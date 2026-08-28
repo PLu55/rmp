@@ -1,14 +1,9 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Matching pursuit decomposition of audio into FOF atoms.
+//!
+//! See `CLAUDE.md` for the project overview and the design plan it references.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod fft;
+pub mod fof;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use fft::{Planner, RealFft, RealFftPlanner, next_fast_len};
+pub use fof::{AtomParams, Envelope, EnvelopeParams, FofError};
