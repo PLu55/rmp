@@ -1,0 +1,483 @@
+//! The block-structured dictionary.
+//!
+//! A *block* fixes one envelope shape `(alpha, beta)`. Its atoms are indexed by frame (onset on a
+//! hop grid) and frequency bin. Because `E(t)` does not depend on `f`, one FFT of an
+//! envelope-windowed frame yields correlations against every bin at once — that is what makes the
+//! pursuit tractable, and why the FFT layer is the engine's inner loop.
+//!
+//! # Hop is set by `alpha`, not by the window length
+//!
+//! This is the design's central departure from MPTK, which targets symmetric Gabor atoms where a
+//! hop of `L/2` costs little. FOF atoms are causal with a sharp attack, and onset capture falls off
+//! as `exp(-2*alpha*|delta|)` — a width set by `1/alpha`, independent of `L`. At `hop = L/2` the
+//! capture fraction is on the order of `1e-4`, so selection would be close to arbitrary.
+//!
+//! Hop is therefore derived from a capture tolerance by **measuring** the block's own envelope
+//! autocorrelation, which accounts for `beta`, the fade tail, and rfofs's phase-transition rounding
+//! without trusting a closed form. Because the loss depends on `alpha`, tying hop to the envelope
+//! is a *correctness* property: a fixed hop would bias selection toward small-`alpha` blocks and
+//! make cross-block ranking unfair.
+
+use crate::fft::{RealFftPlanner, next_fast_len};
+use crate::fof::{Envelope, EnvelopeParams, FofError};
+use realfft::num_complex::Complex32;
+
+/// Tuning for block construction.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockConfig {
+    /// Worst-case onset capture fraction the hop must guarantee.
+    pub capture_tol: f64,
+    /// Lowest carrier frequency the block will represent, Hz.
+    pub f_min: f32,
+    /// Highest carrier frequency the block will represent, Hz.
+    pub f_max: f32,
+    /// Bins with `rho^2` above this are ill-conditioned and disabled.
+    pub rho_sq_max: f32,
+}
+
+impl Default for BlockConfig {
+    fn default() -> Self {
+        Self {
+            capture_tol: 0.95,
+            f_min: 50.0,
+            f_max: 10_000.0,
+            rho_sq_max: 1.0 - 1e-4,
+        }
+    }
+}
+
+/// One envelope shape, with its precomputed Gram inverse per frequency bin.
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub env: Envelope,
+    /// Transform length: `support_len` rounded up to an even 5-smooth number.
+    pub fft_len: usize,
+    /// Frame spacing in samples.
+    pub hop: usize,
+    /// Inclusive bin range this block represents.
+    pub k_lo: usize,
+    pub k_hi: usize,
+    /// `G^-1` pre-divided by `det`, indexed by `k - k_lo`. Dead bins hold zeros, so they project to
+    /// zero energy and can never win — no branch needed in the inner loop.
+    inv_uu: Vec<f32>,
+    inv_uv: Vec<f32>,
+    inv_vv: Vec<f32>,
+    /// `rho_k`, the u/v coherence. Recorded for diagnostics.
+    rho: Vec<f32>,
+}
+
+impl Block {
+    /// Build a block for one envelope shape.
+    pub fn new(
+        params: EnvelopeParams,
+        sample_rate: f32,
+        planner: &mut dyn RealFftPlanner,
+        cfg: &BlockConfig,
+    ) -> Result<Self, FofError> {
+        let env = Envelope::render(params, sample_rate)?;
+        let fft_len = next_fast_len(env.support_len());
+        let hop = measure_hop(&env.samples, fft_len, cfg.capture_tol);
+
+        // Bin range. k = 0 and k = fft_len/2 are excluded unconditionally: at omega = 0 and
+        // omega = pi the sine basis vector is identically zero, so G is exactly rank-1 there.
+        let bin_hz = sample_rate / fft_len as f32;
+        let k_lo = ((cfg.f_min / bin_hz).ceil() as usize).max(1);
+        let k_hi = ((cfg.f_max / bin_hz).floor() as usize).min(fft_len / 2 - 1);
+        if k_lo > k_hi {
+            return Err(FofError::Invalid("empty frequency range for this block"));
+        }
+
+        // One FFT of E^2 gives the Gram for every bin.
+        let mut fft = planner.plan(fft_len);
+        let mut squared = vec![0.0f32; fft_len]; // E^2, zero-padded to fft_len
+        for (dst, &e) in squared.iter_mut().zip(&env.samples) {
+            *dst = e * e;
+        }
+        let mut spectrum = vec![Complex32::new(0.0, 0.0); fft.complex_len()];
+        fft.forward(&mut squared, &mut spectrum);
+
+        let p = env.energy; // == Y[0].re, but summed in f64
+        let n = k_hi - k_lo + 1;
+        let (mut inv_uu, mut inv_uv, mut inv_vv, mut rho) =
+            (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+
+        for k in k_lo..=k_hi {
+            let i = k - k_lo;
+            let (c, s) = fold_e2_bin(&spectrum, fft_len, 2 * k);
+
+            let guu = (p - c) / 2.0;
+            let gvv = (p + c) / 2.0;
+            let guv = s / 2.0;
+            let det = guu * gvv - guv * guv;
+
+            let rho_sq = ((c * c + s * s) / (p * p)).clamp(0.0, 1.0);
+            rho[i] = (rho_sq as f32).sqrt();
+
+            // Leave dead bins as zeros.
+            if rho_sq <= cfg.rho_sq_max as f64 && det > 0.0 && guu > 0.0 {
+                inv_uu[i] = (gvv / det) as f32;
+                inv_uv[i] = (-guv / det) as f32;
+                inv_vv[i] = (guu / det) as f32;
+            }
+        }
+
+        Ok(Self {
+            env,
+            fft_len,
+            hop,
+            k_lo,
+            k_hi,
+            inv_uu,
+            inv_uv,
+            inv_vv,
+            rho,
+        })
+    }
+
+    pub fn support_len(&self) -> usize {
+        self.env.support_len()
+    }
+
+    pub fn sample_rate(&self) -> f32 {
+        self.env.sample_rate
+    }
+
+    /// Carrier frequency of bin `k`, Hz.
+    pub fn bin_hz(&self, k: usize) -> f32 {
+        k as f32 * self.env.sample_rate / self.fft_len as f32
+    }
+
+    /// Number of frames covering a signal of `n` samples.
+    pub fn frame_count(&self, n: usize) -> usize {
+        if n == 0 { 0 } else { (n - 1) / self.hop + 1 }
+    }
+
+    /// Onset of frame `n`, in samples.
+    pub fn frame_onset(&self, n: usize) -> usize {
+        n * self.hop
+    }
+
+    /// `G^-1` row entries for bin `k`, or `None` if the bin is disabled.
+    pub fn gram_inv(&self, k: usize) -> Option<(f32, f32, f32)> {
+        if k < self.k_lo || k > self.k_hi {
+            return None;
+        }
+        let i = k - self.k_lo;
+        if self.inv_uu[i] == 0.0 && self.inv_uv[i] == 0.0 && self.inv_vv[i] == 0.0 {
+            return None;
+        }
+        Some((self.inv_uu[i], self.inv_uv[i], self.inv_vv[i]))
+    }
+
+    /// The u/v coherence at bin `k`. Near 1.0 means the two basis vectors are nearly parallel and
+    /// the projection is ill-conditioned.
+    pub fn rho(&self, k: usize) -> Option<f32> {
+        (k >= self.k_lo && k <= self.k_hi).then(|| self.rho[k - self.k_lo])
+    }
+
+    pub fn live_bins(&self) -> impl Iterator<Item = usize> + '_ {
+        (self.k_lo..=self.k_hi).filter(|&k| self.gram_inv(k).is_some())
+    }
+}
+
+/// Read `C` and `S` for frequency index `m` from the real spectrum of `E^2`.
+///
+/// A real FFT only returns bins `0..=fft_len/2`, but the Gram needs the spectrum at `2k`, which
+/// exceeds that for every `k > fft_len/4` — i.e. every carrier above `sr/4`. Those fold back by
+/// conjugate symmetry, which flips the sign of `S`. Getting it wrong is silent and plausible.
+///
+/// Note the fold is unreachable at the default `f_max` of 10 kHz at 48 kHz (the boundary is
+/// 12 kHz), so it only engages at lower sample rates or a wider `f_max`. It is still required for
+/// correctness there, and `gram_inverse_is_exact_across_the_fold_boundary` exercises it explicitly.
+fn fold_e2_bin(spectrum: &[Complex32], fft_len: usize, m: usize) -> (f64, f64) {
+    let m = m % fft_len;
+    if m <= fft_len / 2 {
+        (spectrum[m].re as f64, -spectrum[m].im as f64)
+    } else {
+        let mirrored = fft_len - m;
+        (spectrum[mirrored].re as f64, spectrum[mirrored].im as f64)
+    }
+}
+
+/// Largest onset offset still capturing `tol` of an atom's energy, doubled.
+///
+/// Frames sit on a grid of spacing `hop`, so a true onset is at most `hop/2` from the nearest
+/// frame; requiring `capture(hop/2) >= tol` gives `hop = 2 * max{delta : capture(delta) >= tol}`.
+fn measure_hop(env: &[f32], fft_len: usize, tol: f64) -> usize {
+    let mut delta = 0usize;
+    while delta < fft_len && envelope_capture(env, delta + 1, fft_len) >= tol {
+        delta += 1;
+    }
+    (2 * delta).max(1)
+}
+
+/// Fraction of a true atom's energy recoverable by a frame anchored `delta` samples before it.
+///
+/// Only the envelope matters: the carrier phase is a free parameter and is absorbed by the
+/// projection, so a carrier shift costs nothing. This is the squared normalized correlation of the
+/// envelope against itself shifted by `delta`, over the frame window.
+fn envelope_capture(env: &[f32], delta: usize, fft_len: usize) -> f64 {
+    let (mut dot, mut ea, mut eb) = (0.0f64, 0.0f64, 0.0f64);
+    for t in 0..fft_len {
+        let a = env.get(t).copied().unwrap_or(0.0) as f64;
+        let b = t
+            .checked_sub(delta)
+            .and_then(|i| env.get(i))
+            .copied()
+            .unwrap_or(0.0) as f64;
+        dot += a * b;
+        ea += a * a;
+        eb += b * b;
+    }
+    if ea <= 0.0 || eb <= 0.0 {
+        return 0.0;
+    }
+    dot * dot / (ea * eb)
+}
+
+/// A set of blocks covering an `(alpha, beta)` grid.
+#[derive(Clone, Debug)]
+pub struct Dictionary {
+    pub blocks: Vec<Block>,
+    pub sample_rate: f32,
+}
+
+impl Dictionary {
+    /// Build from an explicit `(alpha, beta)` list, skipping combinations past the `amax` cliff.
+    pub fn from_grid(
+        grid: &[(f32, f32)],
+        sample_rate: f32,
+        planner: &mut dyn RealFftPlanner,
+        cfg: &BlockConfig,
+    ) -> Result<Self, FofError> {
+        let mut blocks = Vec::new();
+        for &(alpha, beta) in grid {
+            let params = EnvelopeParams::new(alpha, beta);
+            match Block::new(params, sample_rate, planner, cfg) {
+                Ok(b) => blocks.push(b),
+                // A grain that renders silent is simply not a usable atom shape.
+                Err(FofError::SilentGrain { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        if blocks.is_empty() {
+            return Err(FofError::Invalid("dictionary has no usable blocks"));
+        }
+        Ok(Self {
+            blocks,
+            sample_rate,
+        })
+    }
+
+    /// The default grid for voice: `alpha` in a 1.6 ratio ladder over 25-680 Hz bandwidth, three
+    /// attack durations, capped at `alpha*beta <= 4` for well-conditioned `amax`.
+    pub fn voice(
+        sample_rate: f32,
+        planner: &mut dyn RealFftPlanner,
+        cfg: &BlockConfig,
+    ) -> Result<Self, FofError> {
+        const ALPHAS: [f32; 8] = [80.0, 128.0, 205.0, 328.0, 524.0, 839.0, 1342.0, 2147.0];
+        const BETAS: [f32; 3] = [0.0003, 0.001, 0.003];
+
+        let grid: Vec<(f32, f32)> = ALPHAS
+            .iter()
+            .flat_map(|&a| BETAS.iter().map(move |&b| (a, b)))
+            .filter(|&(a, b)| a * b <= 4.0)
+            .collect();
+        Self::from_grid(&grid, sample_rate, planner, cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fft::Planner;
+    use std::f64::consts::TAU;
+
+    const SR: f32 = 48_000.0;
+
+    fn block(alpha: f32, beta: f32) -> Block {
+        let mut planner = Planner::new();
+        Block::new(
+            EnvelopeParams::new(alpha, beta),
+            SR,
+            &mut planner,
+            &BlockConfig::default(),
+        )
+        .unwrap()
+    }
+
+    /// Direct O(L) Gram, the oracle.
+    fn gram_direct(env: &[f32], fft_len: usize, k: usize) -> (f64, f64, f64) {
+        let w = TAU * k as f64 / fft_len as f64;
+        let (mut uu, mut vv, mut uv) = (0.0, 0.0, 0.0);
+        for t in 0..fft_len {
+            let e = env.get(t).copied().unwrap_or(0.0) as f64;
+            let (s, c) = ((w * t as f64).sin(), (w * t as f64).cos());
+            uu += (e * s) * (e * s);
+            vv += (e * c) * (e * c);
+            uv += (e * s) * (e * c);
+        }
+        (uu, vv, uv)
+    }
+
+    /// Checks `G_direct * G_inv_stored == I`.
+    ///
+    /// Comparing the inverse entrywise is the wrong metric: `inv_uv` passes through zero as the
+    /// basis vectors become orthogonal at high bins, so its *relative* error is unbounded there
+    /// while being numerically irrelevant. The product against the direct Gram is scale-free and
+    /// tests exactly the quantity the projection consumes.
+    fn assert_gram_inverse_exact(b: &Block, probes: &[usize]) {
+        let mut worst = 0.0f64;
+        let mut checked = 0;
+        for &k in probes {
+            let Some((iuu, iuv, ivv)) = b.gram_inv(k) else {
+                continue;
+            };
+            let (uu, vv, uv) = gram_direct(&b.env.samples, b.fft_len, k);
+            // [uu uv; uv vv] * [iuu iuv; iuv ivv]
+            let prod = [
+                uu * iuu as f64 + uv * iuv as f64,
+                uu * iuv as f64 + uv * ivv as f64,
+                uv * iuu as f64 + vv * iuv as f64,
+                uv * iuv as f64 + vv * ivv as f64,
+            ];
+            for (got, want) in prod.iter().zip([1.0, 0.0, 0.0, 1.0]) {
+                worst = worst.max((got - want).abs());
+            }
+            checked += 1;
+        }
+        assert!(checked >= 3, "only {checked} live bins probed");
+        assert!(worst < 1e-3, "G * G_inv deviates from identity by {worst:.3e}");
+    }
+
+    #[test]
+    fn gram_inverse_matches_direct_sums() {
+        let b = block(251.0, 0.002);
+        let probes = [b.k_lo, b.k_lo + 1, b.fft_len / 8, b.fft_len / 5, b.k_hi];
+        assert_gram_inverse_exact(&b, &probes);
+    }
+
+    #[test]
+    fn gram_inverse_is_exact_across_the_fold_boundary() {
+        // The fold engages only above sr/4, which the default f_max (10 kHz at 48 kHz) never
+        // reaches. Widen f_max so bins land on both sides of fft_len/4 and the folded branch of
+        // fold_e2_bin is actually executed.
+        let mut planner = Planner::new();
+        let cfg = BlockConfig {
+            f_max: 20_000.0,
+            ..BlockConfig::default()
+        };
+        let b = Block::new(EnvelopeParams::new(251.0, 0.002), SR, &mut planner, &cfg).unwrap();
+
+        let quarter = b.fft_len / 4;
+        let folded: Vec<usize> = (b.k_lo..=b.k_hi).filter(|&k| 2 * k > b.fft_len / 2).collect();
+        assert!(
+            folded.len() > 10,
+            "expected many folded bins, got {}",
+            folded.len()
+        );
+
+        let probes = [
+            quarter - 1,
+            quarter,
+            quarter + 1,
+            folded[folded.len() / 2],
+            b.k_hi,
+        ];
+        assert_gram_inverse_exact(&b, &probes);
+    }
+
+    #[test]
+    fn degenerate_bins_are_excluded() {
+        let b = block(251.0, 0.002);
+        assert!(b.k_lo >= 1, "DC must be excluded");
+        assert!(b.k_hi < b.fft_len / 2, "Nyquist must be excluded");
+        assert!(b.gram_inv(0).is_none());
+        assert!(b.gram_inv(b.fft_len / 2).is_none());
+    }
+
+    #[test]
+    fn coherence_falls_as_frequency_rises() {
+        // rho ~ alpha/(2*pi*f), so low bins are ill-conditioned and high bins are nearly orthogonal.
+        let b = block(524.0, 0.001);
+        let lo = b.rho(b.k_lo).unwrap();
+        let hi = b.rho(b.k_hi).unwrap();
+        assert!(lo > hi, "rho should fall with frequency: {lo} -> {hi}");
+        assert!(hi < 0.05, "high bins should be nearly orthogonal, got {hi}");
+    }
+
+    #[test]
+    fn hop_shrinks_as_alpha_grows() {
+        // Hop tracks the envelope's own decorrelation width, so it must fall as alpha rises.
+        //
+        // Deliberately not compared against the closed form 0.051*sr/alpha: that formula assumes a
+        // pure exponential, while the measurement accounts for the attack softening the onset and
+        // for the fade tail. Measured hops run *larger* than the formula (e.g. 6 vs 1.8 at
+        // alpha=1342), which is the measurement doing its job rather than disagreeing.
+        let mut prev = usize::MAX;
+        for alpha in [80.0f32, 251.0, 524.0, 1342.0] {
+            let hop = block(alpha, 0.0003).hop;
+            assert!(hop < prev, "alpha={alpha}: hop {hop} did not fall below {prev}");
+            prev = hop;
+        }
+    }
+
+    #[test]
+    fn hop_is_vastly_smaller_than_half_the_window() {
+        // Guards against regressing to an MPTK-style hop, which would capture ~1e-4 of the energy.
+        let b = block(251.0, 0.002);
+        assert!(
+            b.hop * 20 < b.fft_len,
+            "hop {} is not far below fft_len/2 = {}",
+            b.hop,
+            b.fft_len / 2
+        );
+    }
+
+    #[test]
+    fn measured_hop_meets_its_capture_tolerance() {
+        for alpha in [80.0f32, 251.0, 1342.0] {
+            let b = block(alpha, 0.0003);
+            let worst = envelope_capture(&b.env.samples, b.hop / 2, b.fft_len);
+            assert!(
+                worst >= 0.94,
+                "alpha={alpha}: capture at hop/2 = {worst:.4}, below tolerance"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_dictionary_covers_the_grid_and_skips_the_cliff() {
+        let mut planner = Planner::new();
+        let d = Dictionary::voice(SR, &mut planner, &BlockConfig::default()).unwrap();
+        // 8 alphas x 3 betas = 24, less two past the alpha*beta <= 4 cap:
+        // 1342*0.003 = 4.026 and 2147*0.003 = 6.441.
+        assert_eq!(d.blocks.len(), 22);
+        for b in &d.blocks {
+            assert!(b.env.params.alpha_beta() <= 4.0);
+            assert!(b.hop >= 1 && b.hop < b.fft_len);
+            assert!(b.k_lo <= b.k_hi);
+        }
+        // Support (and so fft_len) must shrink as alpha grows.
+        let mut by_alpha: Vec<_> = d
+            .blocks
+            .iter()
+            .filter(|b| b.env.params.beta == 0.0003)
+            .collect();
+        by_alpha.sort_by(|a, b| a.env.params.alpha.total_cmp(&b.env.params.alpha));
+        for w in by_alpha.windows(2) {
+            assert!(w[0].fft_len >= w[1].fft_len);
+        }
+    }
+
+    #[test]
+    fn frame_grid_covers_the_signal() {
+        let b = block(251.0, 0.002);
+        let n = 48_000;
+        let frames = b.frame_count(n);
+        assert!(b.frame_onset(frames - 1) < n);
+        assert!(b.frame_onset(frames) >= n);
+        assert_eq!(b.frame_count(0), 0);
+    }
+}

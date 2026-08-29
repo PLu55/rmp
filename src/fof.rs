@@ -16,13 +16,20 @@
 //! render is the envelope alone. `phi = PI/2` is essential — at `phi = 0` the carrier is identically
 //! zero and the probe renders silence.
 //!
-//! rfofs scales output by `amp / amax(alpha*beta)` where `amax` is the peak of `E`, so a probe at
-//! `amp = 1` comes back with **peak 1.0**: the envelope, peak-normalized. Two consequences:
+//! rfofs scales output by `amp / amax(alpha*beta)`, where [`rfofs::fof_amax`] approximates the peak
+//! of `E`, so a probe at `amp = 1` comes back approximately peak-normalized.
 //!
-//! - The private `fof_amax` is not needed. A coefficient fitted against this basis maps *directly*
-//!   to [`FofParams::amp`], because rendering at `amp = A` gives exactly `A * basis`.
-//! - The `alpha*beta > 10` cliff (where `amax` returns 0.0 and the grain is silent) is detected by
-//!   the probe coming back all-zero — more robust than reimplementing the polynomial.
+//! **The amplitude mapping does not use `amax`, and must not.** A coefficient fitted against this
+//! basis maps *directly* to [`FofParams::amp`], because rendering at `amp = A` gives exactly
+//! `A * basis` — the `1/amax` factor is already baked into the basis. Multiplying by `amax`
+//! anywhere in the fitting path would double-normalize.
+//!
+//! `amax` is used here only to reject `alpha*beta > 10` (where it returns 0.0 and the grain renders
+//! silent) *before* allocating and rendering a probe.
+//!
+//! Note `amax` is a polynomial fit rather than the exact peak, so the probe peak lands within about
+//! 3.4% of 1.0 across the useful parameter range rather than on it. That is harmless — the fitted
+//! coefficient absorbs it — but it means "peak-normalized" is approximate.
 //!
 //! # Accuracy note
 //!
@@ -69,6 +76,14 @@ impl EnvelopeParams {
         self.alpha * self.beta
     }
 
+    /// rfofs's envelope-peak normalization factor; 0.0 past the `alpha*beta > 10` cliff.
+    ///
+    /// Useful for screening a dictionary grid before building blocks. It is deliberately *not* part
+    /// of the amplitude mapping — see the module docs.
+    pub fn amax(&self) -> f32 {
+        rfofs::fof_amax(self.alpha, self.beta)
+    }
+
     fn validate(&self) -> Result<(), FofError> {
         if !(self.alpha > 0.0 && self.alpha.is_finite()) {
             return Err(FofError::UnboundedSupport("alpha must be > 0"));
@@ -81,6 +96,12 @@ impl EnvelopeParams {
         }
         if !(self.fade_dur >= 0.0 && self.fade_dur.is_finite()) {
             return Err(FofError::Invalid("fade_dur must be >= 0 and finite"));
+        }
+        // Screen the amax cliff up front rather than discovering it from an all-zero probe.
+        if self.amax() == 0.0 {
+            return Err(FofError::SilentGrain {
+                alpha_beta: self.alpha_beta(),
+            });
         }
         Ok(())
     }
@@ -278,20 +299,48 @@ mod tests {
     }
 
     #[test]
-    fn probe_envelope_is_approximately_peak_normalized() {
-        // rfofs scales by amp/amax, and amax approximates the peak of E — but it is a *polynomial
-        // fit* (exp of a cubic in ln(alpha*beta)), not the exact peak, so the probe lands near 1.0
-        // rather than on it. The exact value does not matter: rendering at amp = A gives exactly
-        // A times this basis either way, which is what makes fof_amax unnecessary. This only
-        // asserts the normalization is happening at all.
-        for (alpha, beta) in [(80.0, 0.001), (251.0, 0.003), (1342.0, 0.0003)] {
-            let env = Envelope::render(EnvelopeParams::new(alpha, beta), SR).unwrap();
-            let peak = env.samples.iter().cloned().fold(0.0f32, f32::max);
+    fn probe_peak_equals_true_peak_over_amax() {
+        // rfofs scales by amp/amax, so the probe's peak must be exactly max(E)/amax. Checking
+        // against the analytic envelope and the now-public fof_amax pins rfofs's normalization
+        // precisely, rather than asserting a loose band around 1.0.
+        for (alpha, beta) in [(80.0, 0.001), (251.0, 0.003), (1342.0, 0.0003), (328.0, 0.01)] {
+            let p = EnvelopeParams::new(alpha, beta);
+            let env = Envelope::render(p, SR).unwrap();
+            let got = env.samples.iter().cloned().fold(0.0f32, f32::max) as f64;
+
+            let want_peak = analytic_envelope(p, SR, env.support_len())
+                .into_iter()
+                .fold(0.0f64, f64::max);
+            let expect = want_peak / p.amax() as f64;
+
             assert!(
-                (0.95..1.05).contains(&peak),
-                "alpha={alpha} beta={beta}: peak {peak} is not near 1.0"
+                (got - expect).abs() / expect < 5e-3,
+                "alpha={alpha} beta={beta}: probe peak {got:.5} != max(E)/amax {expect:.5}"
             );
         }
+    }
+
+    #[test]
+    fn amax_is_a_fit_so_the_probe_is_only_approximately_normalized() {
+        // Documents why "peak-normalized" is approximate: amax is exp of a cubic in ln(alpha*beta),
+        // not the true peak. Measured deviation stays within ~3.4% over the useful range. The
+        // fitted coefficient absorbs this, so it costs nothing — but the basis peak is not 1.0.
+        let mut worst = 0.0f64;
+        for (alpha, beta) in [
+            (80.0, 0.001),
+            (251.0, 0.003),
+            (524.0, 0.001),
+            (1342.0, 0.0003),
+            (328.0, 0.01),
+            (1000.0, 0.004),
+        ] {
+            let p = EnvelopeParams::new(alpha, beta);
+            let env = Envelope::render(p, SR).unwrap();
+            let peak = env.samples.iter().cloned().fold(0.0f32, f32::max) as f64;
+            worst = worst.max((peak - 1.0).abs());
+        }
+        assert!(worst < 0.05, "amax fit error grew to {worst:.4}");
+        assert!(worst > 0.005, "probe is exactly normalized — is amax still a fit?");
     }
 
     #[test]
