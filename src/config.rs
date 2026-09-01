@@ -1,0 +1,223 @@
+//! The settings document.
+//!
+//! TOML, so the file can carry comments explaining what each knob costs. Every section is optional
+//! and every field defaults, so a minimal settings file is legal and an empty one reproduces the
+//! built-in voice dictionary.
+//!
+//! Unknown fields are rejected rather than ignored: in a document whose whole purpose is to be
+//! hand-edited, a silently-dropped typo would look exactly like a setting that had no effect.
+
+use crate::dict::BlockConfig;
+use crate::mp::MpConfig;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Config {
+    pub dictionary: DictionarySettings,
+    pub blocks: BlockSettings,
+    pub pursuit: PursuitSettings,
+}
+
+/// The `(alpha, beta)` grid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DictionarySettings {
+    /// Decay rates in s^-1. The -3 dB bandwidth is `alpha / pi` Hz.
+    pub alphas: Vec<f32>,
+    /// Attack (skirt) durations in milliseconds.
+    pub betas_ms: Vec<f32>,
+    /// Drop combinations above this. rfofs renders `alpha*beta > 10` as silence, and its `amax`
+    /// normalisation is ill-conditioned well before that.
+    pub alpha_beta_max: f32,
+}
+
+impl Default for DictionarySettings {
+    fn default() -> Self {
+        Self {
+            alphas: vec![80.0, 128.0, 205.0, 328.0, 524.0, 839.0, 1342.0, 2147.0],
+            betas_ms: vec![0.3, 1.0, 3.0],
+            alpha_beta_max: 4.0,
+        }
+    }
+}
+
+impl DictionarySettings {
+    /// Expand to `(alpha, beta_seconds)` pairs, dropping those past the cap.
+    pub fn grid(&self) -> Vec<(f32, f32)> {
+        self.alphas
+            .iter()
+            .flat_map(|&a| self.betas_ms.iter().map(move |&b| (a, b / 1000.0)))
+            .filter(|&(a, b)| a * b <= self.alpha_beta_max)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BlockSettings {
+    /// Worst-case fraction of an atom's energy a frame must still capture when the true onset falls
+    /// between hop positions. Lower means a coarser hop: faster, but selection degrades.
+    pub capture_tolerance: f64,
+    /// Frequency range represented, in Hz.
+    pub f_min: f32,
+    pub f_max: f32,
+    /// Bins whose `rho^2` exceeds this are disabled as ill-conditioned.
+    pub rho_sq_max: f32,
+}
+
+impl Default for BlockSettings {
+    fn default() -> Self {
+        let d = BlockConfig::default();
+        Self {
+            capture_tolerance: d.capture_tol,
+            f_min: d.f_min,
+            f_max: d.f_max,
+            rho_sq_max: d.rho_sq_max,
+        }
+    }
+}
+
+impl From<&BlockSettings> for BlockConfig {
+    fn from(s: &BlockSettings) -> Self {
+        Self {
+            capture_tol: s.capture_tolerance,
+            f_min: s.f_min,
+            f_max: s.f_max,
+            rho_sq_max: s.rho_sq_max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PursuitSettings {
+    /// Hard cap on atoms selected.
+    pub max_atoms: usize,
+    /// Stop once this reconstruction SNR is reached.
+    pub target_snr_db: f32,
+    /// Stop when the best atom would remove less than this fraction of the residual.
+    pub min_gain: f64,
+}
+
+impl Default for PursuitSettings {
+    fn default() -> Self {
+        let d = MpConfig::default();
+        Self {
+            max_atoms: d.max_atoms,
+            target_snr_db: d.target_snr_db,
+            min_gain: d.min_gain_fraction,
+        }
+    }
+}
+
+impl From<&PursuitSettings> for MpConfig {
+    fn from(s: &PursuitSettings) -> Self {
+        Self {
+            max_atoms: s.max_atoms,
+            target_snr_db: s.target_snr_db,
+            min_gain_fraction: s.min_gain,
+            full_update: false,
+        }
+    }
+}
+
+impl Config {
+    pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(text)
+    }
+
+    /// A fully-populated settings document, for `--write-config`.
+    pub fn to_toml(&self) -> String {
+        toml::to_string_pretty(self).unwrap_or_default()
+    }
+
+    /// Reject settings that would produce an unusable dictionary before any work starts.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.dictionary.grid().is_empty() {
+            return Err(
+                "dictionary grid is empty: check alphas, betas_ms and alpha_beta_max".into(),
+            );
+        }
+        // NaN must fail too, hence >= rather than a negated <.
+        if self.blocks.f_min >= self.blocks.f_max || !self.blocks.f_min.is_finite() {
+            return Err(format!(
+                "f_min ({}) must be below f_max ({})",
+                self.blocks.f_min, self.blocks.f_max
+            ));
+        }
+        if !(0.0..1.0).contains(&self.blocks.capture_tolerance) || self.blocks.capture_tolerance == 0.0 {
+            return Err("capture_tolerance must be in (0, 1)".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_document_is_the_default_dictionary() {
+        let cfg = Config::from_toml("").unwrap();
+        // 8 alphas x 3 betas, less 1342*3ms = 4.026 and 2147*3ms = 6.441.
+        assert_eq!(cfg.dictionary.grid().len(), 22);
+        assert_eq!(cfg.pursuit.target_snr_db, MpConfig::default().target_snr_db);
+    }
+
+    #[test]
+    fn partial_document_keeps_other_defaults() {
+        let cfg = Config::from_toml("[pursuit]\nmax_atoms = 12\n").unwrap();
+        assert_eq!(cfg.pursuit.max_atoms, 12);
+        assert_eq!(cfg.blocks.f_max, BlockConfig::default().f_max);
+        assert_eq!(cfg.dictionary.grid().len(), 22);
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        // A typo in a hand-edited settings file must fail loudly, not be silently ignored.
+        let err = Config::from_toml("[pursuit]\nmax_atom = 12\n").unwrap_err();
+        assert!(err.to_string().contains("max_atom"), "{err}");
+
+        assert!(Config::from_toml("[pursiut]\nmax_atoms = 12\n").is_err());
+    }
+
+    #[test]
+    fn grid_applies_the_alpha_beta_cap() {
+        let cfg = Config::from_toml(
+            "[dictionary]\nalphas = [100.0, 2000.0]\nbetas_ms = [1.0, 5.0]\nalpha_beta_max = 4.0\n",
+        )
+        .unwrap();
+        // 100*0.001, 100*0.005, 2000*0.001 pass; 2000*0.005 = 10 does not.
+        assert_eq!(cfg.dictionary.grid().len(), 3);
+    }
+
+    #[test]
+    fn betas_are_milliseconds_in_the_document_and_seconds_in_the_grid() {
+        let cfg =
+            Config::from_toml("[dictionary]\nalphas = [100.0]\nbetas_ms = [2.5]\n").unwrap();
+        assert_eq!(cfg.dictionary.grid(), vec![(100.0, 0.0025)]);
+    }
+
+    #[test]
+    fn validation_catches_unusable_settings() {
+        let empty = Config::from_toml("[dictionary]\nalphas = []\n").unwrap();
+        assert!(empty.validate().is_err());
+
+        let inverted = Config::from_toml("[blocks]\nf_min = 9000.0\nf_max = 100.0\n").unwrap();
+        assert!(inverted.validate().is_err());
+
+        let bad_tol = Config::from_toml("[blocks]\ncapture_tolerance = 1.5\n").unwrap();
+        assert!(bad_tol.validate().is_err());
+
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn round_trips_through_toml() {
+        let cfg = Config::default();
+        let restored = Config::from_toml(&cfg.to_toml()).unwrap();
+        assert_eq!(cfg.dictionary.grid(), restored.dictionary.grid());
+        assert_eq!(cfg.pursuit.max_atoms, restored.pursuit.max_atoms);
+    }
+}

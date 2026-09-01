@@ -45,7 +45,7 @@ use rfofs::fof::{FofParams, FofPhase, FofState};
 ///
 /// `E(t)` depends only on these — **not** on `f` or `phi`. That independence is what lets a single
 /// FFT of an envelope-windowed frame yield correlations against every frequency at once.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EnvelopeParams {
     /// Exponential decay coefficient, s^-1. The -3 dB bandwidth is `alpha / PI` Hz.
     pub alpha: f32,
@@ -108,7 +108,7 @@ impl EnvelopeParams {
 }
 
 /// A complete atom: envelope, carrier and placement.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AtomParams {
     /// Onset in samples, relative to the analysed signal's origin. Signed so an atom may start
     /// before the excerpt.

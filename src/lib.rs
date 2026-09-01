@@ -2,7 +2,9 @@
 //!
 //! See `CLAUDE.md` for the project overview and the design plan it references.
 
+pub mod audio;
 pub mod book;
+pub mod config;
 pub mod corr;
 pub mod dict;
 pub mod fft;
@@ -13,6 +15,7 @@ pub mod select;
 pub mod signal;
 
 pub use book::{Book, Selection};
+pub use config::Config;
 pub use corr::{Correlator, Projection, project};
 pub use dict::{Block, BlockConfig, Dictionary};
 pub use fft::{Planner, RealFft, RealFftPlanner, next_fast_len};

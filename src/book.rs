@@ -8,7 +8,7 @@ use crate::signal::snr_db;
 use rfofs::fof::FofParams;
 
 /// One selected atom, with where it came from and what it actually removed.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Selection {
     pub atom: AtomParams,
     /// Index into the dictionary's block list.
@@ -26,7 +26,7 @@ pub struct Selection {
     pub residual_energy: f64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Book {
     pub selections: Vec<Selection>,
     pub initial_energy: f64,
@@ -75,6 +75,15 @@ impl Book {
             .iter()
             .position(|&db| db >= target_db)
             .map(|i| i + 1)
+    }
+
+    /// Render the book back to a signal — the analysis inverted.
+    ///
+    /// Uses the same rfofs path the pursuit subtracted with, so a book that reached N dB against
+    /// its input reproduces that input to N dB here.
+    pub fn resynthesize(&self, len: usize) -> Result<crate::signal::Signal, crate::fof::FofError> {
+        let atoms: Vec<AtomParams> = self.selections.iter().map(|s| s.atom).collect();
+        crate::signal::Signal::from_atoms(&atoms, len, self.sample_rate)
     }
 
     /// Replayable parameters, for rendering through rfofs.

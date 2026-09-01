@@ -9,13 +9,19 @@ realfft = "3.5"
 # The FOF definition itself. Analysis atoms are rendered by the same code that
 # synthesizes them, so the two cannot drift apart.
 rfofs = { path = "../rfofs" }
+
+# CLI, settings document, book serialisation, and soundfile I/O.
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+serde_json = "1"
+sndfile = "0.1"
 #rustfft = "6.4"
 fftw = { version = "0.8", default-features = false, features = ["system"] }
 fftw-sys = { version = "0.8", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-serde_json = "1"
 
 [[bench]]
 name = "fft"
