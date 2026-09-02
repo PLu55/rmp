@@ -25,9 +25,10 @@ cargo clippy --all-targets
 ./target/release/rmp --write-config > settings.toml
 
 # end-to-end measurement against synthetic ground truth
-cargo run --release --example analyze [seconds] [max_atoms] [grains_per_sec]
+cargo run --release --example analyze [seconds] [max_atoms] [grains_per_sec] [candidates]
 
 cargo bench --bench fft                      # FFTW planning = MEASURE (default)
+cargo bench --bench pursuit                  # per-stage cost of one decomposition
 FFTW_PLAN=patient cargo bench --bench fft
 ```
 
@@ -43,7 +44,13 @@ parts that need reading together:
 - **`dict`** — blocks, one per `(alpha, beta)` envelope. Owns the Gram tables and the hop.
 - **`corr`** — one envelope-windowed FFT per frame yields correlations against every frequency at
   once, then a closed-form 2-D projection.
-- **`mp`** — the pursuit loop with the local update.
+- **`fit`** — the same exact projection *off* the grid, by direct f64 summation. Refinement and
+  HRMP both need a score where no precomputed Gram exists.
+- **`cand`** — coarse discovery: local time-frequency maxima, merged across blocks.
+- **`refine`** — bounded 1-D search over `(t0, f, alpha, beta)` after selection.
+- **`hrmp`** — local-support probes and the amplitude clamp.
+- **`mp`** — the pursuit loop with the local update; owns the candidate → refine → validate → select
+  pipeline.
 - **`select`** — max segment tree over frames.
 - **`naive`** — brute-force oracle. Deliberately shares nothing with `dict`/`corr` beyond the atom
   definition and the search space.
@@ -84,6 +91,33 @@ f32; accumulators are f64.
 **`support_len` and `fft_len` are different fields.** The stale set and the envelope use support; the
 frame read and the FFT use `fft_len` (rounded to an even 5-smooth length, not a power of two).
 
+**The fit-region score and the full-support score are not interchangeable.** `E_capt` is the squared
+norm of an orthogonal projection of *one fixed* ambient vector — that is the only reason scores from
+different blocks, onsets and bins are comparable. Truncating the envelope at `fit::fit_end` zeroes
+the residual outside a *candidate-dependent* window, so a truncated score ranks candidates partly by
+how much residual each was allowed to ignore. The fit region drives `refine`'s 1-D searches and never
+leaves that module; everything else uses the full support.
+
+**Refinement can lose, so it must be allowed to decline.** Because those two optima differ, the
+parameters maximizing the search objective can score worse on the full support than the seed. Both
+are scored through `fit::score` — same function, so the same Gram clipping — and the refined atom is
+adopted only if it strictly wins.
+
+**`fit` clips the Gram to the same range as the data; `corr` and `naive` do not.** They use a
+whole-support Gram while reading the residual past the signal end as zeros, which understates a
+boundary-overhanging atom's removable energy. The two agree to the last bit for interior atoms, but
+a seed and a refined candidate must always be compared through `fit`.
+
+**A rejected HRMP candidate must be demoted, not just skipped.** `mp::run` breaks the pursuit when
+residual energy rises, so a rejection must never reach that line. Writing the rejected score back
+into the frame table and its segment tree is what stops the next iteration recomputing the same
+argmax forever — an infinite loop with no error message.
+
+**`signal::overlap` is the single definition of which samples an atom occupies.** Writing it
+(`add_at`, `subtract_at`), scoring it (`fit::accumulate`) and invalidating the frames it touched
+(`refresh_stale`) all go through it. `refresh_stale` used to be passed the seed's frame onset, which
+equals the atom's `t0` only until refinement can move it.
+
 ## Working with rfofs
 
 `rfofs::fof` is pure math (imports only `wide` and its build-script sine LUT) and safe to depend on.
@@ -109,6 +143,16 @@ intact. Verified by mutation — the table comparison catches both a short `n_hi
 
 When adding a recovery test, assert planted atoms are inside `[k_lo, k_hi]`. An atom above `f_max` is
 unrepresentable and presents as a decomposition failure rather than a bad test.
+
+**An HRMP fixture has to be deliberately adversarial.** Given the matching short shape in the
+dictionary, plain MP simply selects it and never bridges a gap — there is nothing for HRMP to
+prevent, and a test built that way passes for the wrong reason. Offer only the long shape, then
+measure the energy the book puts into a silent gap.
+
+**Phase in a multi-atom fixture is referenced to each atom's own onset.** A second burst given
+`phi = PI` is not in anti-phase with the first: it is rotated by `omega * (t2 - t1)` — tens of
+carrier periods — and typically lands almost back in phase. `H_i` applies that rotation
+automatically during the test, but a fixture has to apply it by hand.
 
 ## Measured performance
 
@@ -137,6 +181,22 @@ same splitting factor, while the candidate stage's cost scales linearly (5 ms at
 over the same run): the strongest seed is also the seed that refines best. It stays configurable
 because HRMP can *reject* a candidate rather than merely outscore it, and the loop then needs
 somewhere to fall through to.
+
+`cargo bench --bench pursuit` splits one decomposition by stage. At 0.25 s of off-grid audio, each
+arm including its own `init` of 74 ms:
+
+| arm | atoms | total | per atom |
+| --- | --- | --- | --- |
+| grid | 60 | 1.40 s | 22.2 ms |
+| refined | 60 | 1.19 s | 18.6 ms |
+| hrmp | 42 | 0.92 s | 20.2 ms |
+| full_update | 8 | 0.67 s | 74.0 ms |
+
+**The local update is worth 3.3× here**, and far more at longer durations — `full_update` scales with
+the signal, the incremental path does not. Refinement is *cheaper* per atom than the plain grid, not
+merely affordable: a refined atom's support differs from its seed block's, and the stale sets it
+invalidates are on average smaller. HRMP selects fewer atoms in the same budget because it declines
+the ones it cannot justify, which is the point of it.
 
 Refinement's remaining error is concentrated in `(t0, alpha, beta)`, not `f`. All three shape the
 attack, so they trade against each other along a shallow valley that coordinate descent walks down

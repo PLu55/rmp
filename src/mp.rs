@@ -417,6 +417,7 @@ mod tests {
     use crate::fft::Planner;
     use crate::fof::{AtomParams, EnvelopeParams};
     use crate::hrmp::HrmpConfig;
+    use crate::refine::RefineConfig;
     use crate::naive::{NaiveConfig, NaiveMp};
 
     const SR: f32 = 48_000.0;
@@ -617,6 +618,32 @@ mod tests {
         // Whatever it selects, the pursuit must still be strictly decreasing.
         for w in guarded.selections.windows(2) {
             assert!(w[1].residual_energy < w[0].residual_energy, "residual rose under HRMP");
+        }
+    }
+
+    /// Spec 17.7: identical input and configuration must give an identical book.
+    ///
+    /// Run with every stage engaged — multiple candidates, refinement and HRMP — because each adds
+    /// a place where an unordered container or a non-total float comparison could leak in.
+    #[test]
+    fn the_decomposition_is_reproducible() {
+        let d = tiny_dict();
+        let sig = noise(3_000, 0xd00d_1234_5678_9abc);
+        let cfg = MpConfig {
+            max_atoms: 12,
+            target_snr_db: f32::INFINITY,
+            candidate_count: 4,
+            refine: RefineConfig { enabled: true, ..RefineConfig::default() },
+            hrmp: HrmpConfig { enabled: true, ..HrmpConfig::default() },
+            ..Default::default()
+        };
+
+        let (first, first_res) = run(&d, &sig, &cfg);
+        assert!(first.len() >= 5, "only {} atoms selected", first.len());
+        for _ in 0..3 {
+            let (again, again_res) = run(&d, &sig, &cfg);
+            assert_eq!(again.selections, first.selections);
+            assert_eq!(again_res, first_res);
         }
     }
 
