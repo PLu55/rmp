@@ -160,6 +160,8 @@ impl NaiveMp {
                 projected_energy: best.energy,
                 energy_removed: before - energy,
                 residual_energy: energy,
+                hr_score: None,
+                refined: false,
             });
 
             // The measured energy must fall. A rise means a parameter-mapping bug, not noise.

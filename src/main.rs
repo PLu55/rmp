@@ -264,5 +264,38 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #                           the neighbouring grid rung in each direction, so no
 #                           true value is out of reach. t0_radius = 0 derives
 #                           the onset radius from the block's own hop.
+#
+# [hrmp]
+#   High-Resolution Matching Pursuit. Ordinary MP scores an atom by its global
+#   correlation, so a long atom can win by summing evidence from two separated
+#   events and claiming the silence between them -- pre-echo, and energy
+#   invented in gaps. HRMP asks whether the residual supports the atom
+#   *everywhere* it claims to be, and clamps or rejects it if not.
+#
+#   Off by default: it is a stricter criterion than ordinary MP, so it trades
+#   reconstruction SNR per atom for atoms that describe events actually present.
+#
+#   enabled
+#   mode                    localized_candidate masks the refined atom's own
+#                           envelope; legacy_scaled_fof uses smaller
+#                           same-frequency FOFs, as in the historical code.
+#   depth                   2^depth probes, placed at equal-energy quantiles
+#                           rather than equal time: a FOF decays 60 dB across
+#                           its support, so uniform probes would leave the late
+#                           ones reading noise, and a strict minimum over
+#                           unequal variances measures the noisiest probe
+#                           instead of the least supported region.
+#   phase_tolerance_deg     reject when a probe's local phase disagrees with the
+#                           global fit by more than this.
+#   minimum_probe_energy    structural floor on a probe's share of the atom's
+#                           energy before it gets a vote.
+#   noise_epsilon           bound on each local amplitude's relative standard
+#                           error. A probe must see at least 1/noise_epsilon^2
+#                           times the local residual noise power in atom energy
+#                           to be believed. This is the gate that does the work.
+#   min_mask_periods        skip HRMP when a probe would span fewer carrier
+#                           periods than this: its Gram cannot be conditioned,
+#                           and an atom that short cannot bridge anything.
+#   magnitude_policy        strict_min is the original criterion.
 
 ";

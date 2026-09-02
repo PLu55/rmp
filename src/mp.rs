@@ -31,6 +31,8 @@ use crate::cand::{Candidate, FrameTable, Seed, top_seeds};
 use crate::corr::Correlator;
 use crate::dict::Dictionary;
 use crate::fft::RealFftPlanner;
+use crate::fit;
+use crate::hrmp::{self, HrmpConfig};
 use crate::refine::{EnvelopeCache, RefineConfig, refine};
 use crate::select::SegTree;
 use crate::signal::{Signal, overlap, snr_db, subtract_at};
@@ -55,6 +57,12 @@ pub struct MpConfig {
     pub candidate_count: usize,
     /// Local refinement of the promoted candidates.
     pub refine: RefineConfig,
+    /// Local-support validation of the refined candidates.
+    pub hrmp: HrmpConfig,
+    /// Give up after this many consecutive iterations in which every candidate was rejected.
+    ///
+    /// Only reachable under HRMP, and it is the spec's "no candidate passes" stopping condition.
+    pub max_stalls: usize,
     /// Recompute every frame each iteration instead of only the stale ones. Debug only — this is
     /// the reference the incremental path is validated against.
     pub full_update: bool,
@@ -70,9 +78,18 @@ impl Default for MpConfig {
             // Off by default so the library's default is still the plain, fully-validated pursuit.
             // `Config` turns it on for the CLI.
             refine: RefineConfig { enabled: false, ..RefineConfig::default() },
+            hrmp: HrmpConfig::default(),
+            max_stalls: 16,
             full_update: false,
         }
     }
+}
+
+/// The outcome of scoring one iteration's candidates.
+struct Chosen {
+    best: Option<Candidate>,
+    /// Frames whose stored energy must be lowered because their candidate was rejected outright.
+    demote: Vec<(usize, usize, f64)>,
 }
 
 /// Per-block frame table and its max tree.
@@ -142,6 +159,7 @@ impl<'a> Mp<'a> {
 
     pub fn run(&mut self, cfg: &MpConfig) -> Book {
         let mut book = Book::new(self.initial_energy, self.sample_rate);
+        let mut stalls = 0usize;
 
         for _ in 0..cfg.max_atoms {
             if snr_db(self.initial_energy, self.energy) >= cfg.target_snr_db {
@@ -159,10 +177,30 @@ impl<'a> Mp<'a> {
                 break;
             }
 
-            // Step 3: score each seed exactly, and refine it off the grid.
-            let Some(best) = self.best_candidate(&seeds, &cfg.refine) else {
-                break;
+            // Steps 3-5: score each seed exactly, refine it off the grid, validate its local
+            // support, and select.
+            let chosen = self.best_candidate(&seeds, cfg);
+
+            // A rejected candidate is not a reason to stop: it is a reason to look elsewhere. But
+            // it must be *demoted* in the frame table first, or the next iteration recomputes the
+            // same argmax and the loop spins forever with no error. The demotion is undone
+            // naturally the next time `refresh_stale` touches that frame, which is correct — the
+            // residual there will have changed, so the verdict has to be retaken.
+            let Some(best) = chosen.best else {
+                if chosen.demote.is_empty() {
+                    break;
+                }
+                for (bi, frame, energy) in chosen.demote {
+                    self.states[bi].energy[frame] = energy;
+                    self.states[bi].tree.set(frame, energy);
+                }
+                stalls += 1;
+                if stalls >= cfg.max_stalls {
+                    break;
+                }
+                continue;
             };
+            stalls = 0;
             if best.score() <= 0.0 {
                 break;
             }
@@ -187,6 +225,8 @@ impl<'a> Mp<'a> {
                 projected_energy: best.mp_score,
                 energy_removed: before - self.energy,
                 residual_energy: self.energy,
+                hr_score: best.hr_score,
+                refined: best.refined,
             });
 
             if self.energy >= before {
@@ -228,8 +268,8 @@ impl<'a> Mp<'a> {
     /// The frame table stores only energy and bin, so each seed's transform is recomputed here to
     /// recover `amp` and `phi`. That is one extra FFT per candidate, which is free next to the
     /// update — and it is where refinement will attach.
-    fn best_candidate(&mut self, seeds: &[Seed], refine_cfg: &RefineConfig) -> Option<Candidate> {
-        let mut best: Option<Candidate> = None;
+    fn best_candidate(&mut self, seeds: &[Seed], cfg: &MpConfig) -> Chosen {
+        let mut out = Chosen { best: None, demote: Vec::new() };
         for &seed in seeds {
             let block = &self.dict.blocks[seed.block];
             let (k, p) = scan_frame(&mut self.corrs[seed.block], block, &self.residual, seed.onset);
@@ -238,18 +278,52 @@ impl<'a> Mp<'a> {
             }
             let seed = Seed { bin: k, ..seed };
             let mut cand = Candidate::from_seed(seed, block, p.amp, p.phi, p.energy);
-            if refine_cfg.enabled {
-                refine(&mut cand, block, &self.residual, refine_cfg, &mut self.cache);
+            if cfg.refine.enabled {
+                refine(&mut cand, block, &self.residual, &cfg.refine, &mut self.cache);
+            }
+            if cfg.hrmp.enabled && !self.apply_hrmp(&mut cand, &cfg.hrmp) {
+                out.demote.push((seed.block, seed.frame, 0.0));
+                continue;
             }
             if cand.score() <= 0.0 {
+                out.demote.push((seed.block, seed.frame, 0.0));
                 continue;
             }
             // Strictly greater, so an exact tie keeps the earlier — and better-seeded — candidate.
-            if best.as_ref().is_none_or(|b| cand.score() > b.score()) {
-                best = Some(cand);
+            if out.best.as_ref().is_none_or(|b| cand.score() > b.score()) {
+                out.best = Some(cand);
             }
         }
-        best
+        out
+    }
+
+    /// Validate a candidate's local support, clamping its amplitude. Returns whether it survived.
+    fn apply_hrmp(&mut self, cand: &mut Candidate, cfg: &HrmpConfig) -> bool {
+        let sr = self.sample_rate;
+        let Ok(env) = crate::fof::Envelope::render(cand.atom.env, sr) else {
+            return false;
+        };
+        let omega = std::f64::consts::TAU * cand.atom.f as f64 / sr as f64;
+        let Some(quad) = fit::accumulate(&self.residual, &env.samples, cand.atom.t0, omega) else {
+            return false;
+        };
+        let Some(proj) = quad.solve(cfg.rho_sq_max) else {
+            return false;
+        };
+
+        let at = hrmp::Placement {
+            t0: cand.atom.t0,
+            f: cand.atom.f,
+            fit_len: fit::fit_end(&env),
+        };
+        let v = hrmp::evaluate(&self.residual, &env, at, &quad, &proj, cfg);
+        if !v.accepted() || v.energy <= 0.0 {
+            return false;
+        }
+        // The phase is held at the ordinary fit's; only the amplitude is clamped.
+        cand.atom.amp = v.amp;
+        cand.hr_score = Some(v.energy);
+        true
     }
 
     /// Block and frame of the globally best atom. Ties go to the lowest block, then lowest frame.
@@ -341,7 +415,8 @@ mod tests {
     use super::*;
     use crate::dict::BlockConfig;
     use crate::fft::Planner;
-    use crate::fof::AtomParams;
+    use crate::fof::{AtomParams, EnvelopeParams};
+    use crate::hrmp::HrmpConfig;
     use crate::naive::{NaiveConfig, NaiveMp};
 
     const SR: f32 = 48_000.0;
@@ -468,6 +543,107 @@ mod tests {
                     "seeds {a:?} and {b:?} are the same event"
                 );
             }
+        }
+    }
+
+    /// The end-to-end case HRMP exists for: energy invented in a gap.
+    ///
+    /// The dictionary holds only the *long* shape, so ordinary MP has no choice but to explain two
+    /// separated bursts with an atom that spans the silence between them — the adversarial case the
+    /// spec describes. (Given the matching short shape, plain MP picks it and never bridges, so the
+    /// temptation has to be constructed deliberately.) HRMP must refuse to fill the gap.
+    #[test]
+    fn hrmp_stops_a_long_atom_inventing_energy_in_a_gap() {
+        let mut planner = Planner::new();
+        let cfg = BlockConfig { f_min: 300.0, f_max: 4000.0, ..BlockConfig::default() };
+        let d = Dictionary::from_grid(&[(80.0, 0.001)], SR, &mut planner, &cfg).unwrap();
+        let long_support = d.blocks[0].support_len();
+
+        let f = d.blocks[0].bin_hz((d.blocks[0].k_lo + d.blocks[0].k_hi) / 2);
+        let short = EnvelopeParams::new(2147.0, 0.0003);
+        let short_len = crate::fof::Envelope::render(short, SR).unwrap().support_len();
+        let (t1, t2) = (400i64, 400 + (long_support / 5) as i64);
+
+        let mut sig = Signal::silence(long_support + 8_000, SR);
+        for t0 in [t1, t2] {
+            let a = AtomParams { t0, f, env: short, phi: 0.4, amp: 1.0 };
+            crate::signal::add_at(&mut sig.samples, &a.render(SR).unwrap(), t0);
+        }
+
+        // The silence between the bursts, with a margin so neither burst leaks in.
+        let gap = (t1 as usize + short_len + 64)..(t2 as usize - 64);
+        assert!(gap.end > gap.start, "fixture has no gap");
+        assert!(
+            crate::signal::energy_of(&sig.samples[gap.clone()]) < 1e-9,
+            "the gap must actually be silent"
+        );
+
+        let base = MpConfig {
+            max_atoms: 8,
+            target_snr_db: f32::INFINITY,
+            candidate_count: 4,
+            ..Default::default()
+        };
+        let with_hr = MpConfig {
+            hrmp: HrmpConfig { enabled: true, ..HrmpConfig::default() },
+            ..base
+        };
+
+        let mut planner = Planner::new();
+        let plain = Mp::new(&d, &sig, &mut planner).run(&base);
+        let guarded = Mp::new(&d, &sig, &mut planner).run(&with_hr);
+        assert!(!plain.is_empty(), "plain MP selected nothing");
+
+        let gap_energy = |b: &Book| {
+            b.resynthesize(sig.len())
+                .map(|r| crate::signal::energy_of(&r.samples[gap.clone()]))
+                .unwrap_or(f64::INFINITY)
+        };
+        let (plain_gap, guarded_gap) = (gap_energy(&plain), gap_energy(&guarded));
+
+        assert!(
+            plain_gap > 0.0,
+            "the fixture is not adversarial: plain MP put no energy in the gap"
+        );
+        assert!(
+            guarded_gap < 0.5 * plain_gap,
+            "HRMP put {guarded_gap:.3e} into a silent gap against plain MP's {plain_gap:.3e}"
+        );
+        assert!(
+            guarded.selections.iter().all(|s| s.hr_score.is_some()),
+            "HRMP was enabled but recorded no verdicts"
+        );
+
+        // Whatever it selects, the pursuit must still be strictly decreasing.
+        for w in guarded.selections.windows(2) {
+            assert!(w[1].residual_energy < w[0].residual_energy, "residual rose under HRMP");
+        }
+    }
+
+    /// A rejected candidate must send the loop elsewhere, not stop it and not spin it.
+    #[test]
+    fn hrmp_rejection_demotes_the_cell_instead_of_stalling() {
+        let d = tiny_dict();
+        let sig = noise(4_000, 0x5151_2323_9999_1111);
+        // Tolerances tight enough that almost nothing survives, so the demotion path is what runs.
+        let cfg = MpConfig {
+            max_atoms: 10,
+            target_snr_db: f32::INFINITY,
+            candidate_count: 3,
+            max_stalls: 4,
+            hrmp: HrmpConfig {
+                enabled: true,
+                phase_tolerance_rad: 0.02,
+                min_probe_energy: 1e-9,
+                depth: 3,
+                ..HrmpConfig::default()
+            },
+            ..Default::default()
+        };
+        let (book, _) = run(&d, &sig, &cfg);
+        // The point is that it terminates and stays monotone, whatever it manages to select.
+        for w in book.selections.windows(2) {
+            assert!(w[1].residual_energy < w[0].residual_energy);
         }
     }
 

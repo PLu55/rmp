@@ -24,6 +24,14 @@ pub struct Selection {
     pub energy_removed: f64,
     /// Residual energy after this atom was subtracted.
     pub residual_energy: f64,
+    /// Energy this atom removed after HRMP clamped its amplitude, when HRMP ran.
+    ///
+    /// `None` means ordinary MP: the atom was subtracted at its full projected amplitude.
+    #[serde(default)]
+    pub hr_score: Option<f64>,
+    /// Whether refinement moved the parameters off the seed block's grid point.
+    #[serde(default)]
+    pub refined: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -127,6 +135,8 @@ mod tests {
             projected_energy: 1.0,
             energy_removed: 1.0,
             residual_energy: residual,
+            hr_score: None,
+            refined: false,
         }
     }
 

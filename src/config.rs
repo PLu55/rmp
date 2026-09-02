@@ -10,6 +10,7 @@
 use crate::dict::BlockConfig;
 use crate::fof::ReleasePolicy;
 use crate::mp::MpConfig;
+use crate::hrmp::{HrmpConfig, MagnitudePolicy, ProbeMode};
 use crate::refine::RefineConfig;
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,7 @@ pub struct Config {
     pub blocks: BlockSettings,
     pub pursuit: PursuitSettings,
     pub refine: RefineSettings,
+    pub hrmp: HrmpSettings,
 }
 
 /// The release policy, fixed for the whole analysis.
@@ -165,12 +167,15 @@ impl Default for PursuitSettings {
 
 impl From<&PursuitSettings> for MpConfig {
     fn from(s: &PursuitSettings) -> Self {
+        let d_mp = MpConfig::default();
         Self {
             max_atoms: s.max_atoms,
             target_snr_db: s.target_snr_db,
             min_gain_fraction: s.min_gain,
             candidate_count: s.candidate_count,
             refine: RefineConfig::default(),
+            hrmp: HrmpConfig::default(),
+            max_stalls: d_mp.max_stalls,
             full_update: false,
         }
     }
@@ -229,6 +234,51 @@ impl Default for RefineSettings {
     }
 }
 
+/// High-Resolution Matching Pursuit: reject or clamp an atom the residual does not support across
+/// its whole extent.
+///
+/// Off by default. It is a *stricter* criterion than ordinary MP, so it trades reconstruction SNR
+/// per atom for atoms that describe events actually present.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HrmpSettings {
+    pub enabled: bool,
+    /// `localized_candidate` masks the refined atom's own envelope. `legacy_scaled_fof` uses
+    /// smaller same-frequency FOFs, as in the historical implementation.
+    pub mode: ProbeMode,
+    /// `2^depth` probes. Depth 1 reproduces the historical "half the main scale".
+    pub depth: u32,
+    /// Reject when a probe's local phase disagrees with the global fit by more than this.
+    pub phase_tolerance_deg: f32,
+    /// Structural floor on a probe's share of the atom's energy before it gets a vote.
+    pub minimum_probe_energy: f64,
+    /// Bound on each local amplitude's relative standard error. A probe must see at least
+    /// `1/noise_epsilon^2` times the local residual noise power in atom energy to be believed.
+    pub noise_epsilon: f64,
+    /// Skip HRMP entirely when a probe would span fewer carrier periods than this: its Gram cannot
+    /// be conditioned, and an atom that short cannot bridge anything anyway.
+    pub min_mask_periods: f32,
+    /// `strict_min` is the original criterion. A robust quantile is deliberately not offered here,
+    /// because it is a different algorithm and should not be mistaken for this one.
+    pub magnitude_policy: MagnitudePolicy,
+}
+
+impl Default for HrmpSettings {
+    fn default() -> Self {
+        let d = HrmpConfig::default();
+        Self {
+            enabled: d.enabled,
+            mode: d.mode,
+            depth: d.depth,
+            phase_tolerance_deg: d.phase_tolerance_rad.to_degrees(),
+            minimum_probe_energy: d.min_probe_energy,
+            noise_epsilon: d.noise_epsilon,
+            min_mask_periods: d.min_mask_periods,
+            magnitude_policy: d.magnitude_policy,
+        }
+    }
+}
+
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
@@ -267,6 +317,17 @@ impl Config {
                 alpha_bracket: r.alpha_bracket,
                 beta_bracket: r.beta_bracket,
                 t0_radius: r.t0_radius,
+                rho_sq_max: self.blocks.rho_sq_max as f64,
+            },
+            hrmp: HrmpConfig {
+                enabled: self.hrmp.enabled,
+                mode: self.hrmp.mode,
+                depth: self.hrmp.depth,
+                phase_tolerance_rad: self.hrmp.phase_tolerance_deg.to_radians(),
+                min_probe_energy: self.hrmp.minimum_probe_energy,
+                noise_epsilon: self.hrmp.noise_epsilon,
+                min_mask_periods: self.hrmp.min_mask_periods,
+                magnitude_policy: self.hrmp.magnitude_policy,
                 rho_sq_max: self.blocks.rho_sq_max as f64,
             },
             ..(&self.pursuit).into()
