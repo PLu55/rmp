@@ -13,6 +13,7 @@ pub mod fit;
 pub mod fof;
 pub mod mp;
 pub mod naive;
+pub mod refine;
 pub mod select;
 pub mod signal;
 
@@ -26,5 +27,6 @@ pub use fit::{Quad, fit_end};
 pub use fof::{AtomParams, Envelope, EnvelopeParams, FofError, ReleasePolicy};
 pub use mp::{Mp, MpConfig};
 pub use naive::{NaiveConfig, NaiveMp};
+pub use refine::{EnvelopeCache, RefineConfig, refine};
 pub use select::SegTree;
 pub use signal::Signal;

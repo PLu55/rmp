@@ -112,19 +112,36 @@ unrepresentable and presents as a decomposition failure rather than a bad test.
 
 ## Measured performance
 
-48 kHz, 22-block voice dictionary, one second of audio:
+48 kHz, 22-block voice dictionary, one second of audio, 30 planted grains per second:
 
-| | on-grid | off-grid |
-| --- | --- | --- |
-| realtime factor | 1.0× | 9.5× |
-| atoms to 40 dB | 31 | 378 |
-| splitting factor | 1.4 | 17.2 |
+| | on-grid | off-grid, grid only | off-grid, refined |
+| --- | --- | --- | --- |
+| realtime factor | 1.0× | 9.6× | 2.2× |
+| atoms to 40 dB | 31 | 378 | 91 |
+| splitting factor | 1.4 | 17.2 | 4.5 |
+| median \|Δf\| | 0.0 Hz | 17.8 Hz | 0.1 Hz |
 
 **Per-atom cost is invariant to signal length** (~24 ms across a 10× change), confirming the local
-update works as designed. **Off-grid input needs 12× more atoms for the same SNR** — this dominates
-every other cost, and is the case for post-selection refinement over `(t0, f, alpha, beta)` being the
-next thing built. Splitting is largely *caused* by grid mismatch rather than being independent, so
-refinement should be measured before back-projection is added.
+update works as designed.
+
+**Refinement is the largest single win and is nearly free.** Off-grid input needed 12× more atoms
+than on-grid; refining `(t0, f, alpha, beta)` after selection cuts that to 3×, and cuts wall time
+4.4×. It costs about 0.2 ms per candidate — roughly 2% of a 21 ms iteration — because `refresh_stale`
+dominates everything. 99% of selected atoms move off the grid.
+
+**Splitting is largely *caused* by grid mismatch**, which is why it falls with refinement rather than
+needing back-projection. What remains (4.5) is the honest figure for a coherent dictionary.
+
+**`candidate_count` buys nothing measurable.** 1, 4, 8 and 64 all reach 40 dB in 91 atoms with the
+same splitting factor, while the candidate stage's cost scales linearly (5 ms at 1, 210 ms at 64,
+over the same run): the strongest seed is also the seed that refines best. It stays configurable
+because HRMP can *reject* a candidate rather than merely outscore it, and the loop then needs
+somewhere to fall through to.
+
+Refinement's remaining error is concentrated in `(t0, alpha, beta)`, not `f`. All three shape the
+attack, so they trade against each other along a shallow valley that coordinate descent walks down
+but not along — a known cost of the one-dimensional method, bounded by a fit that still captures
+99.9% of an isolated atom.
 
 ## Build configuration — three things that will bite
 

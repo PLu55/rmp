@@ -4,7 +4,7 @@
 //! 48 kHz, and reports cost, convergence, and parameter recovery.
 //!
 //! ```text
-//! cargo run --release --example analyze [duration_seconds] [max_atoms]
+//! cargo run --release --example analyze [seconds] [max_atoms] [grains_per_sec] [candidates]
 //! ```
 //!
 //! Everything the plan predicted but never measured lands here: the per-iteration cost model, how
@@ -16,6 +16,7 @@ use rmp::dict::{BlockConfig, Dictionary};
 use rmp::fft::Planner;
 use rmp::fof::{AtomParams, EnvelopeParams};
 use rmp::mp::{Mp, MpConfig};
+use rmp::refine::RefineConfig;
 use rmp::signal::Signal;
 use std::time::Instant;
 
@@ -26,6 +27,7 @@ fn main() {
     let seconds: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.25);
     let max_atoms: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(400);
     let density: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(30.0);
+    let candidates: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4);
     let len = (seconds * SR) as usize;
 
     let mut planner = Planner::new();
@@ -43,33 +45,50 @@ fn main() {
     let signal = Signal::from_atoms(&truth, len, SR).unwrap();
     println!("  signal energy {:.4e}", signal.energy());
 
-    let book = run(&dict, &signal, max_atoms, &mut planner);
+    let grid = MpConfig {
+        max_atoms,
+        target_snr_db: 40.0,
+        ..Default::default()
+    };
+    let refined = MpConfig {
+        candidate_count: candidates,
+        refine: RefineConfig::default(),
+        ..grid
+    };
+
+    let book = run(&dict, &signal, &grid, &mut planner);
     report_convergence(&book, &dict, &signal);
     report_recovery(&book, &truth);
     report_roundtrip(&book, &signal);
 
-    // Off-grid: the honest measure, since real signals do not sit on grid points.
+    // Off-grid: the honest measure, since real signals do not sit on grid points. Run it both ways,
+    // because the whole case for refinement is the difference between these two.
     println!("\n{:=<72}", "");
     println!("OFF-GRID: same atoms, shifted off the frequency and onset grids");
     println!("{:=<72}", "");
     let truth = plant_atoms(&dict, len, true, density);
     let signal = Signal::from_atoms(&truth, len, SR).unwrap();
-    let book = run(&dict, &signal, max_atoms, &mut planner);
+
+    println!("\n-- grid only --");
+    let book = run(&dict, &signal, &grid, &mut planner);
     report_convergence(&book, &dict, &signal);
     report_recovery(&book, &truth);
+
+    println!("\n-- refined --");
+    let book = run(&dict, &signal, &refined, &mut planner);
+    report_convergence(&book, &dict, &signal);
+    report_refinement(&book, &dict);
+    report_recovery(&book, &truth);
+    report_roundtrip(&book, &signal);
 }
 
-fn run(dict: &Dictionary, signal: &Signal, max_atoms: usize, planner: &mut Planner) -> Book {
+fn run(dict: &Dictionary, signal: &Signal, cfg: &MpConfig, planner: &mut Planner) -> Book {
     let t = Instant::now();
     let mut mp = Mp::new(dict, signal, planner);
     let init = t.elapsed();
 
     let t = Instant::now();
-    let book = mp.run(&MpConfig {
-        max_atoms,
-        target_snr_db: 40.0,
-        ..Default::default()
-    });
+    let book = mp.run(cfg);
     let pursuit = t.elapsed();
 
     println!("\ncost");
@@ -87,6 +106,33 @@ fn run(dict: &Dictionary, signal: &Signal, max_atoms: usize, planner: &mut Plann
         (init + pursuit).as_secs_f32() / audio_s
     );
     book
+}
+
+/// How far refinement actually moved the atoms it accepted.
+fn report_refinement(book: &Book, dict: &Dictionary) {
+    if book.is_empty() {
+        return;
+    }
+    let (mut moved, mut d_alpha, mut d_beta) = (0usize, 0.0f64, 0.0f64);
+    for s in &book.selections {
+        // `Selection::block` is the seed's provenance, so the block's own envelope is the
+        // before-picture and `atom.env` is whatever refinement settled on.
+        let seed = dict.blocks[s.block].env.params;
+        if seed.alpha != s.atom.env.alpha || seed.beta != s.atom.env.beta {
+            moved += 1;
+        }
+        d_alpha += (s.atom.env.alpha as f64 / seed.alpha as f64).ln().abs();
+        d_beta += (s.atom.env.beta as f64 / seed.beta as f64).ln().abs();
+    }
+    let n = book.len() as f64;
+    println!("\nrefinement");
+    println!(
+        "  atoms moved off the grid   {moved}/{} ({:.0}%)",
+        book.len(),
+        100.0 * moved as f64 / n
+    );
+    println!("  mean |ln alpha/alpha_0|    {:.3}", d_alpha / n);
+    println!("  mean |ln beta/beta_0|      {:.3}", d_beta / n);
 }
 
 fn report_dictionary(dict: &Dictionary, len: usize) {

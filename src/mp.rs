@@ -31,6 +31,7 @@ use crate::cand::{Candidate, FrameTable, Seed, top_seeds};
 use crate::corr::Correlator;
 use crate::dict::Dictionary;
 use crate::fft::RealFftPlanner;
+use crate::refine::{EnvelopeCache, RefineConfig, refine};
 use crate::select::SegTree;
 use crate::signal::{Signal, overlap, snr_db, subtract_at};
 
@@ -43,10 +44,17 @@ pub struct MpConfig {
     pub min_gain_fraction: f64,
     /// How many local maxima to promote per iteration.
     ///
-    /// 1 reduces the pipeline to the plain global argmax, bit for bit. Promoting more only pays
-    /// once refinement can move an atom off the grid, since without it every candidate is scored
-    /// by the same table the seeds were ranked by.
+    /// 1 reduces the pipeline to the plain global argmax, bit for bit.
+    ///
+    /// Measured on the off-grid benchmark, raising this buys **nothing**: 1, 4, 8 and 64 all reach
+    /// 40 dB in 91 atoms with the same splitting factor, while the candidate stage's cost scales
+    /// linearly (5 ms at 1, 210 ms at 64, over the same run). The strongest seed is also the seed
+    /// that refines best, so the extra work is discarded. It is kept configurable because a
+    /// candidate can be *rejected* rather than merely outscored -- which is what HRMP does -- and
+    /// then the loop needs somewhere to fall through to.
     pub candidate_count: usize,
+    /// Local refinement of the promoted candidates.
+    pub refine: RefineConfig,
     /// Recompute every frame each iteration instead of only the stale ones. Debug only — this is
     /// the reference the incremental path is validated against.
     pub full_update: bool,
@@ -59,6 +67,9 @@ impl Default for MpConfig {
             target_snr_db: 30.0,
             min_gain_fraction: 1e-9,
             candidate_count: 1,
+            // Off by default so the library's default is still the plain, fully-validated pursuit.
+            // `Config` turns it on for the CLI.
+            refine: RefineConfig { enabled: false, ..RefineConfig::default() },
             full_update: false,
         }
     }
@@ -78,6 +89,8 @@ pub struct Mp<'a> {
     corrs: Vec<Correlator>,
     states: Vec<BlockState>,
     residual: Vec<f32>,
+    /// Envelopes rendered during refinement, reused across candidates and iterations.
+    cache: EnvelopeCache,
     energy: f64,
     initial_energy: f64,
     sample_rate: f32,
@@ -112,6 +125,7 @@ impl<'a> Mp<'a> {
             corrs,
             states,
             residual: signal.samples.clone(),
+            cache: EnvelopeCache::new(),
             energy: initial_energy,
             initial_energy,
             sample_rate: signal.sample_rate,
@@ -145,8 +159,8 @@ impl<'a> Mp<'a> {
                 break;
             }
 
-            // Step 3: score each seed exactly. Refinement hooks in here.
-            let Some(best) = self.best_candidate(&seeds) else {
+            // Step 3: score each seed exactly, and refine it off the grid.
+            let Some(best) = self.best_candidate(&seeds, &cfg.refine) else {
                 break;
             };
             if best.score() <= 0.0 {
@@ -214,7 +228,7 @@ impl<'a> Mp<'a> {
     /// The frame table stores only energy and bin, so each seed's transform is recomputed here to
     /// recover `amp` and `phi`. That is one extra FFT per candidate, which is free next to the
     /// update — and it is where refinement will attach.
-    fn best_candidate(&mut self, seeds: &[Seed]) -> Option<Candidate> {
+    fn best_candidate(&mut self, seeds: &[Seed], refine_cfg: &RefineConfig) -> Option<Candidate> {
         let mut best: Option<Candidate> = None;
         for &seed in seeds {
             let block = &self.dict.blocks[seed.block];
@@ -223,7 +237,13 @@ impl<'a> Mp<'a> {
                 continue;
             }
             let seed = Seed { bin: k, ..seed };
-            let cand = Candidate::from_seed(seed, block, p.amp, p.phi, p.energy);
+            let mut cand = Candidate::from_seed(seed, block, p.amp, p.phi, p.energy);
+            if refine_cfg.enabled {
+                refine(&mut cand, block, &self.residual, refine_cfg, &mut self.cache);
+            }
+            if cand.score() <= 0.0 {
+                continue;
+            }
             // Strictly greater, so an exact tie keeps the earlier — and better-seeded — candidate.
             if best.as_ref().is_none_or(|b| cand.score() > b.score()) {
                 best = Some(cand);

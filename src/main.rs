@@ -125,7 +125,7 @@ fn run(args: &Args) -> Result<(), String> {
     let mut mp = Mp::new(&dict, &signal, &mut planner);
     let init = t.elapsed();
 
-    let mp_cfg: MpConfig = (&config.pursuit).into();
+    let mp_cfg: MpConfig = config.mp_config();
     let t = Instant::now();
     let book = mp.run(&mp_cfg);
     let pursuit = t.elapsed();
@@ -240,7 +240,29 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #   min_gain       stop when the best atom would remove less than this fraction
 #                  of the remaining residual.
 #   candidate_count  local time-frequency maxima promoted to exact scoring each
-#                    iteration. 1 is the plain global argmax; higher values only
-#                    pay once refinement can move an atom off the grid.
+#                    iteration. 1 is the plain global argmax. Measured, raising
+#                    it changes nothing: the strongest seed is also the seed
+#                    that refines best. It matters only when a candidate can be
+#                    rejected outright rather than merely outscored.
+#
+# [refine]
+#   Moves a selected atom off the grid before it is subtracted, by maximising
+#   captured energy over t0, f, alpha and beta one parameter at a time.
+#   Amplitude and phase are never searched -- they come out of the projection in
+#   closed form. This is the single largest win available: off-grid input needs
+#   12x more atoms than on-grid without it and 3x with it, for about 2% of an
+#   iteration's cost.
+#
+#   enabled                 turn refinement off to get the plain grid pursuit.
+#   rounds, golden_iters    work per candidate, and the dominant cost knobs.
+#   score_tol               stop early when a whole round gains less than this.
+#   alpha_*, beta_*_ms      bounds on the refined envelope, deliberately wider
+#                           than the dictionary grid at both ends.
+#   max_atom_samples        hard cap on the refined support, whatever the bounds
+#                           imply -- a small alpha is a very long atom.
+#   *_bracket, t0_radius    how far from the seed to search. The defaults reach
+#                           the neighbouring grid rung in each direction, so no
+#                           true value is out of reach. t0_radius = 0 derives
+#                           the onset radius from the block's own hop.
 
 ";

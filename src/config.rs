@@ -10,6 +10,7 @@
 use crate::dict::BlockConfig;
 use crate::fof::ReleasePolicy;
 use crate::mp::MpConfig;
+use crate::refine::RefineConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -19,6 +20,7 @@ pub struct Config {
     pub envelope: EnvelopeSettings,
     pub blocks: BlockSettings,
     pub pursuit: PursuitSettings,
+    pub refine: RefineSettings,
 }
 
 /// The release policy, fixed for the whole analysis.
@@ -168,7 +170,61 @@ impl From<&PursuitSettings> for MpConfig {
             target_snr_db: s.target_snr_db,
             min_gain_fraction: s.min_gain,
             candidate_count: s.candidate_count,
+            refine: RefineConfig::default(),
             full_update: false,
+        }
+    }
+}
+
+/// Local refinement of `(t0, f, alpha, beta)` after a candidate is selected.
+///
+/// The frequency range, the conditioning gate and the `alpha*beta` cap are deliberately absent:
+/// they are shared with `[blocks]` and `[dictionary]`, and [`Config::mp_config`] copies them across
+/// so refinement cannot wander into a region the coarse search treats as dead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RefineSettings {
+    pub enabled: bool,
+    /// Passes of the `f -> alpha -> beta -> t0` cycle.
+    pub rounds: usize,
+    /// Stop early when a whole round improves the fit score by less than this fraction.
+    pub score_tol: f64,
+    /// Golden-section evaluations per parameter. The dominant cost knob.
+    pub golden_iters: usize,
+    /// Bounds on the refined envelope, wider than the dictionary grid at both ends.
+    pub alpha_min: f32,
+    pub alpha_max: f32,
+    pub beta_min_ms: f32,
+    pub beta_max_ms: f32,
+    /// Reject any refined envelope longer than this, whatever the bounds imply.
+    pub max_atom_samples: usize,
+    /// Search radii around the seed: bins, then multiplicative factors, then samples.
+    pub f_bracket_bins: f32,
+    pub alpha_bracket: f32,
+    pub beta_bracket: f32,
+    /// 0 derives the onset radius from the block's own hop.
+    pub t0_radius: usize,
+}
+
+impl Default for RefineSettings {
+    fn default() -> Self {
+        let d = RefineConfig::default();
+        Self {
+            enabled: d.enabled,
+            rounds: d.rounds,
+            score_tol: d.score_tol,
+            golden_iters: d.golden_iters,
+            alpha_min: d.alpha_min,
+            alpha_max: d.alpha_max,
+            // Written as milliseconds directly: `beta_min * 1000.0` in f32 renders as
+            // 0.099999994 in the emitted document, which reads like a bug in a hand-edited file.
+            beta_min_ms: 0.1,
+            beta_max_ms: 10.0,
+            max_atom_samples: d.max_atom_samples,
+            f_bracket_bins: d.f_bracket_bins,
+            alpha_bracket: d.alpha_bracket,
+            beta_bracket: d.beta_bracket,
+            t0_radius: d.t0_radius,
         }
     }
 }
@@ -183,6 +239,37 @@ impl Config {
         BlockConfig {
             release: (&self.envelope).into(),
             ..(&self.blocks).into()
+        }
+    }
+
+    /// Pursuit settings with `[refine]` folded in.
+    ///
+    /// The frequency range, conditioning gate and `alpha*beta` cap are copied from the sections
+    /// that already own them, so the coarse and refined paths cannot disagree about which
+    /// parameters are representable.
+    pub fn mp_config(&self) -> MpConfig {
+        let r = &self.refine;
+        MpConfig {
+            refine: RefineConfig {
+                enabled: r.enabled,
+                rounds: r.rounds,
+                score_tol: r.score_tol,
+                golden_iters: r.golden_iters,
+                f_min: self.blocks.f_min,
+                f_max: self.blocks.f_max,
+                alpha_min: r.alpha_min,
+                alpha_max: r.alpha_max,
+                beta_min: r.beta_min_ms / 1000.0,
+                beta_max: r.beta_max_ms / 1000.0,
+                alpha_beta_max: self.dictionary.alpha_beta_max,
+                max_atom_samples: r.max_atom_samples,
+                f_bracket_bins: r.f_bracket_bins,
+                alpha_bracket: r.alpha_bracket,
+                beta_bracket: r.beta_bracket,
+                t0_radius: r.t0_radius,
+                rho_sq_max: self.blocks.rho_sq_max as f64,
+            },
+            ..(&self.pursuit).into()
         }
     }
 
