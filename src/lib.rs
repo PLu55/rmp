@@ -19,7 +19,7 @@ pub use config::Config;
 pub use corr::{Correlator, Projection, project};
 pub use dict::{Block, BlockConfig, Dictionary};
 pub use fft::{Planner, RealFft, RealFftPlanner, next_fast_len};
-pub use fof::{AtomParams, Envelope, EnvelopeParams, FofError};
+pub use fof::{AtomParams, Envelope, EnvelopeParams, FofError, ReleasePolicy};
 pub use mp::{Mp, MpConfig};
 pub use naive::{NaiveConfig, NaiveMp};
 pub use select::SegTree;

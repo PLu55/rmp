@@ -8,6 +8,7 @@
 //! hand-edited, a silently-dropped typo would look exactly like a setting that had no effect.
 
 use crate::dict::BlockConfig;
+use crate::fof::ReleasePolicy;
 use crate::mp::MpConfig;
 use serde::{Deserialize, Serialize};
 
@@ -15,8 +16,48 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     pub dictionary: DictionarySettings,
+    pub envelope: EnvelopeSettings,
     pub blocks: BlockSettings,
     pub pursuit: PursuitSettings,
+}
+
+/// The release policy, fixed for the whole analysis.
+///
+/// rfofs's release is a linear ramp to zero; only where it starts and how long it lasts are settings.
+/// `fade_dur` is derived from `alpha` rather than being a constant — see [`ReleasePolicy`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EnvelopeSettings {
+    /// Amplitude relative to peak at which the release begins. 0.001 is -60 dB.
+    pub fade_level: f32,
+    /// Release duration is `fade_dur_scale / alpha`, clamped to the bounds below.
+    pub fade_dur_scale: f32,
+    /// Clamps on the release duration, in milliseconds.
+    pub fade_dur_min_ms: f32,
+    pub fade_dur_max_ms: f32,
+}
+
+impl Default for EnvelopeSettings {
+    fn default() -> Self {
+        let d = ReleasePolicy::default();
+        Self {
+            fade_level: d.fade_level,
+            fade_dur_scale: d.fade_dur_scale,
+            fade_dur_min_ms: d.fade_dur_min * 1000.0,
+            fade_dur_max_ms: d.fade_dur_max * 1000.0,
+        }
+    }
+}
+
+impl From<&EnvelopeSettings> for ReleasePolicy {
+    fn from(s: &EnvelopeSettings) -> Self {
+        Self {
+            fade_level: s.fade_level,
+            fade_dur_scale: s.fade_dur_scale,
+            fade_dur_min: s.fade_dur_min_ms / 1000.0,
+            fade_dur_max: s.fade_dur_max_ms / 1000.0,
+        }
+    }
 }
 
 /// The `(alpha, beta)` grid.
@@ -78,6 +119,8 @@ impl Default for BlockSettings {
     }
 }
 
+/// Note this leaves [`BlockConfig::release`] at its default: the release policy lives in a different
+/// section, so only [`Config::block_config`] can produce a fully-populated value. Prefer that.
 impl From<&BlockSettings> for BlockConfig {
     fn from(s: &BlockSettings) -> Self {
         Self {
@@ -85,6 +128,7 @@ impl From<&BlockSettings> for BlockConfig {
             f_min: s.f_min,
             f_max: s.f_max,
             rho_sq_max: s.rho_sq_max,
+            release: ReleasePolicy::default(),
         }
     }
 }
@@ -127,6 +171,14 @@ impl Config {
         toml::from_str(text)
     }
 
+    /// Block settings with the release policy from `[envelope]` folded in.
+    pub fn block_config(&self) -> BlockConfig {
+        BlockConfig {
+            release: (&self.envelope).into(),
+            ..(&self.blocks).into()
+        }
+    }
+
     /// A fully-populated settings document, for `--write-config`.
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
@@ -149,6 +201,10 @@ impl Config {
         if !(0.0..1.0).contains(&self.blocks.capture_tolerance) || self.blocks.capture_tolerance == 0.0 {
             return Err("capture_tolerance must be in (0, 1)".into());
         }
+        let release: ReleasePolicy = (&self.envelope).into();
+        release
+            .validate()
+            .map_err(|e| format!("[envelope]: {e}"))?;
         Ok(())
     }
 }
@@ -171,6 +227,38 @@ mod tests {
         assert_eq!(cfg.pursuit.max_atoms, 12);
         assert_eq!(cfg.blocks.f_max, BlockConfig::default().f_max);
         assert_eq!(cfg.dictionary.grid().len(), 22);
+    }
+
+    #[test]
+    fn envelope_section_feeds_the_release_policy() {
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.block_config().release, ReleasePolicy::default());
+
+        let cfg = Config::from_toml(
+            "[envelope]\nfade_level = 0.01\nfade_dur_scale = 4.0\nfade_dur_max_ms = 20.0\n",
+        )
+        .unwrap();
+        let r = cfg.block_config().release;
+        assert_eq!(r.fade_level, 0.01);
+        assert_eq!(r.fade_dur_scale, 4.0);
+        assert_eq!(r.fade_dur_max, 20e-3);
+        assert_eq!(r.fade_dur_min, ReleasePolicy::default().fade_dur_min); // untouched
+        assert!(cfg.validate().is_ok());
+
+        // block_config must carry the other [blocks] settings through, not just the release.
+        let cfg = Config::from_toml("[blocks]\nf_max = 8000.0\n").unwrap();
+        assert_eq!(cfg.block_config().f_max, 8000.0);
+    }
+
+    #[test]
+    fn unusable_release_policies_are_rejected() {
+        for doc in [
+            "[envelope]\nfade_level = 0.0\n",
+            "[envelope]\nfade_level = 1.0\n",
+            "[envelope]\nfade_dur_min_ms = 20.0\nfade_dur_max_ms = 1.0\n",
+        ] {
+            assert!(Config::from_toml(doc).unwrap().validate().is_err(), "{doc}");
+        }
     }
 
     #[test]

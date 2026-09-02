@@ -111,7 +111,7 @@ fn run(args: &Args) -> Result<(), String> {
         &config.dictionary.grid(),
         sr,
         &mut planner,
-        &(&config.blocks).into(),
+        &config.block_config(),
     )
     .map_err(|e| format!("building dictionary: {e}"))?;
     say(&format!(
@@ -211,6 +211,19 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #   alpha_beta_max  combinations above this are dropped. rfofs renders
 #                   alpha*beta > 10 as silence and its amplitude normalisation is
 #                   ill-conditioned well before that.
+#
+# [envelope]
+#   The release policy, fixed for the whole analysis and shared with resynthesis.
+#   rfofs's release is a linear ramp to zero, entered where the raw exponential
+#   decay reaches fade_level.
+#
+#   fade_level                    -60 dB by default.
+#   fade_dur_scale                the release lasts fade_dur_scale/alpha seconds,
+#                                 not a fixed time: a constant duration would run
+#                                 several times longer than the atom body at large
+#                                 alpha, inflating that block's FFT length for no
+#                                 representational gain.
+#   fade_dur_min_ms, _max_ms      clamps on that duration.
 #
 # [blocks]
 #   capture_tolerance  worst-case fraction of an atom's energy a frame must still

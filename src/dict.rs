@@ -19,7 +19,7 @@
 //! make cross-block ranking unfair.
 
 use crate::fft::{RealFftPlanner, next_fast_len};
-use crate::fof::{Envelope, EnvelopeParams, FofError};
+use crate::fof::{Envelope, EnvelopeParams, FofError, ReleasePolicy};
 use realfft::num_complex::Complex32;
 
 /// Tuning for block construction.
@@ -33,6 +33,8 @@ pub struct BlockConfig {
     pub f_max: f32,
     /// Bins with `rho^2` above this are ill-conditioned and disabled.
     pub rho_sq_max: f32,
+    /// Fixed for the whole analysis, and shared with resynthesis.
+    pub release: ReleasePolicy,
 }
 
 impl Default for BlockConfig {
@@ -42,6 +44,7 @@ impl Default for BlockConfig {
             f_min: 50.0,
             f_max: 10_000.0,
             rho_sq_max: 1.0 - 1e-4,
+            release: ReleasePolicy::default(),
         }
     }
 }
@@ -250,9 +253,10 @@ impl Dictionary {
         planner: &mut dyn RealFftPlanner,
         cfg: &BlockConfig,
     ) -> Result<Self, FofError> {
+        cfg.release.validate()?;
         let mut blocks = Vec::new();
         for &(alpha, beta) in grid {
-            let params = EnvelopeParams::new(alpha, beta);
+            let params = EnvelopeParams::with_policy(alpha, beta, &cfg.release);
             match Block::new(params, sample_rate, planner, cfg) {
                 Ok(b) => blocks.push(b),
                 // A grain that renders silent is simply not a usable atom shape.

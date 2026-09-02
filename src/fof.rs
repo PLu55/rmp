@@ -41,6 +41,58 @@
 
 use rfofs::fof::{FofParams, FofPhase, FofState};
 
+/// How the final release is chosen, fixed once when the analyzer is initialized.
+///
+/// rfofs's release is a linear amplitude ramp to zero, entered where the raw exponential decay
+/// reaches `fade_level`. Only its *duration* is a free parameter here, and it is derived from
+/// `alpha` rather than being a constant: a fixed duration would make the ramp several times longer
+/// than the atom body at large `alpha`, inflating that block's FFT length for no representational
+/// gain. Fixing the *policy* — this struct — is what the design requires; fixing the resulting
+/// number is not.
+///
+/// The same policy must be used for analysis and for resynthesis, or the atom subtracted is not the
+/// atom the book replays.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReleasePolicy {
+    /// Amplitude relative to peak at which the natural fade-out begins.
+    pub fade_level: f32,
+    /// `fade_dur = fade_dur_scale / alpha`, before clamping.
+    pub fade_dur_scale: f32,
+    /// Lower clamp on the fade duration, seconds.
+    pub fade_dur_min: f32,
+    /// Upper clamp on the fade duration, seconds.
+    pub fade_dur_max: f32,
+}
+
+impl Default for ReleasePolicy {
+    fn default() -> Self {
+        Self {
+            fade_level: 0.001,
+            fade_dur_scale: 2.0,
+            fade_dur_min: 1e-3,
+            fade_dur_max: 10e-3,
+        }
+    }
+}
+
+impl ReleasePolicy {
+    pub fn validate(&self) -> Result<(), FofError> {
+        if !(self.fade_level > 0.0 && self.fade_level < 1.0) {
+            return Err(FofError::Invalid("fade_level must be in (0, 1)"));
+        }
+        if !(self.fade_dur_scale >= 0.0 && self.fade_dur_scale.is_finite()) {
+            return Err(FofError::Invalid("fade_dur_scale must be >= 0 and finite"));
+        }
+        if !(self.fade_dur_min >= 0.0 && self.fade_dur_min.is_finite()) {
+            return Err(FofError::Invalid("fade_dur_min must be >= 0 and finite"));
+        }
+        if !(self.fade_dur_max >= self.fade_dur_min && self.fade_dur_max.is_finite()) {
+            return Err(FofError::Invalid("fade_dur_max must be >= fade_dur_min"));
+        }
+        Ok(())
+    }
+}
+
 /// Envelope-shaping parameters.
 ///
 /// `E(t)` depends only on these — **not** on `f` or `phi`. That independence is what lets a single
@@ -58,16 +110,26 @@ pub struct EnvelopeParams {
 }
 
 impl EnvelopeParams {
-    /// rfofs's conventional fade settings, with `fade_dur` scaled to the decay rate.
-    ///
-    /// A fixed `fade_dur` would make the fade tail several times longer than the atom body for
-    /// large `alpha`, inflating that block's FFT length for no representational gain.
+    /// Envelope parameters under the default [`ReleasePolicy`].
     pub fn new(alpha: f32, beta: f32) -> Self {
+        Self::with_policy(alpha, beta, &ReleasePolicy::default())
+    }
+
+    /// Envelope parameters under an explicit release policy.
+    ///
+    /// The clamp is written as `min`/`max` rather than `f32::clamp` so that inverted or NaN bounds
+    /// cannot panic here — a bad policy is rejected by [`ReleasePolicy::validate`] and by
+    /// [`EnvelopeParams::validate`], which is where the error belongs.
+    pub fn with_policy(alpha: f32, beta: f32, policy: &ReleasePolicy) -> Self {
+        let (lo, hi) = (
+            policy.fade_dur_min.min(policy.fade_dur_max),
+            policy.fade_dur_min.max(policy.fade_dur_max),
+        );
         Self {
             alpha,
             beta,
-            fade_level: 0.001,
-            fade_dur: (2.0 / alpha).clamp(1e-3, 10e-3),
+            fade_level: policy.fade_level,
+            fade_dur: (policy.fade_dur_scale / alpha).max(lo).min(hi),
         }
     }
 
@@ -490,5 +552,171 @@ mod tests {
         assert!(EnvelopeParams::new(80.0, 0.001).fade_dur > EnvelopeParams::new(2000.0, 0.001).fade_dur);
         assert_eq!(EnvelopeParams::new(80.0, 0.001).fade_dur, 10e-3); // clamped
         assert_eq!(EnvelopeParams::new(5000.0, 0.0001).fade_dur, 1e-3); // clamped
+    }
+
+    // ── the release policy ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn default_policy_reproduces_the_previously_hardcoded_constants() {
+        // Lifting the constants into ReleasePolicy must not move a single envelope, or every
+        // measured hop, support length and performance number changes underneath us.
+        for (alpha, beta) in [(80.0, 0.001), (251.0, 0.003), (2147.0, 0.0003)] {
+            let old = EnvelopeParams {
+                alpha,
+                beta,
+                fade_level: 0.001,
+                fade_dur: (2.0f32 / alpha).clamp(1e-3, 10e-3),
+            };
+            assert_eq!(EnvelopeParams::new(alpha, beta), old);
+        }
+    }
+
+    #[test]
+    fn policy_controls_the_release_and_survives_hostile_bounds() {
+        let p = ReleasePolicy {
+            fade_level: 0.01,
+            fade_dur_scale: 4.0,
+            fade_dur_min: 2e-3,
+            fade_dur_max: 20e-3,
+        };
+        let e = EnvelopeParams::with_policy(500.0, 0.001, &p);
+        assert_eq!(e.fade_level, 0.01);
+        assert_eq!(e.fade_dur, 8e-3); // 4/500, inside the clamps
+
+        // Inverted and non-finite bounds must not panic — they are rejected, not evaluated.
+        let inverted = ReleasePolicy { fade_dur_min: 10e-3, fade_dur_max: 1e-3, ..p };
+        let _ = EnvelopeParams::with_policy(500.0, 0.001, &inverted);
+        assert!(inverted.validate().is_err());
+        assert!(ReleasePolicy { fade_level: 0.0, ..p }.validate().is_err());
+        assert!(ReleasePolicy { fade_dur_scale: f32::NAN, ..p }.validate().is_err());
+        assert!(ReleasePolicy::default().validate().is_ok());
+    }
+
+    // ── spec 17.1: envelope shape, asserted on the render rather than on a formula ───────────────
+
+    /// The attack rise factor at `t`, recovered from the render by dividing out `1/amax` and the
+    /// exponential decay. It must be `0.5*(1 - cos(pi*t/beta_samples))` up to the attack end and
+    /// exactly 1 afterwards.
+    fn rise_factor(env: &Envelope, t: usize) -> f64 {
+        let a = (env.params.alpha / env.sample_rate) as f64;
+        env.samples[t] as f64 * env.params.amax() as f64 * (a * t as f64).exp()
+    }
+
+    #[test]
+    fn envelope_is_zero_at_onset_for_every_grid_shape() {
+        // Not *exactly* zero: the attack rise is `0.5*(1 - cos(pi*t/beta))` evaluated through
+        // rfofs's 4096-entry sine LUT, so `cos(0)` comes back about 1.1e-6 short of 1 and the first
+        // sample lands a few times 1e-7 either side of zero. That is the LUT's accuracy, not a
+        // shape error, and it is six orders below the peak.
+        for alpha in [80.0, 205.0, 524.0, 1342.0, 2147.0] {
+            for beta in [0.0003, 0.001, 0.003] {
+                if alpha * beta > 4.0 {
+                    continue;
+                }
+                let env = Envelope::render(EnvelopeParams::new(alpha, beta), SR).unwrap();
+                let peak = env.samples.iter().cloned().fold(0.0f32, f32::max);
+                assert!(
+                    env.samples[0].abs() < 1e-5 * peak,
+                    "alpha={alpha} beta={beta}: onset {} vs peak {peak}",
+                    env.samples[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attack_reaches_full_amplitude_at_beta_and_holds() {
+        // rfofs's beta is an attack DURATION in seconds, so the rise completes at t = beta*sr —
+        // the spec's "attack end at beta*tau = pi" under its rad/s reading of beta.
+        for (alpha, beta) in [(80.0, 0.003), (251.0, 0.002), (524.0, 0.001)] {
+            let env = Envelope::render(EnvelopeParams::new(alpha, beta), SR).unwrap();
+            let attack_end = (beta * SR).ceil() as usize;
+
+            assert!(rise_factor(&env, attack_end / 2) - 0.5 < 5e-3);
+            for t in attack_end..(attack_end + 8).min(env.support_len()) {
+                let r = rise_factor(&env, t);
+                assert!(
+                    (r - 1.0).abs() < 2e-3,
+                    "alpha={alpha} beta={beta} t={t}: rise {r:.6} should be 1 past the attack"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attack_decay_junction_is_continuous() {
+        for (alpha, beta) in [(80.0, 0.003), (251.0, 0.002), (524.0, 0.001)] {
+            let env = Envelope::render(EnvelopeParams::new(alpha, beta), SR).unwrap();
+            let j = (beta * SR).ceil() as usize;
+            let step = (env.samples[j] - env.samples[j - 1]).abs() as f64;
+            // The one-sample step at the junction must be no larger than the neighbouring steps
+            // inside the attack, i.e. the phase change introduces no discontinuity of its own.
+            let inside = (env.samples[j - 1] - env.samples[j - 2]).abs() as f64;
+            assert!(
+                step <= inside.max(1e-6) * 1.5,
+                "alpha={alpha} beta={beta}: junction step {step:.3e} vs {inside:.3e}"
+            );
+        }
+    }
+
+    #[test]
+    fn decay_log_slope_recovers_alpha() {
+        for (alpha, beta) in [(80.0, 0.001), (251.0, 0.003), (839.0, 0.0003)] {
+            let p = EnvelopeParams::new(alpha, beta);
+            let env = Envelope::render(p, SR).unwrap();
+            let t1 = (beta * SR).ceil() as usize + 16;
+            let t2 = fade_start(&p) - 16;
+            let slope = ((env.samples[t2] as f64).ln() - (env.samples[t1] as f64).ln())
+                / (t2 - t1) as f64;
+            let got = -slope * SR as f64;
+            assert!(
+                (got - alpha as f64).abs() / (alpha as f64) < 2e-3,
+                "alpha={alpha} beta={beta}: recovered {got:.3}"
+            );
+        }
+    }
+
+    /// Where rfofs enters the linear release: the raw decay reaches `fade_level`, clamped so the
+    /// attack always completes first.
+    fn fade_start(p: &EnvelopeParams) -> usize {
+        let natural = (-(p.fade_level as f64).ln() / (p.alpha as f64 / SR as f64)).ceil() as usize;
+        natural.max((p.beta * SR).ceil() as usize)
+    }
+
+    #[test]
+    fn release_is_exactly_linear_to_zero() {
+        for (alpha, beta) in [(80.0, 0.001), (251.0, 0.003), (2147.0, 0.0003)] {
+            let p = EnvelopeParams::new(alpha, beta);
+            let env = Envelope::render(p, SR).unwrap();
+            let t_f = fade_start(&p);
+            let n = env.support_len();
+            assert!(t_f + 4 < n, "alpha={alpha}: release too short to test");
+
+            // A linear ramp has a constant first difference; check it against the ramp's own slope.
+            let step = (env.samples[t_f + 2] - env.samples[t_f + 1]) as f64;
+            assert!(step < 0.0, "alpha={alpha}: release must descend");
+            for t in t_f + 2..n {
+                let d = (env.samples[t] - env.samples[t - 1]) as f64;
+                assert!(
+                    (d - step).abs() < 1e-6 + step.abs() * 1e-3,
+                    "alpha={alpha} t={t}: release step {d:.3e} != {step:.3e}"
+                );
+            }
+            // ...and it lands on zero: one more step past the last sample would cross it.
+            assert!(
+                env.samples[n - 1] as f64 + step <= 1e-9,
+                "alpha={alpha}: release does not reach zero at the end of support"
+            );
+        }
+    }
+
+    #[test]
+    fn analysis_and_resynthesis_share_one_envelope() {
+        // The atom rmp subtracts is rendered by the same code that will replay the book. Rendering
+        // an atom at f=0, phi=PI/2 must reproduce Envelope::render bit for bit.
+        let p = EnvelopeParams::new(251.0, 0.002);
+        let env = Envelope::render(p, SR).unwrap();
+        let atom = AtomParams { t0: 0, f: 0.0, env: p, phi: std::f32::consts::FRAC_PI_2, amp: 1.0 };
+        assert_eq!(atom.render(SR).unwrap(), env.samples);
     }
 }
