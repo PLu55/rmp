@@ -246,7 +246,9 @@ pub struct HrmpSettings {
     /// `localized_candidate` masks the refined atom's own envelope. `legacy_scaled_fof` uses
     /// smaller same-frequency FOFs, as in the historical implementation.
     pub mode: ProbeMode,
-    /// `2^depth` probes. Depth 1 reproduces the historical "half the main scale".
+    /// Probe count, and in `legacy_scaled_fof` also probe scale: that mode needs a larger depth
+    /// than `localized_candidate` to reach the same locality, because a mask can be short at any
+    /// depth while a scaled FOF's support shrinks only as `2^-depth`.
     pub depth: u32,
     /// Reject when a probe's local phase disagrees with the global fit by more than this.
     pub phase_tolerance_deg: f32,
