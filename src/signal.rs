@@ -70,17 +70,35 @@ pub fn snr_db(signal_energy: f64, residual_energy: f64) -> f32 {
     (10.0 * (signal_energy / residual_energy).log10()) as f32
 }
 
-/// Add `src` into `dst` at a signed offset, clipping to `dst`'s bounds.
-pub fn add_at(dst: &mut [f32], src: &[f32], offset: i64) {
+/// Clip `src` placed at a signed `offset` into a buffer of `dst_len`.
+///
+/// Returns `(src_start, dst_start, n)`, or `None` when the two do not overlap at all.
+///
+/// Every path that places an atom against the signal goes through here — writing it
+/// ([`add_at`], [`subtract_at`]), scoring it ([`crate::fit::accumulate`]), and invalidating the
+/// frames it touched ([`crate::mp::Mp::stale_range`]). They have to agree on exactly which samples
+/// an atom occupies, and the cheapest way to guarantee that is to give them one implementation.
+pub fn overlap(dst_len: usize, src_len: usize, offset: i64) -> Option<(usize, usize, usize)> {
     let (src_start, dst_start) = if offset < 0 {
         ((-offset) as usize, 0usize)
     } else {
         (0usize, offset as usize)
     };
-    if src_start >= src.len() || dst_start >= dst.len() {
-        return;
+    if src_start >= src_len || dst_start >= dst_len {
+        return None;
     }
-    let n = (src.len() - src_start).min(dst.len() - dst_start);
+    Some((
+        src_start,
+        dst_start,
+        (src_len - src_start).min(dst_len - dst_start),
+    ))
+}
+
+/// Add `src` into `dst` at a signed offset, clipping to `dst`'s bounds.
+pub fn add_at(dst: &mut [f32], src: &[f32], offset: i64) {
+    let Some((src_start, dst_start, n)) = overlap(dst.len(), src.len(), offset) else {
+        return;
+    };
     for i in 0..n {
         dst[dst_start + i] += src[src_start + i];
     }
@@ -93,15 +111,9 @@ pub fn add_at(dst: &mut [f32], src: &[f32], offset: i64) {
 /// rendered. rfofs's LUT/polynomial carrier means the rendered atom is not exactly the ideal vector
 /// that was projected onto, so assuming the projected energy would let error accumulate silently.
 pub fn subtract_at(residual: &mut [f32], atom: &[f32], offset: i64, old_energy: f64) -> f64 {
-    let (src_start, dst_start) = if offset < 0 {
-        ((-offset) as usize, 0usize)
-    } else {
-        (0usize, offset as usize)
-    };
-    if src_start >= atom.len() || dst_start >= residual.len() {
+    let Some((src_start, dst_start, n)) = overlap(residual.len(), atom.len(), offset) else {
         return old_energy;
-    }
-    let n = (atom.len() - src_start).min(residual.len() - dst_start);
+    };
 
     let (mut dot, mut norm2) = (0.0f64, 0.0f64);
     for i in 0..n {
@@ -138,6 +150,32 @@ mod tests {
         assert!((s.snr_db(25.0) - 0.0).abs() < 1e-6);
         assert!((s.snr_db(0.25) - 20.0).abs() < 1e-4);
         assert_eq!(s.snr_db(0.0), f32::INFINITY);
+    }
+
+    /// `mp` invalidates the frames an atom touched using the range `overlap` reports, so that range
+    /// has to be exactly the set of samples `add_at` and `subtract_at` actually write. Anything
+    /// less and a frame goes silently stale.
+    #[test]
+    fn overlap_is_exactly_what_add_and_subtract_write() {
+        let src = vec![1.0f32; 7];
+        for offset in -9i64..14 {
+            let mut dst = vec![0.0f32; 10];
+            add_at(&mut dst, &src, offset);
+            let touched: Vec<usize> =
+                dst.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(i, _)| i).collect();
+
+            match overlap(dst.len(), src.len(), offset) {
+                None => assert!(touched.is_empty(), "offset {offset} wrote {touched:?}"),
+                Some((src_start, dst_start, n)) => {
+                    assert_eq!(
+                        touched,
+                        (dst_start..dst_start + n).collect::<Vec<_>>(),
+                        "offset {offset}"
+                    );
+                    assert!(src_start + n <= src.len(), "offset {offset} reads past src");
+                }
+            }
+        }
     }
 
     #[test]

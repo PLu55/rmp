@@ -129,17 +129,9 @@ fn accumulate_reseed(
     omega: f64,
     reseed: usize,
 ) -> Option<Quad> {
-    // Clip exactly as `signal::subtract_at` will, so the basis spans the samples that would
-    // actually be written.
-    let (e_start, r_start) = if t0 < 0 {
-        ((-t0) as usize, 0usize)
-    } else {
-        (0usize, t0 as usize)
-    };
-    if e_start >= env.len() || r_start >= residual.len() {
-        return None;
-    }
-    let n = (env.len() - e_start).min(residual.len() - r_start);
+    // Shared with `signal::subtract_at`, so the basis spans exactly the samples that would be
+    // written when this atom is subtracted.
+    let (e_start, r_start, n) = crate::signal::overlap(residual.len(), env.len(), t0)?;
 
     let (sw1, cw1) = omega.sin_cos();
     let (sw2, cw2) = (2.0 * omega).sin_cos();

@@ -27,12 +27,12 @@
 //! arithmetic is where bugs would hide.
 
 use crate::book::{Book, Selection};
+use crate::cand::{Candidate, FrameTable, Seed, top_seeds};
 use crate::corr::Correlator;
 use crate::dict::Dictionary;
 use crate::fft::RealFftPlanner;
-use crate::fof::AtomParams;
 use crate::select::SegTree;
-use crate::signal::{Signal, snr_db, subtract_at};
+use crate::signal::{Signal, overlap, snr_db, subtract_at};
 
 #[derive(Clone, Copy, Debug)]
 pub struct MpConfig {
@@ -41,6 +41,12 @@ pub struct MpConfig {
     pub target_snr_db: f32,
     /// Stop when the best atom would remove less than this fraction of the current residual.
     pub min_gain_fraction: f64,
+    /// How many local maxima to promote per iteration.
+    ///
+    /// 1 reduces the pipeline to the plain global argmax, bit for bit. Promoting more only pays
+    /// once refinement can move an atom off the grid, since without it every candidate is scored
+    /// by the same table the seeds were ranked by.
+    pub candidate_count: usize,
     /// Recompute every frame each iteration instead of only the stale ones. Debug only — this is
     /// the reference the incremental path is validated against.
     pub full_update: bool,
@@ -52,6 +58,7 @@ impl Default for MpConfig {
             max_atoms: 1000,
             target_snr_db: 30.0,
             min_gain_fraction: 1e-9,
+            candidate_count: 1,
             full_update: false,
         }
     }
@@ -126,41 +133,44 @@ impl<'a> Mp<'a> {
             if snr_db(self.initial_energy, self.energy) >= cfg.target_snr_db {
                 break;
             }
-            let Some((bi, frame)) = self.global_argmax() else {
-                break;
-            };
-            if self.states[bi].energy[frame] <= self.energy * cfg.min_gain_fraction {
-                break;
-            }
-
-            let block = &self.dict.blocks[bi];
-            let onset = block.frame_onset(frame);
-
-            // Recompute the winner to recover amp and phi, which are not stored.
-            let (k, p) = scan_frame(&mut self.corrs[bi], block, &self.residual, onset);
-            if p.energy <= 0.0 {
+            // Steps 1-2: promote local maxima and keep the best few.
+            let seeds = self.top_candidates(cfg.candidate_count);
+            let Some(top) = seeds.first() else { break };
+            debug_assert_eq!(
+                self.global_argmax(),
+                Some((top.block, top.frame)),
+                "the strongest seed must be the global argmax"
+            );
+            if top.energy <= self.energy * cfg.min_gain_fraction {
                 break;
             }
 
-            let atom = AtomParams {
-                t0: onset as i64,
-                f: block.bin_hz(k),
-                env: block.env.params,
-                phi: p.phi,
-                amp: p.amp,
+            // Step 3: score each seed exactly. Refinement hooks in here.
+            let Some(best) = self.best_candidate(&seeds) else {
+                break;
             };
-            let Ok(rendered) = atom.render(self.sample_rate) else {
+            if best.score() <= 0.0 {
+                break;
+            }
+
+            // Step 6: synthesize and subtract.
+            let Ok(rendered) = best.atom.render(self.sample_rate) else {
+                break;
+            };
+            let Some((_, tau, atom_len)) =
+                overlap(self.residual.len(), rendered.len(), best.atom.t0)
+            else {
                 break;
             };
 
             let before = self.energy;
-            self.energy = subtract_at(&mut self.residual, &rendered, atom.t0, before);
+            self.energy = subtract_at(&mut self.residual, &rendered, best.atom.t0, before);
             book.selections.push(Selection {
-                atom,
-                block: bi,
-                onset,
-                bin: k,
-                projected_energy: p.energy,
+                atom: best.atom,
+                block: best.seed.block,
+                onset: best.seed.onset,
+                bin: best.seed.bin,
+                projected_energy: best.mp_score,
                 energy_removed: before - self.energy,
                 residual_energy: self.energy,
             });
@@ -169,14 +179,57 @@ impl<'a> Mp<'a> {
                 break; // a rise means a parameter-mapping bug, not noise
             }
 
+            // The invalidated range is the one `subtract_at` just wrote, from the same `overlap`
+            // call — never the seed's frame onset, which stops equalling the atom's `t0` the moment
+            // refinement can move it.
             if cfg.full_update {
                 self.refresh_all();
             } else {
-                self.refresh_stale(onset, rendered.len());
+                self.refresh_stale(tau, atom_len);
             }
         }
 
         book
+    }
+
+    /// The strongest seeds this iteration, best first.
+    fn top_candidates(&self, k: usize) -> Vec<Seed> {
+        let tables: Vec<FrameTable<'_>> = self
+            .states
+            .iter()
+            .enumerate()
+            .map(|(bi, st)| FrameTable {
+                block: bi,
+                energy: &st.energy,
+                bin: &st.bin,
+                hop: self.dict.blocks[bi].hop,
+                support_len: self.dict.blocks[bi].support_len(),
+            })
+            .collect();
+        top_seeds(&tables, k)
+    }
+
+    /// Score every seed and return the best.
+    ///
+    /// The frame table stores only energy and bin, so each seed's transform is recomputed here to
+    /// recover `amp` and `phi`. That is one extra FFT per candidate, which is free next to the
+    /// update — and it is where refinement will attach.
+    fn best_candidate(&mut self, seeds: &[Seed]) -> Option<Candidate> {
+        let mut best: Option<Candidate> = None;
+        for &seed in seeds {
+            let block = &self.dict.blocks[seed.block];
+            let (k, p) = scan_frame(&mut self.corrs[seed.block], block, &self.residual, seed.onset);
+            if p.energy <= 0.0 {
+                continue;
+            }
+            let seed = Seed { bin: k, ..seed };
+            let cand = Candidate::from_seed(seed, block, p.amp, p.phi, p.energy);
+            // Strictly greater, so an exact tie keeps the earlier — and better-seeded — candidate.
+            if best.as_ref().is_none_or(|b| cand.score() > b.score()) {
+                best = Some(cand);
+            }
+        }
+        best
     }
 
     /// Block and frame of the globally best atom. Ties go to the lowest block, then lowest frame.
@@ -268,6 +321,7 @@ mod tests {
     use super::*;
     use crate::dict::BlockConfig;
     use crate::fft::Planner;
+    use crate::fof::AtomParams;
     use crate::naive::{NaiveConfig, NaiveMp};
 
     const SR: f32 = 48_000.0;
@@ -342,6 +396,59 @@ mod tests {
             assert_eq!(a, b, "selection {i} differs:\n  fast {a:?}\n  slow {b:?}");
         }
         assert_eq!(fast_res, slow_res, "residuals differ");
+    }
+
+    /// Promoting more candidates must not change what gets selected until refinement exists.
+    ///
+    /// Scoring a seed recomputes exactly the quantity the frame table already holds, so the
+    /// best-scoring candidate is always the strongest seed however many are promoted. Once
+    /// refinement can move an atom off the grid that stops being true — and this test is what says
+    /// so, by starting to fail.
+    #[test]
+    fn candidate_count_does_not_change_selection_without_refinement() {
+        let d = tiny_dict();
+        let sig = noise(600, 0x2222_3333_4444_5555);
+        let base = MpConfig {
+            max_atoms: 20,
+            target_snr_db: f32::INFINITY,
+            ..Default::default()
+        };
+
+        let (one, one_res) = run(&d, &sig, &base);
+        assert!(one.len() >= 15, "only {} atoms selected", one.len());
+        for k in [2, 8, 32] {
+            let (many, many_res) = run(&d, &sig, &MpConfig { candidate_count: k, ..base });
+            assert_eq!(many.selections, one.selections, "candidate_count = {k}");
+            assert_eq!(many_res, one_res, "candidate_count = {k}: residuals differ");
+        }
+    }
+
+    /// A single event lights up a run of frames; the candidate list must spend its budget on
+    /// distinct events instead of on one ridge.
+    #[test]
+    fn promoted_seeds_are_distinct_events() {
+        let d = tiny_dict();
+        let b0 = &d.blocks[0];
+        let span = b0.k_hi - b0.k_lo;
+        let mut sig = Signal::silence(4_000, SR);
+        for (t0, off) in [(200i64, span / 4), (1_500, span / 2), (3_000, 3 * span / 4)] {
+            let a = on_grid(&d, 0, b0.k_lo + off, t0, 1.0, 0.3);
+            crate::signal::add_at(&mut sig.samples, &a.render(SR).unwrap(), t0);
+        }
+        let mut planner = Planner::new();
+        let mp = Mp::new(&d, &sig, &mut planner);
+
+        let seeds = mp.top_candidates(6);
+        assert!(seeds.len() >= 3, "only {} seeds", seeds.len());
+        for (i, a) in seeds.iter().enumerate() {
+            for b in &seeds[i + 1..] {
+                assert!(
+                    a.block != b.block
+                        || a.onset.abs_diff(b.onset) * 2 >= d.blocks[a.block].support_len(),
+                    "seeds {a:?} and {b:?} are the same event"
+                );
+            }
+        }
     }
 
     /// The strong form of the gate: compare the entire frame table after every single atom.

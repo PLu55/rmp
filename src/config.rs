@@ -142,6 +142,11 @@ pub struct PursuitSettings {
     pub target_snr_db: f32,
     /// Stop when the best atom would remove less than this fraction of the residual.
     pub min_gain: f64,
+    /// Local maxima promoted to exact scoring each iteration.
+    ///
+    /// 1 is the plain global argmax. Promoting more only pays once refinement can move an atom off
+    /// the grid, since otherwise every candidate is scored by the same table that ranked the seeds.
+    pub candidate_count: usize,
 }
 
 impl Default for PursuitSettings {
@@ -151,6 +156,7 @@ impl Default for PursuitSettings {
             max_atoms: d.max_atoms,
             target_snr_db: d.target_snr_db,
             min_gain: d.min_gain_fraction,
+            candidate_count: d.candidate_count,
         }
     }
 }
@@ -161,6 +167,7 @@ impl From<&PursuitSettings> for MpConfig {
             max_atoms: s.max_atoms,
             target_snr_db: s.target_snr_db,
             min_gain_fraction: s.min_gain,
+            candidate_count: s.candidate_count,
             full_update: false,
         }
     }

@@ -239,5 +239,8 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #   target_snr_db  stop once reconstruction reaches this SNR.
 #   min_gain       stop when the best atom would remove less than this fraction
 #                  of the remaining residual.
+#   candidate_count  local time-frequency maxima promoted to exact scoring each
+#                    iteration. 1 is the plain global argmax; higher values only
+#                    pay once refinement can move an atom off the grid.
 
 ";

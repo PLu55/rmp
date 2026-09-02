@@ -4,6 +4,7 @@
 
 pub mod audio;
 pub mod book;
+pub mod cand;
 pub mod config;
 pub mod corr;
 pub mod dict;
@@ -16,6 +17,7 @@ pub mod select;
 pub mod signal;
 
 pub use book::{Book, Selection};
+pub use cand::{Candidate, Seed, top_seeds};
 pub use config::Config;
 pub use corr::{Correlator, Projection, project};
 pub use dict::{Block, BlockConfig, Dictionary};
