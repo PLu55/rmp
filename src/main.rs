@@ -178,14 +178,27 @@ fn run(args: &Args) -> Result<(), String> {
     }
 
     // The residual is the pursuit's own working buffer, so this is the level of what the
-    // decomposition could not explain — an absolute figure, where SNR is a ratio.
+    // decomposition could not explain.
+    //
+    // Reported relative to the input first, because that is the figure you act on — an absolute
+    // dBFS residual means nothing without knowing how loud the input was. The rms ratio is the
+    // negated SNR by construction; it is restated here so the two absolute levels beside it do not
+    // have to be subtracted by eye. The peak ratio is the one that carries new information: it is
+    // where the decomposition is worst rather than where it is on average.
     let residual = mp.residual();
+    let (r_rms, r_peak) = (rms_of(residual), peak_of(residual) as f64);
+    let (s_rms, s_peak) = (signal.rms(), signal.peak() as f64);
     say(&format!(
-        "residual: {:.1} dBFS rms, {:.1} dBFS peak (input {:.1} dBFS rms, {:.1} dBFS peak)",
-        db_fs(rms_of(residual)),
-        db_fs(peak_of(residual) as f64),
-        db_fs(signal.rms()),
-        db_fs(signal.peak() as f64),
+        "residual: {:+.1} dB rms, {:+.1} dB peak relative to input",
+        db_fs(r_rms) - db_fs(s_rms),
+        db_fs(r_peak) - db_fs(s_peak),
+    ));
+    say(&format!(
+        "  absolute: {:.1} dBFS rms, {:.1} dBFS peak (input {:.1} dBFS rms, {:.1} dBFS peak)",
+        db_fs(r_rms),
+        db_fs(r_peak),
+        db_fs(s_rms),
+        db_fs(s_peak),
     ));
 
     // ── write ───────────────────────────────────────────────────────────────
