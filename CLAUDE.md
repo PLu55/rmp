@@ -90,6 +90,20 @@ the `alpha*beta > 10` cliff before rendering.
 not the ideal vector projected onto, so `||R_new||^2` is computed from the rendered atom. Buffers are
 f32; accumulators are f64.
 
+**Never derive amplitude or phase in a bin scan.** `hypot` and `atan2` cost more than everything
+else in the projection put together — at one call per bin per frame they were 60% of total runtime,
+against 13% for the FFT the design treats as its inner loop. Only the energy chooses a bin, so the
+scan compares energies and the full projection is solved once, for the winner. `corr::solve` and
+`fit::Quad::solve_z` exist so the energy-only and full paths cannot drift apart. The same trap is
+live in `refine`, whose 1-D searches read nothing but `.energy` a few hundred times per candidate.
+
+**Blocks are independent, and that is load-bearing for speed.** Each owns its correlator, frame
+table and tree; the only shared thing is the residual, read-only during a refresh. `mp::for_each_block`
+runs them on rayon, which is why `Correlator` holds its own FFT plan and `RealFft::forward` takes
+`&mut self`. Nothing crosses between blocks, so the parallel result is bit-identical and the
+bit-identity gates keep their teeth. Below `PARALLEL_FRAME_THRESHOLD` it stays serial, because
+rayon's per-task overhead is real next to the test fixtures' tiny stale sets.
+
 **`support_len` and `fft_len` are different fields.** The stale set and the envelope use support; the
 frame read and the FFT use `fft_len` (rounded to an even 5-smooth length, not a power of two).
 
@@ -165,22 +179,33 @@ automatically during the test, but a fixture has to apply it by hand.
 
 ## Measured performance
 
-48 kHz, 22-block voice dictionary, one second of audio, 30 planted grains per second:
+48 kHz, 22-block voice dictionary, one second of audio, 30 planted grains per second, 24 threads:
 
 | | on-grid | off-grid, grid only | off-grid, refined |
 | --- | --- | --- | --- |
-| realtime factor | 1.0× | 9.6× | 2.2× |
+| realtime factor | 0.1× | 0.6× | 0.3× |
+| per atom | 1.40 ms | 1.54 ms | 2.95 ms |
 | atoms to 40 dB | 31 | 378 | 91 |
 | splitting factor | 1.4 | 17.2 | 4.5 |
 | median \|Δf\| | 0.0 Hz | 17.8 Hz | 0.1 Hz |
 
-**Per-atom cost is invariant to signal length** (~24 ms across a 10× change), confirming the local
-update works as designed.
+**Analysis runs faster than realtime.** It did not always: three changes took the full refined
+pipeline from 2.2× realtime to 0.3×, a factor of ten, with a bit-identical book. In order of size —
+deriving `amp` and `phi` once per frame rather than once per bin (3.3×, see the invariant below),
+refreshing the blocks in parallel (2.8×), and scanning the Gram rows without the per-bin liveness
+check (1.06×).
 
-**Refinement is the largest single win and is nearly free.** Off-grid input needed 12× more atoms
-than on-grid; refining `(t0, f, alpha, beta)` after selection cuts that to 3×, and cuts wall time
-4.4×. It costs about 0.2 ms per candidate — roughly 2% of a 21 ms iteration — because `refresh_stale`
-dominates everything. 99% of selected atoms move off the grid.
+**Per-atom cost is invariant to signal length**, confirming the local update works as designed.
+
+**Refinement is the largest single win on quality.** Off-grid input needed 12× more atoms than
+on-grid; refining `(t0, f, alpha, beta)` after selection cuts that to 3×, and 99% of selected atoms
+move off the grid.
+
+Refinement is now the *expensive* part of an iteration rather than a rounding error on it — 2.95 ms
+per atom against 1.54 ms without. That is a reversal: it used to be the cheaper of the two because
+`refresh_stale` dominated everything. Parallelising the refresh removed that cover, and refinement's
+few hundred `fit::score_energy` calls per candidate are still serial. It remains worth it four times
+over on atom count, and it is where the next parallelism would go.
 
 **Splitting is largely *caused* by grid mismatch**, which is why it falls with refinement rather than
 needing back-projection. What remains (4.5) is the honest figure for a coherent dictionary.
@@ -192,20 +217,22 @@ because HRMP can *reject* a candidate rather than merely outscore it, and the lo
 somewhere to fall through to.
 
 `cargo bench --bench pursuit` splits one decomposition by stage. At 0.25 s of off-grid audio, each
-arm including its own `init` of 74 ms:
+arm including its own `init` of 2.94 ms:
 
 | arm | atoms | total | per atom |
 | --- | --- | --- | --- |
-| grid | 60 | 1.40 s | 22.2 ms |
-| refined | 60 | 1.19 s | 18.6 ms |
-| hrmp | 42 | 0.92 s | 20.2 ms |
-| full_update | 8 | 0.67 s | 74.0 ms |
+| grid | 60 | 77.2 ms | 1.24 ms |
+| refined | 60 | 81.8 ms | 1.32 ms |
+| hrmp | 60 | 96.9 ms | 1.57 ms |
+| full_update | 8 | 29.2 ms | 3.29 ms |
 
-**The local update is worth 3.3× here**, and far more at longer durations — `full_update` scales with
-the signal, the incremental path does not. Refinement is *cheaper* per atom than the plain grid, not
-merely affordable: a refined atom's support differs from its seed block's, and the stale sets it
-invalidates are on average smaller. HRMP selects fewer atoms in the same budget because it declines
-the ones it cannot justify, which is the point of it.
+**The local update is worth 2.7× here**, and far more at longer durations — `full_update` scales with
+the signal, the incremental path does not. Its margin narrowed when the refresh went parallel, since
+recomputing everything is the more uniform workload and parallelises better.
+
+Refinement costs little on this fixture (0.25 s, sparse) and a great deal on the denser one above
+(1 s, 30 grains/s: 2.95 ms against 1.54 ms). It scales with candidates and rounds, not with the
+signal, so its share grows as the parallel refresh shrinks everything around it.
 
 Refinement's remaining error is concentrated in `(t0, alpha, beta)`, not `f`. All three shape the
 attack, so they trade against each other along a shallow valley that coordinate descent walks down
@@ -285,6 +312,12 @@ changes atom values between the crates. An explicit `RUSTFLAGS` env var override
 rather than merging — don't set both.
 
 `rustfft` is deliberately commented out in `Cargo.toml`; it still arrives transitively via `realfft`.
+
+## Comparing two decompositions
+
+**A WAV written twice is not byte-identical**, because libsndfile stamps a timestamp into the PEAK
+chunk of a float file. Exactly one byte differs and the audio data is untouched, but `cmp` on the
+file reports a difference and reads as nondeterminism. Compare the book, or the data past byte 72.
 
 ## The FFT benchmark
 
