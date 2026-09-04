@@ -55,19 +55,36 @@ impl Projection {
     };
 }
 
-/// Solve the 2-D projection for one bin. Returns [`Projection::ZERO`] for disabled bins.
-pub fn project(block: &Block, k: usize, d_u: f32, d_v: f32) -> Projection {
-    let Some((inv_uu, inv_uv, inv_vv)) = block.gram_inv(k) else {
-        return Projection::ZERO;
-    };
+/// `z = G^-1 d` and the energy it captures, or `None` for a disabled bin.
+///
+/// Shared by [`project`] and [`project_energy`] so the two can never disagree about the energy —
+/// which matters, because selection uses one and the book records the other.
+#[inline]
+fn solve(block: &Block, k: usize, d_u: f32, d_v: f32) -> Option<(f64, f64, f64)> {
+    let (inv_uu, inv_uv, inv_vv) = block.gram_inv(k)?;
     let (du, dv) = (d_u as f64, d_v as f64);
     let z_x = inv_uu as f64 * du + inv_uv as f64 * dv;
     let z_y = inv_uv as f64 * du + inv_vv as f64 * dv;
+    // A negative value can only come from round-off on a near-singular bin.
+    Some((z_x, z_y, (du * z_x + dv * z_y).max(0.0)))
+}
 
-    let energy = du * z_x + dv * z_y;
+/// Captured energy alone, skipping the amplitude and phase.
+///
+/// This is the selection criterion, and it is all a bin scan needs. Deriving `amp` and `phi` costs a
+/// `hypot` and an `atan2` per bin, which together were about 60% of total runtime when
+/// [`Correlator::best_bin`] computed them for every bin instead of once for the winner.
+pub fn project_energy(block: &Block, k: usize, d_u: f32, d_v: f32) -> f64 {
+    solve(block, k, d_u, d_v).map_or(0.0, |(_, _, e)| e)
+}
+
+/// Solve the 2-D projection for one bin. Returns [`Projection::ZERO`] for disabled bins.
+pub fn project(block: &Block, k: usize, d_u: f32, d_v: f32) -> Projection {
+    let Some((z_x, z_y, energy)) = solve(block, k, d_u, d_v) else {
+        return Projection::ZERO;
+    };
     Projection {
-        // A negative value can only come from round-off on a near-singular bin.
-        energy: energy.max(0.0),
+        energy,
         amp: z_x.hypot(z_y) as f32,
         phi: z_y.atan2(z_x) as f32,
     }
@@ -115,16 +132,27 @@ impl Correlator {
     }
 
     /// Best bin of the last correlated frame, with its projection.
+    ///
+    /// The scan compares energies only; the full projection is solved once, for the winner. The
+    /// result is bit-identical to projecting every bin — same arithmetic, same tie-breaking (strict
+    /// `>`, so the lowest bin wins a tie and an all-zero frame reports `k_lo` with
+    /// [`Projection::ZERO`]) — but it does one `hypot` and one `atan2` per frame rather than one per
+    /// bin, which is roughly a thousand times fewer.
     pub fn best_bin(&self, block: &Block) -> (usize, Projection) {
-        let mut best = (block.k_lo, Projection::ZERO);
+        let (mut best_k, mut best_e) = (block.k_lo, 0.0f64);
         for k in block.k_lo..=block.k_hi {
             let (d_u, d_v) = self.at(k);
-            let p = project(block, k, d_u, d_v);
-            if p.energy > best.1.energy {
-                best = (k, p);
+            let e = project_energy(block, k, d_u, d_v);
+            if e > best_e {
+                best_e = e;
+                best_k = k;
             }
         }
-        best
+        if best_e <= 0.0 {
+            return (block.k_lo, Projection::ZERO);
+        }
+        let (d_u, d_v) = self.at(best_k);
+        (best_k, project(block, best_k, d_u, d_v))
     }
 
     /// Turn a selected cell into replayable atom parameters.

@@ -73,6 +73,29 @@ impl Quad {
     /// The conditioning gate is [`crate::dict::Block::new`]'s, rewritten without the `E^2` spectrum:
     /// since `trace = P` and `4*det = P^2 - C^2 - S^2`, `rho^2 = 1 - 4*det/trace^2` exactly.
     pub fn solve(&self, rho_sq_max: f64) -> Option<Projection> {
+        let (z_x, z_y, energy) = self.solve_z(rho_sq_max)?;
+        Some(Projection {
+            energy,
+            amp: z_x.hypot(z_y) as f32,
+            phi: z_y.atan2(z_x) as f32,
+        })
+    }
+
+    /// Captured energy alone, skipping the amplitude and phase.
+    ///
+    /// [`crate::refine`]'s 1-D searches evaluate this a few hundred times per candidate and read
+    /// nothing but the energy, so deriving `amp` and `phi` there is a `hypot` and an `atan2` thrown
+    /// away each time.
+    pub fn energy(&self, rho_sq_max: f64) -> Option<f64> {
+        self.solve_z(rho_sq_max).map(|(_, _, e)| e)
+    }
+
+    /// `z = G^-1 d` and the energy it captures, behind the conditioning gate.
+    ///
+    /// One implementation so [`Quad::solve`] and [`Quad::energy`] cannot disagree — the search
+    /// maximises one and the book records the other.
+    #[inline]
+    fn solve_z(&self, rho_sq_max: f64) -> Option<(f64, f64, f64)> {
         let det = self.g_uu * self.g_vv - self.g_uv * self.g_uv;
         let tr = self.g_uu + self.g_vv;
         // Written as a positive condition so a NaN falls out as `false` rather than through a
@@ -87,12 +110,8 @@ impl Quad {
 
         let z_x = (self.g_vv * self.d_u - self.g_uv * self.d_v) / det;
         let z_y = (self.g_uu * self.d_v - self.g_uv * self.d_u) / det;
-        Some(Projection {
-            // A negative value can only come from round-off on a near-singular fit.
-            energy: (self.d_u * z_x + self.d_v * z_y).max(0.0),
-            amp: z_x.hypot(z_y) as f32,
-            phi: z_y.atan2(z_x) as f32,
-        })
+        // A negative value can only come from round-off on a near-singular fit.
+        Some((z_x, z_y, (self.d_u * z_x + self.d_v * z_y).max(0.0)))
     }
 
     /// Energy removed by subtracting `amp * E * sin(wt + phi)`, for an arbitrary `(amp, phi)`.
@@ -199,6 +218,19 @@ pub fn score_slice(
 ) -> Option<Projection> {
     let omega = std::f64::consts::TAU * f as f64 / sample_rate as f64;
     accumulate(residual, env, t0, omega)?.solve(rho_sq_max)
+}
+
+/// [`score_slice`]'s captured energy alone — the objective the 1-D searches maximise.
+pub fn score_energy(
+    residual: &[f32],
+    env: &[f32],
+    sample_rate: f32,
+    t0: i64,
+    f: f32,
+    rho_sq_max: f64,
+) -> Option<f64> {
+    let omega = std::f64::consts::TAU * f as f64 / sample_rate as f64;
+    accumulate(residual, env, t0, omega)?.energy(rho_sq_max)
 }
 
 /// Index one past the last sample of the exponential body — where the linear release begins.

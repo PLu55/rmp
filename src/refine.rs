@@ -328,8 +328,7 @@ fn fit_score(
     let Some((env, cut)) = cache.get(p.alpha, p.beta, sr, policy, cfg) else {
         return 0.0;
     };
-    fit::score_slice(residual, &env.samples[..*cut], sr, p.t0, p.f, cfg.rho_sq_max)
-        .map_or(0.0, |x| x.energy)
+    fit::score_energy(residual, &env.samples[..*cut], sr, p.t0, p.f, cfg.rho_sq_max).unwrap_or(0.0)
 }
 
 /// The MP score: captured energy over the whole support, including the release.
