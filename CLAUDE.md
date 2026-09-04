@@ -201,11 +201,18 @@ check (1.06×).
 on-grid; refining `(t0, f, alpha, beta)` after selection cuts that to 3×, and 99% of selected atoms
 move off the grid.
 
-Refinement is now the *expensive* part of an iteration rather than a rounding error on it — 2.95 ms
+Refinement is now the *expensive* part of an iteration rather than a rounding error on it — 2.76 ms
 per atom against 1.54 ms without. That is a reversal: it used to be the cheaper of the two because
 `refresh_stale` dominated everything. Parallelising the refresh removed that cover, and refinement's
-few hundred `fit::score_energy` calls per candidate are still serial. It remains worth it four times
-over on atom count, and it is where the next parallelism would go.
+few hundred accumulation passes per candidate are still serial. It remains worth it four times over
+on atom count, and it is where the next parallelism would go.
+
+Caching `G` across the onset sweep — the one stage holding both envelope and carrier fixed, so `G`
+cannot change — takes the refined arm from 266 ms to 248 ms, about 7% of that stage and 3%
+end-to-end. Two failed attempts at the same idea are recorded in `fit`'s comments: splitting the
+accumulation into a data pass and a Gram pass makes the cached case free but costs 15% overall,
+because traversing the envelope twice is dearer than the arithmetic saved and every stage except the
+onset sweep needs both halves anyway. The const-generic specialization is what works.
 
 **Splitting is largely *caused* by grid mismatch**, which is why it falls with refinement rather than
 needing back-projection. What remains (4.5) is the honest figure for a coherent dictionary.

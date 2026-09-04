@@ -24,7 +24,7 @@ pub use config::Config;
 pub use corr::{Correlator, Projection, project};
 pub use dict::{Block, BlockConfig, Dictionary};
 pub use fft::{Planner, RealFft, RealFftPlanner, next_fast_len};
-pub use fit::{Quad, fit_end};
+pub use fit::{Gram, Quad, fit_end};
 pub use fof::{AtomParams, Envelope, EnvelopeParams, FofError, ReleasePolicy};
 pub use hrmp::{HrmpConfig, MagnitudePolicy, Outcome, Placement, ProbeMode, Verdict};
 pub use mp::{Mp, MpConfig};

@@ -21,8 +21,9 @@
 //! [`crate::dict::Block::new`] already reads out of one FFT — so the sign convention is inherited
 //! rather than re-derived, which is the only way to be sure the two paths agree.
 //!
-//! **`G` does not depend on `t0`** for an atom lying wholly inside the signal. A caller sweeping
-//! `t0` at fixed `(alpha, beta, f)` can compute it once.
+//! **`G` does not depend on `t0`** for an atom lying wholly inside the signal, so a caller sweeping
+//! `t0` at fixed `(alpha, beta, f)` computes it once and passes it to [`accumulate_with`]. That is
+//! [`crate::refine`]'s onset stage, the only one holding both the envelope and the carrier fixed.
 //!
 //! # Local atom time
 //!
@@ -66,6 +67,18 @@ pub struct Quad {
 /// below the ~1e-4 ripple rfofs's own polynomial/LUT carrier already carries. It must stay f64: an
 /// f32 rotation would drift 3.6e-3 rad across a 30000-sample support.
 const RESEED: usize = 512;
+
+/// The envelope-and-carrier half of the fit statistics.
+///
+/// `G` depends on the envelope and the carrier frequency, and on nothing else — in particular not
+/// on where the atom sits against the residual. A caller sweeping `t0` at fixed `(alpha, beta, f)`
+/// can therefore compute it once and hand it to every trial.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gram {
+    pub g_uu: f64,
+    pub g_uv: f64,
+    pub g_vv: f64,
+}
 
 impl Quad {
     /// Solve the 2-D projection. Returns `None` for an ill-conditioned or degenerate fit.
@@ -130,7 +143,27 @@ impl Quad {
 ///
 /// Returns `None` if the atom and the signal do not overlap at all.
 pub fn accumulate(residual: &[f32], env: &[f32], t0: i64, omega: f64) -> Option<Quad> {
-    accumulate_reseed(residual, env, t0, omega, RESEED)
+    accumulate_reseed(residual, env, t0, omega, RESEED, None)
+}
+
+/// [`accumulate`] reusing a Gram computed earlier for the same envelope and carrier.
+///
+/// The saving is the whole `E^2` pass and its doubled-frequency rotation — a little over half the
+/// per-sample work — so an onset sweep at fixed `(alpha, beta, f)` pays for `G` once instead of once
+/// per trial.
+///
+/// `cached` is *advisory*: it is used only when nothing was clipped. `fit` clips `G` to the same
+/// sample range as `d`, so an atom overhanging either end of the signal has a different `G` from the
+/// whole-envelope one, and the full path runs instead. Passing a Gram that belongs to some other
+/// envelope or carrier is a caller error this cannot detect.
+pub fn accumulate_with(
+    residual: &[f32],
+    env: &[f32],
+    t0: i64,
+    omega: f64,
+    cached: Option<Gram>,
+) -> Option<Quad> {
+    accumulate_reseed(residual, env, t0, omega, RESEED, cached)
 }
 
 /// [`accumulate`] with the carrier evaluated exactly at every sample — the reference path.
@@ -138,7 +171,12 @@ pub fn accumulate(residual: &[f32], env: &[f32], t0: i64, omega: f64) -> Option<
 /// Kept for the test that pins the recurrence against it, mirroring the `NaiveRef` discipline used
 /// throughout this crate.
 pub fn accumulate_exact(residual: &[f32], env: &[f32], t0: i64, omega: f64) -> Option<Quad> {
-    accumulate_reseed(residual, env, t0, omega, 1)
+    accumulate_reseed(residual, env, t0, omega, 1, None)
+}
+
+/// `G` for `env` placed wholly inside the signal, at carrier `omega` rad/sample.
+pub fn gram(env: &[f32], omega: f64) -> Gram {
+    gram_range(env, 0, env.len(), omega, RESEED)
 }
 
 fn accumulate_reseed(
@@ -147,11 +185,47 @@ fn accumulate_reseed(
     t0: i64,
     omega: f64,
     reseed: usize,
+    cached: Option<Gram>,
 ) -> Option<Quad> {
     // Shared with `signal::subtract_at`, so the basis spans exactly the samples that would be
     // written when this atom is subtracted.
     let (e_start, r_start, n) = crate::signal::overlap(residual.len(), env.len(), t0)?;
 
+    // A cached Gram describes the whole envelope, so it only applies when nothing was clipped.
+    match cached.filter(|_| e_start == 0 && n == env.len()) {
+        Some(g) => {
+            let (d_u, d_v) = walk_sums::<false>(residual, env, e_start, r_start, n, omega, reseed).0;
+            Some(Quad { g_uu: g.g_uu, g_uv: g.g_uv, g_vv: g.g_vv, d_u, d_v, n, e_start })
+        }
+        None => {
+            let ((d_u, d_v), g) =
+                walk_sums::<true>(residual, env, e_start, r_start, n, omega, reseed);
+            Some(Quad { g_uu: g.g_uu, g_uv: g.g_uv, g_vv: g.g_vv, d_u, d_v, n, e_start })
+        }
+    }
+}
+
+/// The accumulation loop, specialized on whether `G` is wanted.
+///
+/// `WITH_GRAM` is a const parameter rather than a runtime flag so the compiler emits two loops from
+/// one source: the full one, identical to what it produced before this split existed, and a
+/// data-only one that drops the `E^2` sums and the doubled-frequency rotation — a little over half
+/// the per-sample work.
+///
+/// Written as one interleaved loop rather than two passes over the data. Two passes were measured
+/// 15% slower overall even though they let the Gram be skipped entirely: traversing the envelope
+/// twice costs more than the arithmetic saved, and the common case (every stage except the onset
+/// sweep) needs both halves anyway.
+#[inline]
+fn walk_sums<const WITH_GRAM: bool>(
+    residual: &[f32],
+    env: &[f32],
+    e_start: usize,
+    r_start: usize,
+    n: usize,
+    omega: f64,
+    reseed: usize,
+) -> ((f64, f64), Gram) {
     let (sw1, cw1) = omega.sin_cos();
     let (sw2, cw2) = (2.0 * omega).sin_cos();
 
@@ -163,37 +237,66 @@ fn accumulate_reseed(
         let chunk = reseed.min(n - i);
         let t = (e_start + i) as f64;
         let (mut s1, mut c1) = (omega * t).sin_cos();
-        let (mut s2, mut c2) = (2.0 * omega * t).sin_cos();
+        let (mut s2, mut c2) = if WITH_GRAM {
+            (2.0 * omega * t).sin_cos()
+        } else {
+            (0.0, 0.0)
+        };
 
         for j in 0..chunk {
             let e = env[e_start + i + j] as f64;
             let r = residual[r_start + i + j] as f64;
-            let e2 = e * e;
-            p += e2;
-            cc += e2 * c2;
-            ss += e2 * s2;
+            if WITH_GRAM {
+                let e2 = e * e;
+                p += e2;
+                cc += e2 * c2;
+                ss += e2 * s2;
+            }
             d_u += r * e * s1;
             d_v += r * e * c1;
 
             let n1 = s1 * cw1 + c1 * sw1;
             c1 = c1 * cw1 - s1 * sw1;
             s1 = n1;
+            if WITH_GRAM {
+                let n2 = s2 * cw2 + c2 * sw2;
+                c2 = c2 * cw2 - s2 * sw2;
+                s2 = n2;
+            }
+        }
+        i += chunk;
+    }
+
+    (
+        (d_u, d_v),
+        Gram { g_uu: (p - cc) * 0.5, g_uv: ss * 0.5, g_vv: (p + cc) * 0.5 },
+    )
+}
+
+/// `G` over envelope indices `[e_start, e_start + n)`.
+///
+/// Only ever called once per onset sweep, so it is written for clarity rather than speed.
+fn gram_range(env: &[f32], e_start: usize, n: usize, omega: f64, reseed: usize) -> Gram {
+    let (sw2, cw2) = (2.0 * omega).sin_cos();
+    let (mut p, mut cc, mut ss) = (0.0f64, 0.0f64, 0.0f64);
+
+    let mut i = 0;
+    while i < n {
+        let chunk = reseed.min(n - i);
+        let (mut s2, mut c2) = (2.0 * omega * (e_start + i) as f64).sin_cos();
+        for j in 0..chunk {
+            let e = env[e_start + i + j] as f64;
+            let e2 = e * e;
+            p += e2;
+            cc += e2 * c2;
+            ss += e2 * s2;
             let n2 = s2 * cw2 + c2 * sw2;
             c2 = c2 * cw2 - s2 * sw2;
             s2 = n2;
         }
         i += chunk;
     }
-
-    Some(Quad {
-        g_uu: (p - cc) * 0.5,
-        g_uv: ss * 0.5,
-        g_vv: (p + cc) * 0.5,
-        d_u,
-        d_v,
-        n,
-        e_start,
-    })
+    Gram { g_uu: (p - cc) * 0.5, g_uv: ss * 0.5, g_vv: (p + cc) * 0.5 }
 }
 
 /// Score an atom of shape `env` at onset `t0` and frequency `f` Hz against `residual`.
@@ -218,19 +321,6 @@ pub fn score_slice(
 ) -> Option<Projection> {
     let omega = std::f64::consts::TAU * f as f64 / sample_rate as f64;
     accumulate(residual, env, t0, omega)?.solve(rho_sq_max)
-}
-
-/// [`score_slice`]'s captured energy alone — the objective the 1-D searches maximise.
-pub fn score_energy(
-    residual: &[f32],
-    env: &[f32],
-    sample_rate: f32,
-    t0: i64,
-    f: f32,
-    rho_sq_max: f64,
-) -> Option<f64> {
-    let omega = std::f64::consts::TAU * f as f64 / sample_rate as f64;
-    accumulate(residual, env, t0, omega)?.energy(rho_sq_max)
 }
 
 /// Index one past the last sample of the exponential body — where the linear release begins.
@@ -355,6 +445,49 @@ mod tests {
                     assert!((a - b).abs() / scale < 1e-11, "{what}: {a} vs {b} at f={f}");
                 }
             }
+        }
+    }
+
+    /// A cached Gram must give bit-identical statistics to recomputing one, or the onset sweep
+    /// optimises a subtly different objective from every other stage.
+    #[test]
+    fn a_cached_gram_matches_a_recomputed_one() {
+        let dict = voice();
+        let block = &dict.blocks[7];
+        let env = &block.env.samples;
+        let signal = noise(24_000, 0xca11);
+        let omega = std::f64::consts::TAU * 880.0 / SR as f64;
+        let g = gram(env, omega);
+
+        for t0 in [0i64, 1, 517, 4_000, 12_345] {
+            let plain = accumulate(&signal, env, t0, omega).unwrap();
+            let cached = accumulate_with(&signal, env, t0, omega, Some(g)).unwrap();
+            assert_eq!(plain, cached, "t0 = {t0}");
+        }
+    }
+
+    /// ...and must be *ignored* where it does not apply. `fit` clips `G` to the same range as `d`,
+    /// so an atom hanging off either end of the signal has a different `G` from the whole-envelope
+    /// one. Silently using the cached value there would overstate a boundary atom's energy.
+    #[test]
+    fn a_cached_gram_is_ignored_when_the_atom_is_clipped() {
+        let dict = voice();
+        let block = &dict.blocks[7];
+        let env = &block.env.samples;
+        let signal = noise(24_000, 0xc11d);
+        let omega = std::f64::consts::TAU * 880.0 / SR as f64;
+        let g = gram(env, omega);
+
+        // Overhanging the start, then the end.
+        for t0 in [-(env.len() as i64) / 2, 24_000 - env.len() as i64 / 2] {
+            let plain = accumulate(&signal, env, t0, omega).unwrap();
+            let cached = accumulate_with(&signal, env, t0, omega, Some(g)).unwrap();
+            assert_eq!(plain, cached, "t0 = {t0}: the clipped Gram must win");
+            assert_ne!(
+                (cached.g_uu, cached.g_uv, cached.g_vv),
+                (g.g_uu, g.g_uv, g.g_vv),
+                "t0 = {t0}: a clipped atom must not reuse the whole-envelope Gram"
+            );
         }
     }
 

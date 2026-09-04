@@ -252,17 +252,27 @@ pub fn refine(
 
         // Onset. Amplitude and phase are re-solved at every trial, so the objective varies on the
         // envelope's scale rather than the carrier's and a bracketed search is well posed.
+        //
+        // This is the one stage that holds both the envelope and the carrier fixed, so `G` is the
+        // same for all dozen-odd trials. Computing it once turns each of them into the data half of
+        // the accumulation alone, a little under half the per-sample work.
+        let t0_gram = {
+            let omega = std::f64::consts::TAU * cur.f as f64 / sr as f64;
+            cache
+                .get(cur.alpha, cur.beta, sr, &policy, cfg)
+                .map(|(env, cut)| fit::gram(&env.samples[..*cut], omega))
+        };
         let (lo, hi) = (
             (cur.t0 - t0_radius as i64) as f64,
             (cur.t0 + t0_radius as i64) as f64,
         );
         golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, |p, x| p.t0 = x.round() as i64, |p| {
-            fit_score(*p, residual, sr, &policy, cfg, cache)
+            fit_score_with(*p, residual, sr, &policy, cfg, cache, t0_gram)
         });
         // Golden section works on a real line; polish the integer it landed between.
         for d in [-1i64, 1] {
             let trial = Params { t0: cur.t0 + d, ..cur };
-            let s = fit_score(trial, residual, sr, &policy, cfg, cache);
+            let s = fit_score_with(trial, residual, sr, &policy, cfg, cache, t0_gram);
             if s > cur_score {
                 cur = trial;
                 cur_score = s;
@@ -325,10 +335,29 @@ fn fit_score(
     cfg: &RefineConfig,
     cache: &mut EnvelopeCache,
 ) -> f64 {
+    fit_score_with(p, residual, sr, policy, cfg, cache, None)
+}
+
+/// [`fit_score`] reusing a Gram already computed for this envelope and carrier.
+///
+/// Only the onset sweep can supply one: it is the single stage where both the envelope and the
+/// carrier are held fixed, so `G` cannot have changed between trials.
+fn fit_score_with(
+    p: Params,
+    residual: &[f32],
+    sr: f32,
+    policy: &ReleasePolicy,
+    cfg: &RefineConfig,
+    cache: &mut EnvelopeCache,
+    gram: Option<fit::Gram>,
+) -> f64 {
     let Some((env, cut)) = cache.get(p.alpha, p.beta, sr, policy, cfg) else {
         return 0.0;
     };
-    fit::score_energy(residual, &env.samples[..*cut], sr, p.t0, p.f, cfg.rho_sq_max).unwrap_or(0.0)
+    let omega = std::f64::consts::TAU * p.f as f64 / sr as f64;
+    fit::accumulate_with(residual, &env.samples[..*cut], p.t0, omega, gram)
+        .and_then(|q| q.energy(cfg.rho_sq_max))
+        .unwrap_or(0.0)
 }
 
 /// The MP score: captured energy over the whole support, including the release.
