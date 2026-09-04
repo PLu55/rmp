@@ -117,11 +117,14 @@ impl Correlator {
     /// Reads past the end of `signal` as zeros, so trailing frames need no padding by the caller.
     pub fn correlate(&mut self, block: &Block, signal: &[f32], onset: usize) {
         let env = &block.env.samples;
-        self.windowed.fill(0.0);
         let avail = signal.len().saturating_sub(onset).min(env.len());
+        // Write the window first and zero only what follows it. The transform scrambles the input,
+        // so the tail has to be re-zeroed every call — but zeroing the whole buffer and then
+        // overwriting most of it writes the leading `avail` samples twice.
         for i in 0..avail {
             self.windowed[i] = signal[onset + i] * env[i];
         }
+        self.windowed[avail..].fill(0.0);
         self.fft.forward(&mut self.windowed, &mut self.spectrum);
     }
 
@@ -139,18 +142,35 @@ impl Correlator {
     /// [`Projection::ZERO`]) — but it does one `hypot` and one `atan2` per frame rather than one per
     /// bin, which is roughly a thousand times fewer.
     pub fn best_bin(&self, block: &Block) -> (usize, Projection) {
-        let (mut best_k, mut best_e) = (block.k_lo, 0.0f64);
-        for k in block.k_lo..=block.k_hi {
-            let (d_u, d_v) = self.at(k);
-            let e = project_energy(block, k, d_u, d_v);
+        // Straight down the Gram rows with no per-bin branch. `gram_inv`'s liveness check is
+        // redundant here: a dead bin holds zeros, so it yields zero energy and cannot beat a
+        // running best that starts at zero. Dropping the `max(0.0)` is free for the same reason —
+        // a negative never wins either.
+        //
+        // Splitting this into a vectorizable energy pass and a separate argmax was tried and
+        // measured no faster: `Complex32`'s interleaved layout means the `.re`/`.im` loads and the
+        // f32-to-f64 widening cost more shuffles than the arithmetic saves. Left as one pass.
+        let (inv_uu, inv_uv, inv_vv) = block.gram_rows();
+        let n = inv_uu.len();
+        let spectrum = &self.spectrum[block.k_lo..block.k_lo + n];
+
+        let (mut best_i, mut best_e) = (0usize, 0.0f64);
+        for i in 0..n {
+            let x = spectrum[i];
+            let (du, dv) = (-x.im as f64, x.re as f64);
+            let z_x = inv_uu[i] as f64 * du + inv_uv[i] as f64 * dv;
+            let z_y = inv_uv[i] as f64 * du + inv_vv[i] as f64 * dv;
+            let e = du * z_x + dv * z_y;
             if e > best_e {
                 best_e = e;
-                best_k = k;
+                best_i = i;
             }
         }
+
         if best_e <= 0.0 {
             return (block.k_lo, Projection::ZERO);
         }
+        let best_k = block.k_lo + best_i;
         let (d_u, d_v) = self.at(best_k);
         (best_k, project(block, best_k, d_u, d_v))
     }

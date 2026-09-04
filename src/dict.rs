@@ -172,6 +172,16 @@ impl Block {
         Some((self.inv_uu[i], self.inv_uv[i], self.inv_vv[i]))
     }
 
+    /// `G^-1`'s three rows over the whole bin range, indexed by `k - k_lo`.
+    ///
+    /// For scanning every bin of a frame. A dead bin holds zeros rather than being marked absent,
+    /// so it projects to zero energy and can never win — which is the point of storing it that way,
+    /// and lets the inner loop run straight down the slices with no per-bin branch. Use
+    /// [`Block::gram_inv`] when you need one bin and care whether it is live.
+    pub fn gram_rows(&self) -> (&[f32], &[f32], &[f32]) {
+        (&self.inv_uu, &self.inv_uv, &self.inv_vv)
+    }
+
     /// The u/v coherence at bin `k`. Near 1.0 means the two basis vectors are nearly parallel and
     /// the projection is ill-conditioned.
     pub fn rho(&self, k: usize) -> Option<f32> {
