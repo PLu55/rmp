@@ -51,6 +51,16 @@ impl Signal {
         energy_of(&self.samples)
     }
 
+    /// Root-mean-square amplitude.
+    pub fn rms(&self) -> f64 {
+        rms_of(&self.samples)
+    }
+
+    /// Largest absolute sample.
+    pub fn peak(&self) -> f32 {
+        peak_of(&self.samples)
+    }
+
     /// `10*log10(self.energy() / residual_energy)`.
     ///
     /// Returns `f32::INFINITY` for an exactly zero residual.
@@ -61,6 +71,29 @@ impl Signal {
 
 pub fn energy_of(samples: &[f32]) -> f64 {
     samples.iter().map(|&s| (s as f64) * (s as f64)).sum()
+}
+
+/// Root-mean-square amplitude. Zero for an empty buffer.
+pub fn rms_of(samples: &[f32]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (energy_of(samples) / samples.len() as f64).sqrt()
+}
+
+/// Largest absolute sample. Zero for an empty buffer.
+pub fn peak_of(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
+}
+
+/// An amplitude as dB relative to full scale, so 1.0 is 0 dBFS.
+///
+/// Returns `f32::NEG_INFINITY` for exact silence rather than `NaN`.
+pub fn db_fs(amplitude: f64) -> f32 {
+    if amplitude <= 0.0 {
+        return f32::NEG_INFINITY;
+    }
+    (20.0 * amplitude.log10()) as f32
 }
 
 pub fn snr_db(signal_energy: f64, residual_energy: f64) -> f32 {
@@ -228,5 +261,21 @@ mod tests {
         for i in 0..2048 {
             assert!((s.samples[i] - (e0.samples[i] + e1.samples[i])).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn rms_peak_and_db_fs() {
+        let s = Signal::new(vec![0.5, -0.5, 0.5, -0.5], SR);
+        assert!((s.rms() - 0.5).abs() < 1e-12);
+        assert_eq!(s.peak(), 0.5);
+        // Half amplitude is -6.02 dBFS.
+        assert!((db_fs(s.rms()) + 6.0206).abs() < 1e-3);
+        assert_eq!(db_fs(1.0), 0.0);
+        assert_eq!(db_fs(0.0), f32::NEG_INFINITY);
+
+        // Empty is silent, not NaN.
+        let empty = Signal::new(Vec::new(), SR);
+        assert_eq!(empty.rms(), 0.0);
+        assert_eq!(empty.peak(), 0.0);
     }
 }

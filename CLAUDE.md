@@ -22,6 +22,8 @@ cargo clippy --all-targets
 
 # the CLI
 ./target/release/rmp in.wav -o resynth.wav [-c settings.toml] [-r residual.wav] [-b book.toml]
+./target/release/rmp in.wav -o resynth.wav -s 2.5 -d 0.5   # analyse one excerpt, in seconds
+./target/release/rmp in.wav -o resynth.wav -b book.json.gz   # any book format, compressed
 ./target/release/rmp --write-config > settings.toml
 
 # end-to-end measurement against synthetic ground truth
@@ -202,6 +204,31 @@ Refinement's remaining error is concentrated in `(t0, alpha, beta)`, not `f`. Al
 attack, so they trade against each other along a shallow valley that coordinate descent walks down
 but not along — a known cost of the one-dimensional method, bounded by a fit that still captures
 99.9% of an isolated atom.
+
+## Book size
+
+A book is dominated by its per-atom record, and the text formats are extravagant about it. Measured
+on a 3000-atom decomposition of 7.0 s of mono 48 kHz audio:
+
+| encoding | bytes | per atom |
+| --- | --- | --- |
+| pretty JSON (`-b book.json`) | 1,597,609 | 532 |
+| compact JSON | 1,009,592 | 336 |
+| gzipped JSON (`-b book.json.gz`) | 229,319 | 76 |
+| fixed-width binary, every field | 231,000 | 77 |
+| replay-only `(t0, f, alpha, beta, phi, amp)` | 72,000 | 24 |
+
+**The JSON book is 1.19× the size of the f32 WAV it decomposes**, so the decomposition expands
+rather than compresses until something is done about it. A `.gz` or `.gzip` suffix on `--book`
+gzips the output and is worth about 7×; the format is then read from the extension *beneath* the
+suffix, so `book.json.gz` is JSON and a bare `book.gz` is TOML, matching the no-extension default.
+
+**A binary format would buy the same 6.9× as gzip and no more** — its advantage would be parse-free
+loading, not size. The size lives in the field list: only 24 of the 77 bytes/atom are replayable
+parameters. `block`/`onset`/`bin` record the pre-refinement grid point, which refinement moved for
+all but one atom of the 3000; the three energies are f64 for what is only ever printed as dB; and
+`fade_level`/`fade_dur` are config constants re-encoded per atom (1 and 7 distinct values in 3000).
+Splitting the replay stream from the diagnostics is where the remaining 22× is, not the encoding.
 
 ## Build configuration — three things that will bite
 

@@ -2,17 +2,21 @@
 //!
 //! ```text
 //! rmp input.wav -o resynth.wav [-c settings.toml] [-r residual.wav] [-b book.toml]
+//!     [-s start_seconds] [-d duration_seconds]
 //! rmp --write-config > settings.toml
 //! ```
 
 use clap::Parser;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use rmp::audio;
 use rmp::book::Book;
 use rmp::config::Config;
 use rmp::dict::Dictionary;
 use rmp::fft::Planner;
 use rmp::mp::{Mp, MpConfig};
-use rmp::signal::Signal;
+use rmp::signal::{db_fs, peak_of, rms_of, Signal};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -40,9 +44,18 @@ struct Args {
     #[arg(short, long)]
     residual: Option<PathBuf>,
 
-    /// Also write the book of recovered atoms. Format follows the extension: .toml or .json.
+    /// Also write the book of recovered atoms. Format follows the extension: .toml or .json,
+    /// either of which may carry a trailing .gz to be compressed.
     #[arg(short, long)]
     book: Option<PathBuf>,
+
+    /// Analyse from this offset into the file, in seconds. Defaults to the start.
+    #[arg(short, long, value_name = "SECONDS")]
+    start: Option<f32>,
+
+    /// Analyse only this many seconds. Defaults to the rest of the file.
+    #[arg(short, long, value_name = "SECONDS")]
+    duration: Option<f32>,
 
     /// Print a fully-commented default settings document and exit.
     #[arg(long)]
@@ -80,8 +93,10 @@ fn run(args: &Args) -> Result<(), String> {
     let read = audio::read(input).map_err(|e| e.to_string())?;
     let downmixed = read.was_downmixed();
     let channels = read.channels;
-    let signal = read.signal;
-    let sr = signal.sample_rate;
+    let whole = read.signal;
+    let sr = whole.sample_rate;
+    let whole_len = whole.len();
+    let (offset, signal) = excerpt(whole, args.start, args.duration)?;
     let duration = signal.len() as f32 / sr;
 
     let say = |m: &str| {
@@ -92,15 +107,30 @@ fn run(args: &Args) -> Result<(), String> {
     say(&format!(
         "{}: {:.2} s, {} Hz, {} channel(s)",
         input.display(),
-        duration,
+        whole_len as f32 / sr,
         sr as u32,
         channels
     ));
+    if signal.len() != whole_len {
+        // Everything downstream — atom onsets in the book, the resynthesis, the residual — is
+        // relative to this excerpt, not to the file.
+        say(&format!(
+            "  analysing {:.3}-{:.3} s ({} samples from {})",
+            offset as f32 / sr,
+            (offset + signal.len()) as f32 / sr,
+            signal.len(),
+            offset
+        ));
+    }
     if downmixed {
         say("  downmixed to mono; out-of-phase content between channels partially cancels");
     }
     if signal.energy() <= 0.0 {
-        return Err("input is silent".into());
+        return Err(if signal.len() == whole_len {
+            "input is silent".into()
+        } else {
+            "the selected excerpt is silent".to_string()
+        });
     }
 
     // ── dictionary ──────────────────────────────────────────────────────────
@@ -147,6 +177,29 @@ fn run(args: &Args) -> Result<(), String> {
         ));
     }
 
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n: Vec<usize> = rmp::hrmp::STATS.iter().map(|c| c.load(Relaxed)).collect();
+        let rn = rmp::hrmp::RHO_N.load(Relaxed);
+        say(&format!(
+            "[diag] hrmp verdicts: too_short {} uninformative {} accepted {} clamped {} rejected {} | stalls {} | mean rho {:.3}",
+            n[0], n[1], n[2], n[3], n[4],
+            rmp::hrmp::STALLS.load(Relaxed),
+            if rn > 0 { rmp::hrmp::RHO_SUM.load(Relaxed) as f64 / 1000.0 / rn as f64 } else { 0.0 }
+        ));
+    }
+
+    // The residual is the pursuit's own working buffer, so this is the level of what the
+    // decomposition could not explain — an absolute figure, where SNR is a ratio.
+    let residual = mp.residual();
+    say(&format!(
+        "residual: {:.1} dBFS rms, {:.1} dBFS peak (input {:.1} dBFS rms, {:.1} dBFS peak)",
+        db_fs(rms_of(residual)),
+        db_fs(peak_of(residual) as f64),
+        db_fs(signal.rms()),
+        db_fs(signal.peak() as f64),
+    ));
+
     // ── write ───────────────────────────────────────────────────────────────
     let resynth = book
         .resynthesize(signal.len())
@@ -170,6 +223,53 @@ fn run(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Cut `[start, start + duration)` out of the signal, in seconds.
+///
+/// Returns the sample offset the excerpt begins at along with the excerpt itself. `None` for
+/// either bound means "the whole file" in that direction; the end is clamped to the file, so
+/// asking for more seconds than remain is not an error, but starting past the end is.
+fn excerpt(
+    signal: Signal,
+    start: Option<f32>,
+    duration: Option<f32>,
+) -> Result<(usize, Signal), String> {
+    if start.is_none() && duration.is_none() {
+        return Ok((0, signal));
+    }
+    let sr = signal.sample_rate;
+
+    let start = start.unwrap_or(0.0);
+    if !(start.is_finite() && start >= 0.0) {
+        return Err(format!("--start must be a non-negative number of seconds, got {start}"));
+    }
+    let begin = (start as f64 * sr as f64).round() as usize;
+    if begin >= signal.len() {
+        return Err(format!(
+            "--start {start} s is at or past the end of the {:.3} s input",
+            signal.len() as f32 / sr
+        ));
+    }
+
+    let end = match duration {
+        None => signal.len(),
+        Some(d) => {
+            if !(d.is_finite() && d > 0.0) {
+                return Err(format!("--duration must be a positive number of seconds, got {d}"));
+            }
+            let n = (d as f64 * sr as f64).round() as usize;
+            if n == 0 {
+                return Err(format!(
+                    "--duration {d} s is under one sample at {} Hz",
+                    sr as u32
+                ));
+            }
+            signal.len().min(begin + n)
+        }
+    };
+
+    Ok((begin, Signal::new(signal.samples[begin..end].to_vec(), sr)))
+}
+
 fn load_config(path: Option<&Path>) -> Result<Config, String> {
     let Some(path) = path else {
         return Ok(Config::default());
@@ -180,8 +280,21 @@ fn load_config(path: Option<&Path>) -> Result<Config, String> {
 }
 
 /// Serialise the book, picking the format from the file extension.
+///
+/// A trailing `.gz` or `.gzip` compresses the output, and the format is then read from the
+/// extension beneath it: `book.json.gz` is gzipped JSON, a bare `book.gz` gzipped TOML. A book is
+/// mostly repeated field names and decimal digits, so this is worth about 7×.
 fn write_book(path: &Path, book: &Book) -> Result<(), String> {
-    let text = match path.extension().and_then(|e| e.to_str()) {
+    let gzip = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("gz" | "gzip")
+    );
+    // Strip the .gz to expose the format extension. Only the extension is ever read from this, so
+    // losing the directory to `file_stem` does not matter.
+    let stem = path.file_stem().unwrap_or_default();
+    let format_path = if gzip { Path::new(stem) } else { path };
+
+    let text = match format_path.extension().and_then(|e| e.to_str()) {
         Some("json") => serde_json::to_string_pretty(book)
             .map_err(|e| format!("serialising book: {e}"))?,
         Some("toml") | None => {
@@ -189,11 +302,20 @@ fn write_book(path: &Path, book: &Book) -> Result<(), String> {
         }
         Some(other) => {
             return Err(format!(
-                "unknown book format '.{other}' — use .toml or .json"
+                "unknown book format '.{other}' — use .toml or .json, optionally with a .gz suffix"
             ));
         }
     };
-    std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))
+
+    let bytes = if gzip {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(text.as_bytes())
+            .and_then(|()| enc.finish())
+            .map_err(|e| format!("compressing book: {e}"))?
+    } else {
+        text.into_bytes()
+    };
+    std::fs::write(path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 const DEFAULT_CONFIG_HEADER: &str = "\
@@ -299,3 +421,111 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #   magnitude_policy        strict_min is the original criterion.
 
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn ramp(n: usize) -> Signal {
+        Signal::new((0..n).map(|i| i as f32).collect(), 1000.0)
+    }
+
+    #[test]
+    fn no_bounds_returns_the_whole_signal() {
+        let (off, got) = excerpt(ramp(500), None, None).unwrap();
+        assert_eq!((off, got.len()), (0, 500));
+    }
+
+    #[test]
+    fn start_and_duration_cut_a_window() {
+        let (off, got) = excerpt(ramp(500), Some(0.1), Some(0.2)).unwrap();
+        assert_eq!((off, got.len()), (100, 200));
+        assert_eq!(got.samples[0], 100.0);
+    }
+
+    #[test]
+    fn duration_is_clamped_to_the_end_of_the_file() {
+        let (off, got) = excerpt(ramp(500), Some(0.4), Some(9.0)).unwrap();
+        assert_eq!((off, got.len()), (400, 100));
+    }
+
+    #[test]
+    fn start_alone_runs_to_the_end() {
+        let (off, got) = excerpt(ramp(500), Some(0.25), None).unwrap();
+        assert_eq!((off, got.len()), (250, 250));
+    }
+
+    fn a_book() -> Book {
+        let mut b = Book::new(1.0, 48_000.0);
+        b.selections.push(rmp::book::Selection {
+            atom: rmp::fof::AtomParams {
+                t0: 17,
+                f: 440.0,
+                env: rmp::fof::EnvelopeParams::new(251.0, 0.001),
+                phi: 0.5,
+                amp: 0.25,
+            },
+            block: 3,
+            onset: 16,
+            bin: 9,
+            projected_energy: 0.5,
+            energy_removed: 0.5,
+            residual_energy: 0.5,
+            hr_score: None,
+            refined: true,
+        });
+        b
+    }
+
+    /// The .gz is stripped before the format is read, and the bytes on disk are a gzip member that
+    /// inflates back to the same book.
+    #[test]
+    fn a_gz_suffix_compresses_and_the_format_comes_from_beneath_it() {
+        let dir = std::env::temp_dir().join(format!("rmp-book-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = a_book();
+
+        for (name, gzipped) in [
+            ("b.json", false),
+            ("b.json.gz", true),
+            ("b.toml.gzip", true),
+            ("b.gz", true),
+        ] {
+            let path = dir.join(name);
+            write_book(&path, &book).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes.starts_with(&[0x1f, 0x8b]), gzipped, "{name}");
+
+            let text = if gzipped {
+                let mut out = String::new();
+                flate2::read::GzDecoder::new(&bytes[..])
+                    .read_to_string(&mut out)
+                    .unwrap();
+                out
+            } else {
+                String::from_utf8(bytes).unwrap()
+            };
+            // A bare .gz falls through to TOML, the same as no extension at all.
+            let back: Book = if name.contains(".json") {
+                serde_json::from_str(&text).unwrap()
+            } else {
+                toml::from_str(&text).unwrap()
+            };
+            assert_eq!(back, book, "{name}");
+        }
+
+        assert!(write_book(&dir.join("b.yaml"), &book).is_err());
+        assert!(write_book(&dir.join("b.yaml.gz"), &book).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn out_of_range_or_negative_bounds_are_errors() {
+        assert!(excerpt(ramp(500), Some(0.5), None).is_err());
+        assert!(excerpt(ramp(500), Some(-0.1), None).is_err());
+        assert!(excerpt(ramp(500), None, Some(0.0)).is_err());
+        // Rounds to zero samples at 1 kHz.
+        assert!(excerpt(ramp(500), None, Some(1e-4)).is_err());
+    }
+}
