@@ -62,6 +62,13 @@ pub struct MpConfig {
     /// Give up after this many consecutive iterations in which every candidate was rejected.
     ///
     /// Only reachable under HRMP, and it is the spec's "no candidate passes" stopping condition.
+    ///
+    /// It has to be generous. A rejection is local — one frame whose residual does not support the
+    /// atom the dictionary proposes there — and on dense polyphonic material a long run of them is
+    /// ordinary, not a signal that the decomposition is finished. Each stall demotes at least one
+    /// frame, so a run of stalls is progress through the table rather than a spin; setting this
+    /// small turns a strict HRMP configuration into an early stop, which reads as "HRMP produces
+    /// far too few atoms".
     pub max_stalls: usize,
     /// Recompute every frame each iteration instead of only the stale ones. Debug only — this is
     /// the reference the incremental path is validated against.
@@ -79,7 +86,7 @@ impl Default for MpConfig {
             // `Config` turns it on for the CLI.
             refine: RefineConfig { enabled: false, ..RefineConfig::default() },
             hrmp: HrmpConfig::default(),
-            max_stalls: 16,
+            max_stalls: 4096,
             full_update: false,
         }
     }
@@ -161,7 +168,12 @@ impl<'a> Mp<'a> {
         let mut book = Book::new(self.initial_energy, self.sample_rate);
         let mut stalls = 0usize;
 
-        for _ in 0..cfg.max_atoms {
+        // `max_atoms` bounds *selected* atoms, not iterations: an iteration in which HRMP rejects
+        // every candidate adds nothing to the book, so charging it to the atom budget would let a
+        // strict HRMP setting exhaust the budget on atoms it refused. Termination does not depend
+        // on this loop being counted, because each rejection demotes at least one frame to zero and
+        // `max_stalls` bounds how many may pass without a selection.
+        while book.len() < cfg.max_atoms {
             if snr_db(self.initial_energy, self.energy) >= cfg.target_snr_db {
                 break;
             }
@@ -186,13 +198,20 @@ impl<'a> Mp<'a> {
             // same argmax and the loop spins forever with no error. The demotion is undone
             // naturally the next time `refresh_stale` touches that frame, which is correct — the
             // residual there will have changed, so the verdict has to be retaken.
+            //
+            // This happens whether or not some *other* seed was selected. A rejection is a fact
+            // about the residual at that frame, so leaving the frame's energy standing because a
+            // different candidate won means the next iteration promotes the same doomed seed again
+            // and burns a candidate slot on it every iteration until an atom happens to overlap it.
+            let demoted = !chosen.demote.is_empty();
+            for &(bi, frame, energy) in &chosen.demote {
+                self.states[bi].energy[frame] = energy;
+                self.states[bi].tree.set(frame, energy);
+            }
+
             let Some(best) = chosen.best else {
-                if chosen.demote.is_empty() {
+                if !demoted {
                     break;
-                }
-                for (bi, frame, energy) in chosen.demote {
-                    self.states[bi].energy[frame] = energy;
-                    self.states[bi].tree.set(frame, energy);
                 }
                 stalls += 1;
                 if stalls >= cfg.max_stalls {
@@ -672,6 +691,41 @@ mod tests {
         for w in book.selections.windows(2) {
             assert!(w[1].residual_energy < w[0].residual_energy);
         }
+    }
+
+    /// A rejection costs an iteration, never a slot in the atom budget.
+    ///
+    /// The failure this pins down is quiet: with `max_atoms` counting iterations, an HRMP setting
+    /// that rejects most candidates returns a book far shorter than the budget and reports having
+    /// stopped short of the SNR target, which reads as "HRMP finds no atoms" rather than as a
+    /// budget spent on refusals.
+    #[test]
+    fn rejections_do_not_consume_the_atom_budget() {
+        let d = tiny_dict();
+        let sig = noise(4_000, 0x5151_2323_9999_1111);
+        // Tight enough that most candidates are refused, loose enough that some still pass.
+        let hrmp = HrmpConfig {
+            enabled: true,
+            phase_tolerance_rad: 0.15,
+            min_probe_energy: 1e-9,
+            depth: 3,
+            ..HrmpConfig::default()
+        };
+        let cfg = MpConfig {
+            max_atoms: 12,
+            target_snr_db: f32::INFINITY,
+            candidate_count: 1,
+            max_stalls: 4096,
+            hrmp,
+            ..Default::default()
+        };
+        let (book, _) = run(&d, &sig, &cfg);
+        assert_eq!(
+            book.len(),
+            12,
+            "the budget is atoms, not iterations: got {} of 12",
+            book.len()
+        );
     }
 
     /// The strong form of the gate: compare the entire frame table after every single atom.

@@ -113,7 +113,14 @@ a seed and a refined candidate must always be compared through `fit`.
 **A rejected HRMP candidate must be demoted, not just skipped.** `mp::run` breaks the pursuit when
 residual energy rises, so a rejection must never reach that line. Writing the rejected score back
 into the frame table and its segment tree is what stops the next iteration recomputing the same
-argmax forever — an infinite loop with no error message.
+argmax forever — an infinite loop with no error message. The demotion happens whether or not some
+*other* seed was selected that iteration: a rejection is a fact about the residual at that frame,
+and leaving its energy standing means the next iteration promotes the same doomed seed again.
+
+**`max_atoms` counts selected atoms, not iterations.** An iteration where HRMP rejects everything
+adds nothing to the book, so charging it to the budget lets a strict setting spend the whole budget
+on atoms it refused. `max_stalls` is what bounds a barren stretch; the atom cap must not double as
+an iteration cap or the two limits interfere.
 
 **`signal::overlap` is the single definition of which samples an atom occupies.** Writing it
 (`add_at`, `subtract_at`), scoring it (`fit::accumulate`) and invalidating the frames it touched
@@ -204,6 +211,37 @@ Refinement's remaining error is concentrated in `(t0, alpha, beta)`, not `f`. Al
 attack, so they trade against each other along a shallow valley that coordinate descent walks down
 but not along — a known cost of the one-dimensional method, bounded by a fit that still captures
 99.9% of an isolated atom.
+
+### HRMP on real material: the two settings that decide everything
+
+The synthetic fixtures are sparse and isolated, and HRMP's original defaults were tuned there. Dense
+polyphonic audio behaves differently, because a probe's local residual carries *other events*, so a
+local phase far from the global fit is ordinary rather than evidence of a bridged gap. Measured on
+0.5 s of solo piano at 48 kHz, `candidate_count = 1`, refinement on, target 40 dB:
+
+| phase tolerance | depth | atoms | SNR | rejected |
+| --- | --- | --- | --- | --- |
+| 45° | 2 | 136 | 11.7 dB | 3864 |
+| 60° | 2 | 1078 | 40.0 dB | 2791 |
+| 90° | 2 | 1111 | 40.0 dB | 917 |
+| 90° | 1 | 979 | 40.0 dB | 0 |
+| HRMP off | — | 920 | 40.0 dB | — |
+
+**`phase_tolerance_deg` saturates at 90.** The `dot > 0` sign rule rejects everything beyond a
+quarter turn on its own, so 90 and 179 give bit-identical books; the setting only ever tightens.
+45° is not a mild tightening — it is the difference between a decomposition and a failure.
+
+**`depth` is the strictness knob, not just a resolution knob.** Rejection is "any probe disagrees",
+so the rate climbs with the probe count: `2^depth` masks means `2^(depth+1) - 1` overlapping probes.
+Depth 1 rejects nothing on this material and still clamps 85% of what it passes at a mean `rho` of
+0.79 — HRMP is fully engaged, just not trigger-happy.
+
+At depth 1 and 90°, HRMP costs about 6% more atoms than plain MP for the same SNR. That is the
+honest price of the constraint; anything far above it means a setting is rejecting good atoms.
+
+`noise_epsilon` moves the same dial from the other end: lowering it to 0.05 makes most probes
+uninformative (698 of 745 here), so HRMP passes almost everything through unchanged. That reaches
+40 dB in 897 atoms but is close to disabling HRMP rather than tuning it.
 
 ## Book size
 

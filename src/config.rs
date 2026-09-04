@@ -151,6 +151,11 @@ pub struct PursuitSettings {
     /// 1 is the plain global argmax. Promoting more only pays once refinement can move an atom off
     /// the grid, since otherwise every candidate is scored by the same table that ranked the seeds.
     pub candidate_count: usize,
+    /// Give up after this many consecutive iterations in which every candidate was rejected.
+    ///
+    /// Only reachable under HRMP. On dense polyphonic material a run of rejections is normal, so
+    /// this is what decides whether HRMP declines a few atoms or ends the pursuit outright.
+    pub max_stalls: usize,
 }
 
 impl Default for PursuitSettings {
@@ -161,13 +166,13 @@ impl Default for PursuitSettings {
             target_snr_db: d.target_snr_db,
             min_gain: d.min_gain_fraction,
             candidate_count: d.candidate_count,
+            max_stalls: d.max_stalls,
         }
     }
 }
 
 impl From<&PursuitSettings> for MpConfig {
     fn from(s: &PursuitSettings) -> Self {
-        let d_mp = MpConfig::default();
         Self {
             max_atoms: s.max_atoms,
             target_snr_db: s.target_snr_db,
@@ -175,7 +180,7 @@ impl From<&PursuitSettings> for MpConfig {
             candidate_count: s.candidate_count,
             refine: RefineConfig::default(),
             hrmp: HrmpConfig::default(),
-            max_stalls: d_mp.max_stalls,
+            max_stalls: s.max_stalls,
             full_update: false,
         }
     }

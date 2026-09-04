@@ -177,18 +177,6 @@ fn run(args: &Args) -> Result<(), String> {
         ));
     }
 
-    {
-        use std::sync::atomic::Ordering::Relaxed;
-        let n: Vec<usize> = rmp::hrmp::STATS.iter().map(|c| c.load(Relaxed)).collect();
-        let rn = rmp::hrmp::RHO_N.load(Relaxed);
-        say(&format!(
-            "[diag] hrmp verdicts: too_short {} uninformative {} accepted {} clamped {} rejected {} | stalls {} | mean rho {:.3}",
-            n[0], n[1], n[2], n[3], n[4],
-            rmp::hrmp::STALLS.load(Relaxed),
-            if rn > 0 { rmp::hrmp::RHO_SUM.load(Relaxed) as f64 / 1000.0 / rn as f64 } else { 0.0 }
-        ));
-    }
-
     // The residual is the pursuit's own working buffer, so this is the level of what the
     // decomposition could not explain — an absolute figure, where SNR is a ratio.
     let residual = mp.residual();
@@ -366,6 +354,15 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #                    it changes nothing: the strongest seed is also the seed
 #                    that refines best. It matters only when a candidate can be
 #                    rejected outright rather than merely outscored.
+#   max_stalls     give up after this many consecutive iterations in which every
+#                  candidate was rejected. Reachable only under HRMP, and it
+#                  wants to be generous: a rejection is one frame's residual
+#                  declining one proposed atom, and on dense material a long run
+#                  of them is ordinary. A small value turns a strict HRMP setting
+#                  into an early stop that looks like 'HRMP finds no atoms'.
+#
+#   max_atoms counts atoms actually selected; a rejected iteration adds nothing
+#   to the book and is not charged to the budget.
 #
 # [refine]
 #   Moves a selected atom off the grid before it is subtracted, by maximising
@@ -407,8 +404,19 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #                           ones reading noise, and a strict minimum over
 #                           unequal variances measures the noisiest probe
 #                           instead of the least supported region.
+#                           It is also the strictness knob. Rejection is 'any
+#                           probe disagrees', so the rejection rate climbs with
+#                           the probe count: on piano at 48 kHz, depth 2 rejects
+#                           roughly as many candidates as it accepts where depth
+#                           1 rejects none and still clamps 85% of them.
 #   phase_tolerance_deg     reject when a probe's local phase disagrees with the
-#                           global fit by more than this.
+#                           global fit by more than this. Capped in effect at 90:
+#                           the sign rule rejects anything beyond a quarter turn
+#                           by itself, so larger values are no-ops. Smaller ones
+#                           bite hard -- 45 rejects the large majority of
+#                           candidates on polyphonic material, because a local
+#                           residual carrying other events routinely sits a
+#                           quarter turn from the global fit.
 #   minimum_probe_energy    structural floor on a probe's share of the atom's
 #                           energy before it gets a vote.
 #   noise_epsilon           bound on each local amplitude's relative standard

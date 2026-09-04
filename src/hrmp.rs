@@ -92,6 +92,13 @@ pub struct HrmpConfig {
     /// a larger depth than `localized_candidate` to reach the same locality, because a mask can be
     /// short at any depth while a scaled FOF's support shrinks only with it.
     pub depth: u32,
+    /// Reject when a probe's local phase disagrees with the global fit by more than this.
+    ///
+    /// Effectively capped at `PI/2`: the sign rule `dot > 0` rejects everything beyond a quarter
+    /// turn on its own, so a tolerance at or above 90 degrees means "sign consistency only", and
+    /// raising it further changes nothing. Below that it bites quickly — on dense polyphonic
+    /// material the residual under a probe carries other events, so a local phase a quarter turn
+    /// from the global fit is common and 45 degrees rejects the great majority of candidates.
     pub phase_tolerance_rad: f32,
     /// Structural floor on a probe's share of the atom's energy.
     pub min_probe_energy: f64,
@@ -110,7 +117,7 @@ impl Default for HrmpConfig {
             enabled: false,
             mode: ProbeMode::LocalizedCandidate,
             depth: 2,
-            phase_tolerance_rad: std::f32::consts::FRAC_PI_4,
+            phase_tolerance_rad: std::f32::consts::FRAC_PI_2,
             min_probe_energy: 1e-3,
             noise_epsilon: 0.2,
             min_mask_periods: 2.0,
