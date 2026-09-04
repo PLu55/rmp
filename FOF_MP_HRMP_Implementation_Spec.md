@@ -1,9 +1,10 @@
 # FOF Matching Pursuit / High-Resolution Matching Pursuit
+
 ## Implementation Specification for Analysis and Resynthesis
 
 **Status:** design specification for implementation  
 **Purpose:** provide enough mathematical, algorithmic, and software detail for an AI coding agent to implement a FOF-based Matching Pursuit (MP) and High-Resolution Matching Pursuit (HRMP) analyzer/resynthesizer.  
-**Primary historical references:** Gribonval et al. (HRMP), LastWave 2.0.4, and MPTK.  
+**Primary historical references:** Gribonval et al. (HRMP), LastWave 2.0.4, and MPTK.
 
 ---
 
@@ -12,7 +13,7 @@
 Implement an analysis system that decomposes an audio signal into a sparse sum of Rodet-style Formant-Wave-Function (FOF) atoms plus a residual:
 
 \[
-x[n] \approx \sum_{k=0}^{K-1} g_k[n] + r_K[n].
+x[n] \approx \sum\_{k=0}^{K-1} g_k[n] + r_K[n].
 \]
 
 Each extracted FOF should have the parameters
@@ -90,7 +91,7 @@ The real FOF is
 
 \[
 g[n] = A\,e(\tau;\alpha,\beta,\rho_0)
-       \cos(2\pi f\tau+\phi).
+\cos(2\pi f\tau+\phi).
 \]
 
 ### 3.1 Attack and exponential decay
@@ -128,11 +129,11 @@ A suitable reference convention is:
    t_r=-\frac{\ln a_r}{\alpha};
    \]
 
-3. over the globally fixed release duration \(T_\rho\) represented by \(\rho_0\), replace the exponential tail by a straight line from \(a_r\) to zero:
+3. over the globally fixed release duration \(T\_\rho\) represented by \(\rho_0\), replace the exponential tail by a straight line from \(a_r\) to zero:
 
    \[
-   e(\tau)=a_r\left(1-\frac{\tau-t_r}{T_\rho}\right),
-   \qquad t_r\le\tau<t_r+T_\rho;
+   e(\tau)=a*r\left(1-\frac{\tau-t_r}{T*\rho}\right),
+   \qquad t*r\le\tau<t_r+T*\rho;
    \]
 
 4. set the envelope to zero afterward.
@@ -220,7 +221,7 @@ A=\sqrt{a^2+b^2},
 The energy removed by the orthogonal projection onto this two-dimensional quadrature subspace is
 
 \[
-E_{\mathrm{capt}}=p^T G^{-1}p.
+E\_{\mathrm{capt}}=p^T G^{-1}p.
 \]
 
 Use this quantity as the exact MP score for a fixed envelope/time/frequency candidate.
@@ -244,15 +245,15 @@ H_2(\omega)=\sum_n e[n]^2 e^{-j2\omega n}.
 Then
 
 \[
-G_{cc}=\frac12(E+\Re H_2),
+G\_{cc}=\frac12(E+\Re H_2),
 \]
 
 \[
-G_{ss}=\frac12(E-\Re H_2),
+G\_{ss}=\frac12(E-\Re H_2),
 \]
 
 \[
-G_{cs}=-\frac12\Im H_2.
+G\_{cs}=-\frac12\Im H_2.
 \]
 
 If the complex correlation is
@@ -296,7 +297,7 @@ At iteration \(k\):
 5. subtract it from the residual:
 
    \[
-   r_{k+1}[n]=r_k[n]-g_k[n];
+   r\_{k+1}[n]=r_k[n]-g_k[n];
    \]
 
 6. append the atom parameters to the decomposition book;
@@ -335,7 +336,7 @@ Use scale-coupled FOFs only as **seed templates**.
 For example, create templates for window lengths
 
 \[
-N\in\{N_0,2N_0,4N_0,\ldots,N_{\max}\}.
+N\in\{N*0,2N_0,4N_0,\ldots,N*{\max}\}.
 \]
 
 Each template supplies initial
@@ -389,7 +390,7 @@ For every trial \((\alpha,\beta)\):
 4. evaluate
 
    \[
-   E_{\mathrm{capt}}(\alpha,\beta)=p^TG^{-1}p;
+   E\_{\mathrm{capt}}(\alpha,\beta)=p^TG^{-1}p;
    \]
 
 5. maximize this score over only the nonlinear parameters.
@@ -474,8 +475,8 @@ by weighted least squares:
 
 \[
 \hat q=
-\frac{\sum_n w_n z[n+1]z[n]^*}
-     {\sum_n w_n|z[n]|^2}.
+\frac{\sum_n w_n z[n+1]z[n]^\*}
+{\sum_n w_n|z[n]|^2}.
 \]
 
 Then
@@ -505,13 +506,13 @@ u(\tau)=\frac{1-\cos(\beta\tau)}{2}.
 Its 50% point obeys
 
 \[
-\beta t_{50}=\frac{\pi}{2},
+\beta t\_{50}=\frac{\pi}{2},
 \]
 
 hence
 
 \[
-\beta_0\approx\frac{\pi}{2t_{50}}.
+\beta*0\approx\frac{\pi}{2t*{50}}.
 \]
 
 Use this only as an initializer. Final \(\beta\) should be obtained from a one-dimensional profile fit or variable-projection score.
@@ -572,21 +573,21 @@ If the candidate is genuinely present throughout its support, the \(q_i\) should
 Let the main fitted phasor be
 
 \[
-c_{\mathrm{main}}=A_{\mathrm{main}}e^{j\phi_{\mathrm{main}}}.
+c*{\mathrm{main}}=A*{\mathrm{main}}e^{j\phi\_{\mathrm{main}}}.
 \]
 
 A strict generalized HRMP magnitude is
 
 \[
-A_{\mathrm{HR}}=
-\min\left(A_{\mathrm{main}},\min_i|q_i|\right).
+A*{\mathrm{HR}}=
+\min\left(A*{\mathrm{main}},\min_i|q_i|\right).
 \]
 
 Reject the candidate if local phases are inconsistent. Otherwise use
 
 \[
-c_{\mathrm{HR}}=
-A_{\mathrm{HR}}e^{j\phi_{\mathrm{main}}}.
+c*{\mathrm{HR}}=
+A*{\mathrm{HR}}e^{j\phi\_{\mathrm{main}}}.
 \]
 
 The HRMP candidate score is the energy captured using this clamped amplitude, not the unconstrained ordinary-MP amplitude.
@@ -596,14 +597,14 @@ The HRMP candidate score is the energy captured using this clamped amplitude, no
 For each valid probe compute
 
 \[
-\Delta\phi_i=
-\arg(q_i c_{\mathrm{main}}^*).
+\Delta\phi*i=
+\arg(q_i c*{\mathrm{main}}^\*).
 \]
 
 Strict mode should require
 
 \[
-|\Delta\phi_i|<\phi_{\max}
+|\Delta\phi*i|<\phi*{\max}
 \]
 
 for all informative probes.
@@ -643,7 +644,7 @@ This is the recommended extension for the final flexible FOF model.
 Implement strict HRMP first:
 
 \[
-A_{\mathrm{HR}}=\min_i |q_i|.
+A\_{\mathrm{HR}}=\min_i |q_i|.
 \]
 
 Optionally add a robust mode later using a low quantile instead of the absolute minimum. Do not call the robust mode identical to the original HRMP; expose it as a separate policy.
@@ -665,7 +666,7 @@ For every seed FOF template:
 
 ### Step 2 - form top candidates
 
-Merge maxima across scales/templates and keep the best \(K_{\mathrm{cand}}\) candidates.
+Merge maxima across scales/templates and keep the best \(K\_{\mathrm{cand}}\) candidates.
 
 Each candidate contains at least
 
@@ -717,7 +718,7 @@ g_k[n]=A_k e[n]\cos(2\pi f_k\tau+\phi_k).
 Update
 
 \[
-r_{k+1}=r_k-g_k.
+r\_{k+1}=r_k-g_k.
 \]
 
 ### Step 7 - store atom
@@ -861,7 +862,7 @@ Provide an all-`f64` reference mode for tests.
 For
 
 \[
-\det G=G_{cc}G_{ss}-G_{cs}^2,
+\det G=G*{cc}G*{ss}-G\_{cs}^2,
 \]
 
 reject or special-case candidates for which
@@ -1288,7 +1289,7 @@ Wigner-Ville is not required for the pursuit itself.
 If a time-frequency display is desired after decomposition, prefer an atom-based map
 
 \[
-E(t,f)=\sum_k E_k\,\widetilde W_{g_k}(t,f)
+E(t,f)=\sum*k E_k\,\widetilde W*{g_k}(t,f)
 \]
 
 rather than the raw Wigner-Ville distribution of the complete signal. Summing per-atom distributions avoids the cross-terms that arise in the bilinear Wigner-Ville distribution of a sum.
@@ -1367,4 +1368,3 @@ An implementation is not complete until all of the following are true:
 - [ ] deterministic tie-breaking and reproducibility are tested;
 - [ ] the scalar/reference implementation remains available for regression testing;
 - [ ] performance optimization is measured against the reference implementation, not substituted for it.
-
