@@ -817,6 +817,7 @@ dependencies = [
  "fftw",
  "fftw-sys",
  "flate2",
+ "rayon",
  "realfft",
  "rfofs",
  "serde",

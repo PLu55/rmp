@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 realfft = "3.5"
+rayon = "1"
 
 # The FOF definition itself. Analysis atoms are rendered by the same code that
 # synthesizes them, so the two cannot drift apart.

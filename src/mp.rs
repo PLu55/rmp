@@ -36,6 +36,7 @@ use crate::hrmp::{self, HrmpConfig};
 use crate::refine::{EnvelopeCache, RefineConfig, refine};
 use crate::select::SegTree;
 use crate::signal::{Signal, overlap, snr_db, subtract_at};
+use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug)]
 pub struct MpConfig {
@@ -129,19 +130,25 @@ impl<'a> Mp<'a> {
             .map(|b| Correlator::new(b, planner))
             .collect();
 
-        let mut states = Vec::with_capacity(dict.blocks.len());
-        for (bi, block) in dict.blocks.iter().enumerate() {
-            let frames = block.frame_count(signal.len());
-            let mut energy = vec![f64::NEG_INFINITY; frames];
-            let mut bin = vec![0u32; frames];
-            for n in 0..frames {
-                let (k, p) = scan_frame(&mut corrs[bi], block, &signal.samples, block.frame_onset(n));
-                energy[n] = p.energy;
-                bin[n] = k as u32;
-            }
-            let tree = SegTree::new(&energy);
-            states.push(BlockState { energy, bin, tree });
-        }
+        // Correlating every frame of every block is the one unavoidable up-front cost, and the
+        // blocks are independent, so it goes wide.
+        let samples = &signal.samples;
+        let states: Vec<BlockState> = corrs
+            .par_iter_mut()
+            .zip(dict.blocks.par_iter())
+            .map(|(corr, block)| {
+                let frames = block.frame_count(signal.len());
+                let mut energy = vec![f64::NEG_INFINITY; frames];
+                let mut bin = vec![0u32; frames];
+                for n in 0..frames {
+                    let (k, p) = scan_frame(corr, block, samples, block.frame_onset(n));
+                    energy[n] = p.energy;
+                    bin[n] = k as u32;
+                }
+                let tree = SegTree::new(&energy);
+                BlockState { energy, bin, tree }
+            })
+            .collect();
 
         let initial_energy = signal.energy();
         Self {
@@ -366,32 +373,31 @@ impl<'a> Mp<'a> {
     /// implementation and the test that pins it against the overlap definition guards this path
     /// too.
     fn refresh_stale(&mut self, tau: usize, atom_len: usize) {
-        for bi in 0..self.dict.blocks.len() {
-            let Some((n_lo, n_hi)) = self.stale_range(bi, tau, atom_len) else {
-                continue;
+        let (dict, residual) = (self.dict, &self.residual);
+        // Blocks are independent: each owns its correlator, its frame table and its tree, and all
+        // any of them read is the shared residual. This is the parallelism `Correlator` was shaped
+        // for — it holds an FFT plan, which is why `RealFft::forward` takes `&mut self` and why
+        // there is one correlator per block rather than one shared.
+        for_each_block(&mut self.corrs, &mut self.states, |bi, corr, state| {
+            let block = &dict.blocks[bi];
+            let Some((n_lo, n_hi)) = stale_range_of(block, state.energy.len(), tau, atom_len) else {
+                return;
             };
             for n in n_lo..=n_hi {
-                self.refresh_frame(bi, n);
+                refresh_one(block, corr, state, residual, n);
             }
-        }
-    }
-
-    fn refresh_frame(&mut self, bi: usize, n: usize) {
-        let block = &self.dict.blocks[bi];
-        let onset = block.frame_onset(n);
-        let (k, p) = scan_frame(&mut self.corrs[bi], block, &self.residual, onset);
-        self.states[bi].energy[n] = p.energy;
-        self.states[bi].bin[n] = k as u32;
-        self.states[bi].tree.set(n, p.energy);
+        });
     }
 
     /// Recompute every frame — the reference behaviour.
     fn refresh_all(&mut self) {
-        for bi in 0..self.dict.blocks.len() {
-            for n in 0..self.states[bi].energy.len() {
-                self.refresh_frame(bi, n);
+        let (dict, residual) = (self.dict, &self.residual);
+        for_each_block(&mut self.corrs, &mut self.states, |bi, corr, state| {
+            let block = &dict.blocks[bi];
+            for n in 0..state.energy.len() {
+                refresh_one(block, corr, state, residual, n);
             }
-        }
+        });
     }
 
     /// Per-frame best energies for one block. Exposed so the incremental and full-recompute paths
@@ -408,15 +414,78 @@ impl<'a> Mp<'a> {
 
     /// Frames the incremental path would mark stale — exposed for testing the arithmetic directly.
     pub fn stale_range(&self, bi: usize, tau: usize, atom_len: usize) -> Option<(usize, usize)> {
-        let block = &self.dict.blocks[bi];
-        let frames = self.states[bi].energy.len();
-        if frames == 0 {
-            return None;
-        }
-        let n_lo = tau.saturating_sub(block.support_len() - 1).div_ceil(block.hop);
-        let n_hi = ((tau + atom_len).saturating_sub(1) / block.hop).min(frames - 1);
-        (n_lo <= n_hi).then_some((n_lo, n_hi))
+        stale_range_of(
+            &self.dict.blocks[bi],
+            self.states[bi].energy.len(),
+            tau,
+            atom_len,
+        )
     }
+}
+
+/// Run `f` over every block's correlator and frame table, in parallel.
+///
+/// The whole per-frame cost of the pursuit — one FFT and one bin scan — lives inside this, and
+/// nothing crosses between blocks: each writes only its own table and tree. Results are therefore
+/// identical to running the blocks in sequence, which is what lets the bit-identity gates keep
+/// their teeth.
+///
+/// Small jobs stay on one thread. Rayon's per-task overhead is real next to a block whose stale set
+/// is a handful of short frames, and the test fixtures are all that size.
+fn for_each_block<F>(corrs: &mut [Correlator], states: &mut [BlockState], f: F)
+where
+    F: Fn(usize, &mut Correlator, &mut BlockState) + Sync + Send,
+{
+    let total: usize = states.iter().map(|s| s.energy.len()).sum();
+    if total < PARALLEL_FRAME_THRESHOLD {
+        for (bi, (corr, state)) in corrs.iter_mut().zip(states.iter_mut()).enumerate() {
+            f(bi, corr, state);
+        }
+        return;
+    }
+    corrs
+        .par_iter_mut()
+        .zip(states.par_iter_mut())
+        .enumerate()
+        .for_each(|(bi, (corr, state))| f(bi, corr, state));
+}
+
+/// Frame count below which the blocks are refreshed on one thread.
+///
+/// Chosen to sit under any realistic analysis and over every test fixture, so the threshold is not
+/// itself a thing that needs tuning.
+const PARALLEL_FRAME_THRESHOLD: usize = 4096;
+
+/// Recompute one frame's stored energy and bin.
+fn refresh_one(
+    block: &crate::dict::Block,
+    corr: &mut Correlator,
+    state: &mut BlockState,
+    residual: &[f32],
+    n: usize,
+) {
+    let (k, p) = scan_frame(corr, block, residual, block.frame_onset(n));
+    state.energy[n] = p.energy;
+    state.bin[n] = k as u32;
+    state.tree.set(n, p.energy);
+}
+
+/// Frames of `block` whose read window overlaps `[tau, tau + atom_len)`.
+///
+/// The single definition, used by the incremental update and by the test that pins it against the
+/// overlap predicate directly.
+fn stale_range_of(
+    block: &crate::dict::Block,
+    frames: usize,
+    tau: usize,
+    atom_len: usize,
+) -> Option<(usize, usize)> {
+    if frames == 0 {
+        return None;
+    }
+    let n_lo = tau.saturating_sub(block.support_len() - 1).div_ceil(block.hop);
+    let n_hi = ((tau + atom_len).saturating_sub(1) / block.hop).min(frames - 1);
+    (n_lo <= n_hi).then_some((n_lo, n_hi))
 }
 
 fn scan_frame(
