@@ -11,7 +11,9 @@
 //! so each worker constructs its own via [`RealFftPlanner::plan`]. That is a real constraint rather
 //! than a conservative one, and encoding it here means the parallel update loop cannot get it wrong.
 
-use realfft::num_complex::Complex32;
+/// Re-exported because `RealFft::forward` names it, so any implementor or caller
+/// outside this module needs it too.
+pub use realfft::num_complex::Complex32;
 use realfft::{RealFftPlanner as RfPlanner, RealToComplex};
 use std::sync::Arc;
 
