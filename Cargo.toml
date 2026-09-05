@@ -21,6 +21,7 @@ sndfile = "0.1"
 #rustfft = "6.4"
 fftw = { version = "0.8", default-features = false, features = ["system"] }
 fftw-sys = { version = "0.8", default-features = false, features = ["system"] }
+plotters = { version = "0.3.7", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "svg_backend", "all_series", "all_elements", "ab_glyph"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

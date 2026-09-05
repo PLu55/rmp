@@ -26,6 +26,14 @@ cargo clippy --all-targets
 ./target/release/rmp in.wav -o resynth.wav -b book.json.gz   # any book format, compressed
 ./target/release/rmp --write-config > settings.toml
 
+# statistics and visualization over a book
+./target/release/rmpstat summary book.json [-c settings.toml]
+./target/release/rmpstat diag    book.json -c settings.toml
+./target/release/rmpstat hist    book.json --of alpha,bandwidth,f --weight energy
+./target/release/rmpstat hist    book.json --of alpha,f -f svg -o plots/
+./target/release/rmpstat snr     book.json -f svg -o snr.svg
+./target/release/rmpstat wv      book.json -f png -o wv.png --log-freq --floor 65
+
 # end-to-end measurement against synthetic ground truth
 cargo run --release --example analyze [seconds] [max_atoms] [grains_per_sec] [candidates]
 
@@ -56,8 +64,14 @@ parts that need reading together:
 - **`select`** — max segment tree over frames.
 - **`naive`** — brute-force oracle. Deliberately shares nothing with `dict`/`corr` beyond the atom
   definition and the search space.
-- **`signal` / `book`** — f64 energy bookkeeping, and the decomposition result.
+- **`signal` / `book`** — f64 energy bookkeeping, and the decomposition result. `book::read` /
+  `book::write` are the single definition of the on-disk format, used by both binaries.
+- **`stats`** — aggregation over a book: derived quantities, weighted histograms, diagnostics.
+  Nothing here renders.
+- **`tfmap`** — the atom-based pseudo-Wigner time-frequency map (spec §21), as diagnostics only.
 - **`config` / `audio` / `main`** — TOML settings, libsndfile I/O, the CLI.
+- **`bin/rmpstat`** — the statistics CLI: clap, `plotters`, and text tables. A thin shell, so
+  everything worth an oracle lives in `stats`/`tfmap` where `cargo test` reaches it.
 
 ### Invariants that are not locally obvious
 
@@ -136,10 +150,76 @@ adds nothing to the book, so charging it to the budget lets a strict setting spe
 on atoms it refused. `max_stalls` is what bounds a barren stretch; the atom cap must not double as
 an iteration cap or the two limits interfere.
 
+**A book's `hr_score` is not a clamp severity.** It and `energy_removed` record the same
+post-clamp energy and agree to 5e-3 on real material, so reading `hr_score < energy_removed` as
+"HRMP clamped this atom" measures pure rounding — it reported 43% clamped on a book where the
+figure is meaningless. The clamp is visible as `energy_removed / projected_energy`: median 0.98,
+p5 0.76, min 0.24 on the 5000-atom piano book. On a book where HRMP did *not* run, that same
+shortfall would be a parameter-mapping error instead, which is why the two readings need
+separating.
+
 **`signal::overlap` is the single definition of which samples an atom occupies.** Writing it
 (`add_at`, `subtract_at`), scoring it (`fit::accumulate`) and invalidating the frames it touched
 (`refresh_stale`) all go through it. `refresh_stale` used to be passed the seed's frame onset, which
 equals the atom's `t0` only until refinement can move it.
+
+### The pseudo-Wigner map
+
+Spec §21 rules Wigner-Ville out of the pursuit and into diagnostics. `tfmap` builds
+`E(t,f) = sum_k E_k * W~(t,f)` — a sum of *per-atom* distributions, so there are no cross-terms by
+construction rather than by smoothing. Four facts that were measured, not assumed:
+
+**The kernel is the separable product of each atom's exact time and frequency marginals.** Both
+marginals are reproduced exactly; what is lost is their coupling. The true WVD of a decaying
+exponential is a wedge whose frequency half-width to the first null is `1/(4t)`, so the product form
+is too narrow over the first 23% of an atom's life and too wide over the rest. Since a product space
+constrained only by its marginals has the product as its maximum-entropy solution, "the
+least-committed joint density consistent with the atom's exact marginals" is a precise description,
+which is what earns the *pseudo* label the spec demands.
+
+**A closed-form Lorentzian frequency kernel is not viable, and the test suite knows it.** The
+half-cosine attack cuts the tails hard: at `alpha*beta = 1` the exact spectrum is 5.5 dB below a
+Lorentzian at five half-widths and 40 dB below at thirty. A Lorentzian would stay above a −60 dB
+floor out to ~1000 half-widths — a full-height vertical smear under every atom with a real attack.
+`the_real_book_does_not_haze_the_display` bounds the lit fraction at −60 dB (measured 21.3%) and is
+the regression that encodes this.
+
+**Transform the rendered *atom*, not an envelope spectrum shifted to `f_k`.** Shifting drops the
+negative-frequency image, its cross term, and the Nyquist fold. 523 of `book1.json`'s 5000 atoms
+have `2f < alpha/PI`, where the images overlap outright and the cross term is order one.
+
+**Integrate mass over each bin; never sample a density at its centre.** This is what makes the alpha
+range a non-issue with no multi-resolution grid: at 1200x800 over a real book, an `alpha = 19.7`
+atom is 64 time bins by *under one* frequency bin while an `alpha = 3994` atom is *under one* time
+bin by 196 frequency bins, and both are exact. The cumulative uses the **trapezoid** rule rather
+than a left Riemann sum — same arithmetic, same transform, and it took the worst disagreement with
+the direct oracle from 0.81 dB to 0.15 dB, which a Riemann cumulative would have needed a 16x longer
+transform to match.
+
+**An `(alpha, beta)` cache collapses nothing.** Refinement moves both continuously: 4752 of 5000
+atoms have distinct envelope bits, 3125 even at 5% log quantization. The envelope *shape* depends
+only on `(alpha*beta, fade_level)` with `alpha` a pure time scale — verified to 0.05 dB down to
+−80 dB — but that identity is continuous-time and the sampled spectrum aliases, +13.7 dB at
+`alpha = 3994`. `refine::EnvelopeCache` is also not reusable: its `get` is private and it is bounded
+by `RefineConfig`. The module keeps only an exact-bits memo, worthless on a refined book and free on
+an unrefined one.
+
+**Kernels are computed in parallel and folded in serially, in book order.** Per-thread accumulators
+would cost more to reduce than the fold takes (24 x 7.7 MB against ~100 ms), and fixing the f64
+addition order makes the map bit-identical whatever the thread count — the same standard
+`mp::for_each_block` is held to, and what gives the determinism gate teeth. 5000 atoms onto
+1200x800 takes 0.13 s wall; the FFTs are the whole cost.
+
+**`plotters` uses the `ab_glyph` backend, which has no font discovery.** `render::init_fonts` finds
+a system sans font and registers it before any chart is drawn. The alternative, plotters' `ttf`
+backend, does discover fonts but needs `libfontconfig1-dev` at build time — a system package to
+install for a diagnostic tool, against reading one file at startup. Text output needs no font, so
+`-f text` works regardless. The `colormaps` feature does **not** build without `full_palette`; the
+heat ramp is local anyway.
+
+**The heat map is blitted as one image, never drawn as rectangles.** A useful grid is ~10^6 cells,
+and an SVG of that many `<rect>` elements would be tens of megabytes and would not open.
+`SVGBackend` base64-embeds a PNG for a bitmap blit, so SVG and PNG take the identical path.
 
 ## Working with rfofs
 
@@ -306,6 +386,9 @@ Splitting the replay stream from the diagnostics is where the remaining 22× is,
 
 **`src/main.rs` must contain a `main`.** An empty file fails the whole build with `E0601`, including
 bench targets, which makes `cargo bench` look broken for an unrelated reason.
+
+**Adding `src/bin/rmpstat/` needed no `[[bin]]` section.** Cargo auto-discovers `src/main.rs` and
+`src/bin/*` together, so `rmp` is unaffected.
 
 **`fftw` must keep `features = ["system"]`.** The crate's default `source` feature vendors FFTW 3.3.8
 with no SIMD flags at all — the generated `config.h` has `HAVE_AVX`, `HAVE_AVX2`, `HAVE_SSE2` all
