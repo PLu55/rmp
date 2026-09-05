@@ -20,11 +20,34 @@
 //! Note this uses `support_len`, not `fft_len`: the envelope is zero past its support, so residual
 //! changes beyond it cannot affect that frame's correlations.
 //!
+//! # The lazy update
+//!
+//! A stale frame is not recomputed; it is *bounded*. A frame's best energy is `||P r||^2` for `P`
+//! the orthogonal projector onto `span(E sin, E cos)`, and subtracting `a` changes `r` by `a`.
+//! Since `||P(r - a)|| <= ||P r|| + ||P a||`,
+//!
+//! ```text
+//! E_new <= (sqrt(E_old) + ||P a||)^2        for every bin, hence for the best one
+//! ```
+//!
+//! and `||P a||^2` is bounded two ways, O(1) each given prefix sums of `|a|` and `a^2` and a
+//! range-max over the envelope: by `||a||^2`, and by `(sum |a| E)^2 / lambda_min(G)`, since
+//! `|<a, E e^{-i omega t}>| <= sum |a| E` at every frequency. The table holds the smaller and the
+//! frame is marked dirty. Nothing is transformed until a dirty frame's bound reaches the top of the
+//! table, and then only that frame is recomputed — see [`Mp::top_candidates`].
+//!
+//! The point is that most stale frames never get there. A frame whose window catches only the
+//! decayed tail of the subtracted atom moves by a rounding error; the eager update paid a full
+//! transform to learn that. On a low-`alpha` dictionary those transforms are 331k points, the stale
+//! set is every frame in the block, and they were 85% of the runtime.
+//!
 //! # Equivalence
 //!
-//! [`MpConfig::full_update`] recomputes every frame of every block each iteration. The incremental
-//! path must produce a bit-identical book — that is the gate for this stage, and the stale-set
-//! arithmetic is where bugs would hide.
+//! The selected atom is identical to the eager update's, by construction: a bound is never below
+//! the true value, so once every frame at or above the weakest seed is exact, nothing dirty can
+//! outrank or shadow a seed. [`MpConfig::full_update`] recomputes every frame of every block each
+//! iteration and is the reference; the lazy path must produce a bit-identical book, and its bounds
+//! must never be seen to undercut an exact value — both are tests.
 
 use crate::book::{Book, Selection};
 use crate::cand::{Candidate, FrameTable, Seed, top_seeds};
@@ -102,11 +125,37 @@ struct Chosen {
 
 /// Per-block frame table and its max tree.
 struct BlockState {
-    /// Best projected energy per frame.
+    /// Best projected energy per frame — or, where `dirty`, an upper bound on it.
     energy: Vec<f64>,
-    /// Bin achieving that energy.
+    /// Bin achieving that energy. Stale wherever `dirty`.
     bin: Vec<u32>,
     tree: SegTree,
+    /// Frames holding a bound rather than an exact value.
+    dirty: Vec<bool>,
+    /// Running maxima of the envelope from the left and from the right, and where it peaks, for
+    /// an O(1) upper bound on the envelope over any index range.
+    env_prefix_max: Vec<f32>,
+    env_suffix_max: Vec<f32>,
+    env_peak: usize,
+    /// The smallest eigenvalue of any live bin's Gram, `(P/2)(1 - max rho)`. A correlation of
+    /// magnitude `|d|` at any bin captures at most `|d|^2 / lambda_min` of energy.
+    lambda_min: f64,
+}
+
+impl BlockState {
+    /// An upper bound on the envelope over indices `[s, e)`.
+    ///
+    /// Exact when the range contains the peak; otherwise the range lies on one flank, and the
+    /// running maximum from that flank's end is at least the range's own maximum.
+    fn env_max(&self, s: usize, e: usize) -> f32 {
+        if s <= self.env_peak && self.env_peak < e {
+            self.env_prefix_max[self.env_peak]
+        } else if s > self.env_peak {
+            self.env_suffix_max[s]
+        } else {
+            self.env_prefix_max[e - 1]
+        }
+    }
 }
 
 pub struct Mp<'a> {
@@ -116,6 +165,11 @@ pub struct Mp<'a> {
     residual: Vec<f32>,
     /// Envelopes rendered during refinement, reused across candidates and iterations.
     cache: EnvelopeCache,
+    /// Frames bounded rather than recomputed, and frames recomputed on demand, over the run.
+    marked: usize,
+    resolved: usize,
+    /// The same, per block, so the cost of resolution can be attributed to transform length.
+    per_block: Vec<(usize, usize)>,
     energy: f64,
     initial_energy: f64,
     sample_rate: f32,
@@ -146,7 +200,40 @@ impl<'a> Mp<'a> {
                     bin[n] = k as u32;
                 }
                 let tree = SegTree::new(&energy);
-                BlockState { energy, bin, tree }
+
+                let env = &block.env.samples;
+                let mut env_prefix_max = env.to_vec();
+                for i in 1..env_prefix_max.len() {
+                    env_prefix_max[i] = env_prefix_max[i].max(env_prefix_max[i - 1]);
+                }
+                let mut env_suffix_max = env.to_vec();
+                for i in (0..env_suffix_max.len().saturating_sub(1)).rev() {
+                    env_suffix_max[i] = env_suffix_max[i].max(env_suffix_max[i + 1]);
+                }
+                let env_peak = env
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                        if v > bv { (i, v) } else { (bi, bv) }
+                    })
+                    .0;
+
+                let max_rho = block
+                    .live_bins()
+                    .filter_map(|k| block.rho(k))
+                    .fold(0.0f32, f32::max) as f64;
+                let lambda_min = 0.5 * block.env.energy * (1.0 - max_rho);
+
+                BlockState {
+                    dirty: vec![false; frames],
+                    energy,
+                    bin,
+                    tree,
+                    env_prefix_max,
+                    env_suffix_max,
+                    env_peak,
+                    lambda_min,
+                }
             })
             .collect();
 
@@ -157,6 +244,9 @@ impl<'a> Mp<'a> {
             states,
             residual: signal.samples.clone(),
             cache: EnvelopeCache::new(),
+            marked: 0,
+            resolved: 0,
+            per_block: vec![(0, 0); dict.blocks.len()],
             energy: initial_energy,
             initial_energy,
             sample_rate: signal.sample_rate,
@@ -214,6 +304,8 @@ impl<'a> Mp<'a> {
             for &(bi, frame, energy) in &chosen.demote {
                 self.states[bi].energy[frame] = energy;
                 self.states[bi].tree.set(frame, energy);
+                // A demotion is a deliberate value, not a bound: it must not be "resolved" back.
+                self.states[bi].dirty[frame] = false;
             }
 
             let Some(best) = chosen.best else {
@@ -235,7 +327,7 @@ impl<'a> Mp<'a> {
             let Ok(rendered) = best.atom.render(self.sample_rate) else {
                 break;
             };
-            let Some((_, tau, atom_len)) =
+            let Some((src_start, tau, atom_len)) =
                 overlap(self.residual.len(), rendered.len(), best.atom.t0)
             else {
                 break;
@@ -265,28 +357,138 @@ impl<'a> Mp<'a> {
             if cfg.full_update {
                 self.refresh_all();
             } else {
-                self.refresh_stale(tau, atom_len);
+                self.mark_stale(tau, &rendered[src_start..src_start + atom_len]);
             }
         }
 
         book
     }
 
-    /// The strongest seeds this iteration, best first.
-    fn top_candidates(&self, k: usize) -> Vec<Seed> {
-        let tables: Vec<FrameTable<'_>> = self
+    /// The strongest seeds this iteration, best first — every one of them exact.
+    ///
+    /// The tables may hold bounds. A seed list read off them is trustworthy once every dirty frame
+    /// at or above the weakest seed has been recomputed: a bound is never below the truth, so a
+    /// dirty frame under that line can neither belong in the list nor be the inflated neighbour
+    /// that hides a real local maximum from it. Resolving lowers values, which can lower the line
+    /// and expose more dirty frames above it, so this iterates; each pass makes at least one frame
+    /// exact, so it ends.
+    fn top_candidates(&mut self, k: usize) -> Vec<Seed> {
+        // Seeds are read off the *clean* frames only: a dirty frame is masked out of the scan. The
+        // line is then set by certain values, and one pass resolves every dirty frame above it as
+        // a single parallel batch. Setting the line from the unmasked table instead was measured
+        // as a pathology: when the top entry is an inflated bound, each pass resolves exactly that
+        // one frame, its value drops, the next bound becomes the top, and a single atom costs
+        // hundreds of serial passes over a 66k-frame table.
+        //
+        // A masked seed is a true local maximum once nothing dirty remains above the line: its
+        // clean neighbours are in the scan, and a dirty neighbour's bound — hence its value — is
+        // below it. So the list returned is the same one the eager tables would give.
+        loop {
+            let masked: Vec<Vec<f64>> = self
+                .states
+                .iter()
+                .map(|st| {
+                    st.energy
+                        .iter()
+                        .zip(&st.dirty)
+                        .map(|(&e, &d)| if d { f64::NEG_INFINITY } else { e })
+                        .collect()
+                })
+                .collect();
+            let seeds = {
+                let tables: Vec<FrameTable<'_>> = self
+                    .states
+                    .iter()
+                    .zip(&masked)
+                    .enumerate()
+                    .map(|(bi, (st, energy))| FrameTable {
+                        block: bi,
+                        energy,
+                        bin: &st.bin,
+                        hop: self.dict.blocks[bi].hop,
+                        support_len: self.dict.blocks[bi].support_len(),
+                    })
+                    .collect();
+                top_seeds(&tables, k)
+            };
+            // Fewer clean seeds than asked for means there is no line to reason about; resolve
+            // everything dirty, which is the eager behaviour and equally correct.
+            let threshold = if seeds.len() == k {
+                seeds[k - 1].energy
+            } else {
+                f64::NEG_INFINITY
+            };
+            let pending: Vec<(usize, usize)> = self
+                .states
+                .iter()
+                .enumerate()
+                .flat_map(|(bi, st)| {
+                    st.dirty
+                        .iter()
+                        .enumerate()
+                        .filter(move |&(n, &d)| d && st.energy[n] >= threshold)
+                        .map(move |(n, _)| (bi, n))
+                })
+                .collect();
+            if pending.is_empty() {
+                return seeds;
+            }
+            self.resolve(&pending);
+        }
+    }
+
+    /// Recompute the given frames exactly.
+    fn resolve(&mut self, pending: &[(usize, usize)]) {
+        self.resolved += pending.len();
+        let mut per_block: Vec<Vec<usize>> = vec![Vec::new(); self.states.len()];
+        for &(bi, n) in pending {
+            per_block[bi].push(n);
+            self.per_block[bi].1 += 1;
+        }
+        let (dict, residual) = (self.dict, &self.residual);
+        for_each_block(&mut self.corrs, &mut self.states, |bi, corr, state| {
+            let block = &dict.blocks[bi];
+            for &n in &per_block[bi] {
+                let bound = state.energy[n];
+                refresh_one(block, corr, state, residual, n);
+                state.dirty[n] = false;
+                debug_assert!(
+                    state.energy[n] <= bound,
+                    "block {bi} frame {n}: exact {} exceeds its bound {bound}",
+                    state.energy[n]
+                );
+            }
+        });
+    }
+
+    /// Make every frame exact. The tables then equal a full recompute's, which is what lets the
+    /// table-for-table gate keep its teeth on the lazy path.
+    pub fn resolve_all(&mut self) {
+        let pending: Vec<(usize, usize)> = self
             .states
             .iter()
             .enumerate()
-            .map(|(bi, st)| FrameTable {
-                block: bi,
-                energy: &st.energy,
-                bin: &st.bin,
-                hop: self.dict.blocks[bi].hop,
-                support_len: self.dict.blocks[bi].support_len(),
+            .flat_map(|(bi, st)| {
+                st.dirty
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &d)| d)
+                    .map(move |(n, _)| (bi, n))
             })
             .collect();
-        top_seeds(&tables, k)
+        if !pending.is_empty() {
+            self.resolve(&pending);
+        }
+    }
+
+    /// Frames bounded rather than recomputed, and frames recomputed on demand, so far.
+    pub fn lazy_stats(&self) -> (usize, usize) {
+        (self.marked, self.resolved)
+    }
+
+    /// [`Mp::lazy_stats`] per block.
+    pub fn lazy_stats_per_block(&self) -> &[(usize, usize)] {
+        &self.per_block
     }
 
     /// Score every seed and return the best.
@@ -367,26 +569,82 @@ impl<'a> Mp<'a> {
         best.map(|(b, f, _)| (b, f))
     }
 
-    /// Recompute only frames whose read window overlaps `[tau, tau + atom_len)`.
+    /// Bound every frame whose read window overlaps the subtracted atom, without transforming any.
     ///
-    /// The range itself comes from [`Self::stale_range`], so the arithmetic has exactly one
-    /// implementation and the test that pins it against the overlap definition guards this path
-    /// too.
-    fn refresh_stale(&mut self, tau: usize, atom_len: usize) {
-        let (dict, residual) = (self.dict, &self.residual);
-        // Blocks are independent: each owns its correlator, its frame table and its tree, and all
-        // any of them read is the shared residual. This is the parallelism `Correlator` was shaped
-        // for — it holds an FFT plan, which is why `RealFft::forward` takes `&mut self` and why
-        // there is one correlator per block rather than one shared.
-        for_each_block(&mut self.corrs, &mut self.states, |bi, corr, state| {
-            let block = &dict.blocks[bi];
-            let Some((n_lo, n_hi)) = stale_range_of(block, state.energy.len(), tau, atom_len) else {
-                return;
+    /// `atom` is the subtracted samples as they landed in the residual, starting at `tau`. The range
+    /// itself comes from [`stale_range_of`], so the arithmetic has exactly one implementation and
+    /// the test that pins it against the overlap definition guards this path too.
+    fn mark_stale(&mut self, tau: usize, atom: &[f32]) {
+        // Prefix sums of |a| and a^2, so either norm of the atom under any window is a subtraction.
+        let mut a1 = Vec::with_capacity(atom.len() + 1);
+        let mut a2 = Vec::with_capacity(atom.len() + 1);
+        a1.push(0.0f64);
+        a2.push(0.0f64);
+        for &x in atom {
+            let x = x as f64;
+            a1.push(a1.last().unwrap() + x.abs());
+            a2.push(a2.last().unwrap() + x * x);
+        }
+        let atom_end = tau + atom.len();
+
+        for (bi, st) in self.states.iter_mut().enumerate() {
+            let block = &self.dict.blocks[bi];
+            let Some((n_lo, n_hi)) = stale_range_of(block, st.energy.len(), tau, atom.len()) else {
+                continue;
             };
+            let support = block.support_len();
             for n in n_lo..=n_hi {
-                refresh_one(block, corr, state, residual, n);
+                let onset = block.frame_onset(n);
+                let (lo, hi) = (onset.max(tau), (onset + support).min(atom_end));
+                if hi <= lo {
+                    continue;
+                }
+
+                // The frame's energy is ||P R||^2 for P the orthogonal projector onto
+                // span(E sin, E cos) — the projection of the *residual*, not of the windowed
+                // signal the transform sees. So the change is the atom `a` itself, and the
+                // envelope enters once, through the basis. (Writing the change as a*E and
+                // bounding with E^2 double-counts it; that bound undercut by a hair on a frame
+                // whose energy rose, and the gate caught it.)
+                //
+                // Two valid bounds on how much energy the change can add at any one bin; the
+                // smaller is taken.
+                //
+                // The norm bound: ||P a||^2 <= ||a||^2 = sum a^2 over the overlap. No envelope at
+                // all, so it is loose wherever the window catches only the atom's tail.
+                //
+                // The correlation bound: for every omega, |<a, E e^{-i omega t}>| <= sum |a| E,
+                // and d'G^-1 d <= |d|^2 / lambda_min. Within a small constant of the matched
+                // projection by Cauchy-Schwarz however long the window, and it decays with the
+                // envelope — which is the case that matters.
+                //
+                // The overlap is chunked so the envelope's range-max tracks its decay rather than
+                // pinning every chunk to the value at the overlap's start.
+                let (mut d_max, mut w2) = (0.0f64, 0.0f64);
+                let chunks = 8usize.min(hi - lo);
+                for c in 0..chunks {
+                    let cs = lo + (hi - lo) * c / chunks;
+                    let ce = lo + (hi - lo) * (c + 1) / chunks;
+                    if ce <= cs {
+                        continue;
+                    }
+                    let e_max = st.env_max(cs - onset, ce - onset) as f64;
+                    d_max += e_max * (a1[ce - tau] - a1[cs - tau]);
+                    w2 += a2[ce - tau] - a2[cs - tau];
+                }
+                let delta = w2.min(d_max * d_max / st.lambda_min);
+
+                // The stored value may itself be a bound; compounding bounds is still a bound. The
+                // margin covers the f32 transform's rounding, which the algebra knows nothing of.
+                let old = st.energy[n].max(0.0);
+                let bound = (old.sqrt() + delta.sqrt()).powi(2) * (1.0 + 1e-4) + 1e-12;
+                st.energy[n] = bound;
+                st.tree.set(n, bound);
+                st.dirty[n] = true;
+                self.marked += 1;
+                self.per_block[bi].0 += 1;
             }
-        });
+        }
     }
 
     /// Recompute every frame — the reference behaviour.
@@ -396,6 +654,7 @@ impl<'a> Mp<'a> {
             let block = &dict.blocks[bi];
             for n in 0..state.energy.len() {
                 refresh_one(block, corr, state, residual, n);
+                state.dirty[n] = false;
             }
         });
     }
@@ -620,7 +879,7 @@ mod tests {
             crate::signal::add_at(&mut sig.samples, &a.render(SR).unwrap(), t0);
         }
         let mut planner = Planner::new();
-        let mp = Mp::new(&d, &sig, &mut planner);
+        let mut mp = Mp::new(&d, &sig, &mut planner);
 
         let seeds = mp.top_candidates(6);
         assert!(seeds.len() >= 3, "only {} seeds", seeds.len());
@@ -735,6 +994,44 @@ mod tests {
         }
     }
 
+    /// The lazy update rests on one inequality: a bound is never below the exact value. This
+    /// checks it on every dirty frame after every atom, against a fresh exact scan, rather than
+    /// trusting the algebra — the f32 transform is where it would quietly fail.
+    #[test]
+    fn lazy_bounds_never_undercut_the_exact_value() {
+        let d = tiny_dict();
+        let sig = noise(600, 0x1eaf_1eaf_1eaf_1eaf);
+        let mut planner = Planner::new();
+        let mut mp = Mp::new(&d, &sig, &mut planner);
+        let one = MpConfig { max_atoms: 1, target_snr_db: f32::INFINITY, ..Default::default() };
+
+        let mut checked = 0usize;
+        for step in 0..12 {
+            let book = mp.run(&one);
+            assert_eq!(book.len(), 1, "step {step}: pursuit stopped early");
+            for bi in 0..d.blocks.len() {
+                let block = &d.blocks[bi];
+                let mut corr = Correlator::new(block, &mut planner);
+                for n in 0..mp.states[bi].energy.len() {
+                    if !mp.states[bi].dirty[n] {
+                        continue;
+                    }
+                    let (_, p) = scan_frame(&mut corr, block, &mp.residual, block.frame_onset(n));
+                    assert!(
+                        p.energy <= mp.states[bi].energy[n],
+                        "step {step} block {bi} frame {n}: exact {} above bound {}",
+                        p.energy,
+                        mp.states[bi].energy[n]
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "only {checked} bounds were ever checked");
+        let (marked, resolved) = mp.lazy_stats();
+        assert!(resolved < marked, "lazy update resolved every frame it bounded: {resolved}/{marked}");
+    }
+
     /// A rejected candidate must send the loop elsewhere, not stop it and not spin it.
     #[test]
     fn hrmp_rejection_demotes_the_cell_instead_of_stalling() {
@@ -828,6 +1125,8 @@ mod tests {
             assert_eq!(a.selections, b.selections, "step {step}: different atom");
             assert_eq!(a.len(), 1, "step {step}: pursuit stopped early");
 
+            // The lazy table holds bounds; only the resolved table is comparable to a recompute.
+            fast.resolve_all();
             for bi in 0..d.blocks.len() {
                 let (fe, se) = (fast.frame_energy(bi), slow.frame_energy(bi));
                 assert_eq!(fe.len(), se.len());

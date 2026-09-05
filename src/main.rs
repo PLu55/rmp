@@ -261,6 +261,24 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
         ));
     }
 
+    let (marked, resolved) = mp.lazy_stats();
+    if marked > 0 {
+        say(&format!(
+            "  refresh: {marked} frames bounded, {resolved} recomputed ({:.1}%)",
+            100.0 * resolved as f64 / marked as f64
+        ));
+        if std::env::var_os("RMP_REFRESH_DETAIL").is_some() {
+            for (bi, &(m, r)) in mp.lazy_stats_per_block().iter().enumerate() {
+                let b = &dict.blocks[bi];
+                say(&format!(
+                    "    block {bi:>2} alpha {:>6.1} fft {:>7}: {m:>8} bounded {r:>8} recomputed ({:>5.1}%)  ~{:.0} Msamples",
+                    b.env.params.alpha, b.fft_len, 100.0 * r as f64 / m.max(1) as f64,
+                    (r * b.fft_len) as f64 / 1e6
+                ));
+            }
+        }
+    }
+
     // The residual is the pursuit's own working buffer, so this is the level of what the
     // decomposition could not explain.
     //
