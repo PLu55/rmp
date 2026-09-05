@@ -172,6 +172,23 @@ residual by the input. The atom tails the analysis truncated at the excerpt end 
 2.9% of the excerpt's energy on a 0.15 s piano fixture. Over the excerpt itself the two renders are
 bit-identical, so this is a longer file, not a different one.
 
+**A stale frame is bounded, not recomputed.** After a subtraction, frames overlapping the atom get
+an upper bound — `(sqrt(E_old) + ||P a||)^2`, with `||P a||^2` bounded in O(1) by both `||a||^2` and
+`(sum |a| E)^2 / lambda_min(G)` — and a dirty flag. Seeds are read off the *clean* frames only;
+every dirty frame at or above the weakest seed is then recomputed as one parallel batch, and the loop
+repeats until nothing dirty is above the line. The selected atom is identical to the eager update's
+by construction. Two things that were measured, not reasoned: taking the threshold from the
+*unmasked* table resolves one frame per pass and turns a 42 s run into a twenty-minute one; and the
+envelope enters the bound **once**, through the basis — writing the change as `a*E` and bounding
+with `E^2` double-counts it, and undercut by 1.1e-6. `lazy_bounds_never_undercut_the_exact_value`
+checks every dirty frame after every atom against a fresh exact scan; keep it.
+
+**The bound is one-sided, and that is the ceiling.** A bound never sits below `E_old`, so a frame
+already near the top of the table is recomputed every time an atom touches it, however tight the
+bound. A seven-second window over dense material is always near the top: the `alpha = 1` blocks
+recompute 70% of what they bound. What remains for those blocks is the number of frames, which is
+`capture_tolerance`.
+
 **`signal::overlap` is the single definition of which samples an atom occupies.** Writing it
 (`add_at`, `subtract_at`), scoring it (`fit::accumulate`) and invalidating the frames it touched
 (`refresh_stale`) all go through it. `refresh_stale` used to be passed the seed's frame onset, which
@@ -339,6 +356,45 @@ Refinement's remaining error is concentrated in `(t0, alpha, beta)`, not `f`. Al
 attack, so they trade against each other along a shallow valley that coordinate descent walks down
 but not along — a known cost of the one-dimensional method, bounded by a fit that still captures
 99.9% of an isolated atom.
+
+### The low-alpha regime, and what `capture_tolerance` is worth
+
+The realistic configs in `data/config` reach down to `alpha = 1`: a 332k-sample support, a 337,500
+point transform, and `support/hop` pinned near 134 by the default tolerance — so every atom refreshed
+~130 frames of that transform per block. On 3 s of piano, `mp_1.toml`:
+
+| | analysis | dictionary | realtime |
+| --- | --- | --- | --- |
+| before this work | 41.8 s | 1.6 s | 14.5× |
+| lazy refresh, gallop hop | 28.4 s | 0.05 s | 9.5× |
+| the same at `capture_tolerance = 0.5` | 6.6 s | 0.06 s | 2.2× |
+
+**`capture_tolerance` is the lever, and it is a config trade rather than a free win.** A frame
+count scales as `1/ln(1/tol)`, so 0.5 has 13× fewer frames than 0.95, and the profile is 85%
+transforms either way. On piano it costs 8% more atoms to the same SNR (978 → 1057); 0.3 is *slower*
+again (19 s) — so it is an optimum, not a monotone knob. On the adversarial synthetic, which plants
+every atom exactly `hop/2` off-grid, 0.5 alone is a real regression (193 atoms to 40 dB against
+102, splitting 10.5 against 4.5) because the coarser seed misranks; `candidate_count = 8` recovers
+it fully (95 atoms, 4.8) — but on piano more candidates buy nothing (1057 / 1077 / 1073 for 1/4/8).
+The defaults stay at 0.95 and 1, because the 0.95 hop is a correctness property without refinement;
+with refinement on, set 0.5 for realistic material and expect the numbers above.
+
+**Splitting the refresh by frame instead of by block was slower**, 30% at every thread count from 4
+to 24, and chunking frames by block did not recover it. Same profile shape with more time in the
+FFT's load-heavy butterflies — bouncing threads across six differently sized envelopes and buffer
+sets. The block split's locality is worth more than its balance costs.
+
+**The transform length is not the problem.** rustfft runs these lengths at ~1.1 ns/sample; a
+factorisation with a small odd cofactor (345600 = 2⁹·675 over 337500 = 2²·3³·5⁵) is 7–14% faster on
+the two largest blocks, a few percent overall, and would re-baseline every book. Not taken.
+
+**`measure_hop` gallops and bisects.** The linear scan was 16k O(N) correlations per low-alpha block
+at 0.5 — twenty seconds of dictionary build sitting invisibly ahead of a seven-second analysis,
+because only the analysis line was being read. Monotonicity is checked, not assumed:
+`hop_search_matches_the_linear_scan` pins it on every block of both dictionaries.
+
+`RMP_REFRESH_DETAIL=1` prints per-block bounded/recomputed counts and the transform samples each
+block cost; it is how every attribution above was made.
 
 ### HRMP on real material: the two settings that decide everything
 
