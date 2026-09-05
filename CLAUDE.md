@@ -24,6 +24,8 @@ cargo clippy --all-targets
 ./target/release/rmp in.wav -o resynth.wav [-c settings.toml] [-r residual.wav] [-b book.toml]
 ./target/release/rmp in.wav -o resynth.wav -s 2.5 -d 0.5   # analyse one excerpt, in seconds
 ./target/release/rmp in.wav -o resynth.wav -b book.json.gz   # any book format, compressed
+./target/release/rmp in.wav -b book.toml                    # analyse only, no resynthesis
+./target/release/rmp -b book.toml -o resynth.wav            # synthesise a book, no analysis
 ./target/release/rmp --write-config > settings.toml
 
 # statistics and visualization over a book
@@ -157,6 +159,18 @@ figure is meaningless. The clamp is visible as `energy_removed / projected_energ
 p5 0.76, min 0.24 on the 5000-atom piano book. On a book where HRMP did *not* run, that same
 shortfall would be a parameter-mapping error instead, which is why the two readings need
 separating.
+
+**`--book` is an input or an output depending on whether an input soundfile is given.** With
+one it is written; without one it is read and synthesised, and the whole analysis path — config,
+dictionary, `--start`/`--duration`, `--residual` — is inapplicable rather than merely unused, so
+those flags are errors in that mode. Analysis needs at least one of the three outputs; `--out`
+alone is no longer mandatory, and skipping it also skips the resynthesis render.
+
+**A synthesised book is longer than the excerpt it came from.** `Book::natural_len` sizes the
+output by rendering each atom's envelope and taking the furthest death, where analysis sized the
+residual by the input. The atom tails the analysis truncated at the excerpt end are audible again —
+2.9% of the excerpt's energy on a 0.15 s piano fixture. Over the excerpt itself the two renders are
+bit-identical, so this is a longer file, not a different one.
 
 **`signal::overlap` is the single definition of which samples an atom occupies.** Writing it
 (`add_at`, `subtract_at`), scoring it (`fit::accumulate`) and invalidating the frames it touched

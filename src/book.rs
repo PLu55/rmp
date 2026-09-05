@@ -3,7 +3,7 @@
 //! A [`Book`] is the output of a pursuit: the atoms selected, in order, with enough provenance to
 //! diagnose a bad decomposition and enough parameters to replay it through rfofs.
 
-use crate::fof::AtomParams;
+use crate::fof::{AtomParams, Envelope, FofError};
 use crate::signal::snr_db;
 use flate2::Compression;
 use flate2::read::GzDecoder;
@@ -97,6 +97,22 @@ impl Book {
     pub fn resynthesize(&self, len: usize) -> Result<crate::signal::Signal, crate::fof::FofError> {
         let atoms: Vec<AtomParams> = self.selections.iter().map(|s| s.atom).collect();
         crate::signal::Signal::from_atoms(&atoms, len, self.sample_rate)
+    }
+
+    /// Samples this book occupies, from the analysis origin to the death of the last atom.
+    ///
+    /// This is what [`resynthesize`](Self::resynthesize) needs when there is no input signal to
+    /// take the length from. Atoms with a negative `t0` began before the analysed excerpt and are
+    /// clipped at the origin here exactly as `resynthesize` clips them, so a book replays in the
+    /// same frame it was analysed in. Support lengths come from rendering, never from a formula —
+    /// the same rule the rest of the crate follows.
+    pub fn natural_len(&self) -> Result<usize, FofError> {
+        let mut len = 0i64;
+        for s in &self.selections {
+            let env = Envelope::render(s.atom.env, self.sample_rate)?;
+            len = len.max(s.atom.t0 + env.support_len() as i64);
+        }
+        Ok(len.max(0) as usize)
     }
 
     /// Replayable parameters, for rendering through rfofs.
@@ -287,6 +303,42 @@ mod tests {
         assert!(write(&dir.join("b.yaml.gz"), &book).is_err());
         assert!(read(&dir.join("b.yaml")).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `natural_len` has to cover every atom's whole life and no more: rendering into a longer
+    /// buffer must add nothing past it, and the samples just inside it must still be live.
+    ///
+    /// Also the reason a negative `t0` cannot extend it — `resynthesize` clips such an atom at the
+    /// origin, so counting its pre-origin part would pad the output with silence the book does not
+    /// contain.
+    #[test]
+    fn natural_len_is_exactly_where_the_last_atom_dies() {
+        let at = |t0: i64| Selection {
+            atom: AtomParams {
+                t0,
+                ..sel(0, 0.5).atom
+            },
+            ..sel(0, 0.5)
+        };
+
+        let mut b = Book::new(1.0, 48_000.0);
+        assert_eq!(b.natural_len().unwrap(), 0, "an empty book occupies nothing");
+
+        let support = Envelope::render(at(0).atom.env, b.sample_rate).unwrap().support_len();
+        b.selections.push(at(-(support as i64) - 10));
+        assert_eq!(b.natural_len().unwrap(), 0, "an atom entirely before the origin is clipped");
+
+        b.selections.push(at(-200));
+        assert_eq!(b.natural_len().unwrap(), support - 200);
+
+        b.selections.push(at(5_000));
+        let len = b.natural_len().unwrap();
+        assert_eq!(len, support + 5_000);
+
+        // Rendered with room to spare, the book is silent past its own length and audible inside.
+        let s = b.resynthesize(len + 4_096).unwrap();
+        assert!(s.samples[len..].iter().all(|&v| v == 0.0), "energy past natural_len");
+        assert!(s.samples[len - 64..len].iter().any(|&v| v != 0.0), "dead before natural_len");
     }
 
     /// A book written before `hr_score` and `refined` existed still reads.

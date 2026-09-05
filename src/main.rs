@@ -3,8 +3,13 @@
 //! ```text
 //! rmp input.wav -o resynth.wav [-c settings.toml] [-r residual.wav] [-b book.toml]
 //!     [-s start_seconds] [-d duration_seconds]
+//! rmp input.wav -b book.toml            # analyse only, no resynthesis
+//! rmp -b book.toml -o resynth.wav       # synthesise a book, no analysis
 //! rmp --write-config > settings.toml
 //! ```
+//!
+//! The two roles of `--book` are told apart by whether an input soundfile is given: with one it is
+//! written, without one it is read.
 
 use clap::Parser;
 use rmp::audio;
@@ -25,12 +30,13 @@ use std::time::Instant;
     version
 )]
 struct Args {
-    /// Input soundfile (WAV, AIFF, FLAC). Multi-channel input is downmixed to mono.
-    #[arg(required_unless_present = "write_config")]
+    /// Input soundfile (WAV, AIFF, FLAC). Multi-channel input is downmixed to mono. Omit it to
+    /// synthesise the book given by --book instead of analysing anything.
     input: Option<PathBuf>,
 
-    /// Resynthesised output, as 32-bit float WAV.
-    #[arg(short, long, required_unless_present = "write_config")]
+    /// Resynthesised output, as 32-bit float WAV. Optional when analysing — omitting it and
+    /// giving --book analyses without rendering the result.
+    #[arg(short, long)]
     out: Option<PathBuf>,
 
     /// Settings document (TOML). Defaults are used if omitted.
@@ -41,8 +47,9 @@ struct Args {
     #[arg(short, long)]
     residual: Option<PathBuf>,
 
-    /// Also write the book of recovered atoms. Format follows the extension: .toml or .json,
-    /// either of which may carry a trailing .gz to be compressed.
+    /// The book of atoms: written when a soundfile is analysed, read and synthesised when no
+    /// input soundfile is given. Format follows the extension: .toml or .json, either of which
+    /// may carry a trailing .gz to be compressed.
     #[arg(short, long)]
     book: Option<PathBuf>,
 
@@ -80,8 +87,88 @@ fn run(args: &Args) -> Result<(), String> {
         return Ok(());
     }
 
-    let input = args.input.as_ref().expect("required by clap");
-    let out = args.out.as_ref().expect("required by clap");
+    // `--book` is an output when there is something to analyse and an input when there is not.
+    // Nothing else distinguishes the two modes: a book carries its own sample rate and its atoms
+    // are the whole of what synthesis needs.
+    match (args.input.as_deref(), args.book.as_deref()) {
+        (Some(input), _) => analyse(args, input),
+        (None, Some(book)) => synthesise(args, book),
+        (None, None) => Err(
+            "give an input soundfile to analyse, or a book to synthesise with --book".into(),
+        ),
+    }
+}
+
+/// Render a book back to audio, with no analysis and no dictionary.
+///
+/// The book is replayed in the frame it was analysed in: sample 0 of the output is the origin the
+/// atom onsets are relative to, and an atom that began before it is clipped there. So a book from
+/// `--start 2.5` synthesises the excerpt, not the file.
+fn synthesise(args: &Args, book_path: &Path) -> Result<(), String> {
+    let Some(out) = args.out.as_deref() else {
+        return Err(format!(
+            "synthesising {} needs somewhere to write it: give --out",
+            book_path.display()
+        ));
+    };
+    for (flag, unused) in [
+        ("--config", args.config.is_some()),
+        ("--residual", args.residual.is_some()),
+        ("--start", args.start.is_some()),
+        ("--duration", args.duration.is_some()),
+    ] {
+        if unused {
+            return Err(format!("{flag} applies to analysis; synthesising a book ignores it"));
+        }
+    }
+
+    let say = |m: &str| {
+        if !args.quiet {
+            eprintln!("{m}");
+        }
+    };
+
+    let book = book::read(book_path)?;
+    if book.is_empty() {
+        return Err(format!("{} contains no atoms", book_path.display()));
+    }
+    if !(book.sample_rate > 0.0 && book.sample_rate.is_finite()) {
+        return Err(format!(
+            "{} has an unusable sample rate ({})",
+            book_path.display(),
+            book.sample_rate
+        ));
+    }
+
+    let t = Instant::now();
+    let len = book.natural_len().map_err(|e| format!("sizing the book: {e}"))?;
+    let signal = book
+        .resynthesize(len)
+        .map_err(|e| format!("resynthesis: {e}"))?;
+    say(&format!(
+        "{}: {} atoms, {} Hz, {:.2} s reconstructed at {:.1} dB in {:.2?}",
+        book_path.display(),
+        book.len(),
+        book.sample_rate as u32,
+        len as f32 / book.sample_rate,
+        book.snr_db(),
+        t.elapsed()
+    ));
+
+    audio::write(out, &signal).map_err(|e| e.to_string())?;
+    say(&format!("wrote {}", out.display()));
+    Ok(())
+}
+
+/// Decompose a soundfile, and write whichever of the three outputs were asked for.
+fn analyse(args: &Args, input: &Path) -> Result<(), String> {
+    if args.out.is_none() && args.book.is_none() && args.residual.is_none() {
+        return Err(
+            "nothing to write: give --out for the resynthesis, --book for the atoms, or \
+             --residual for what is left over"
+                .into(),
+        );
+    }
 
     let config = load_config(args.config.as_deref())?;
     config.validate()?;
@@ -199,11 +286,15 @@ fn run(args: &Args) -> Result<(), String> {
     ));
 
     // ── write ───────────────────────────────────────────────────────────────
-    let resynth = book
-        .resynthesize(signal.len())
-        .map_err(|e| format!("resynthesis: {e}"))?;
-    audio::write(out, &resynth).map_err(|e| e.to_string())?;
-    say(&format!("wrote {}", out.display()));
+    // Resynthesis is skipped outright when no --out was given: it renders every atom a second
+    // time, which is not free on a large book, and an analysis-only run has no use for it.
+    if let Some(out) = &args.out {
+        let resynth = book
+            .resynthesize(signal.len())
+            .map_err(|e| format!("resynthesis: {e}"))?;
+        audio::write(out, &resynth).map_err(|e| e.to_string())?;
+        say(&format!("wrote {}", out.display()));
+    }
 
     if let Some(path) = &args.residual {
         // Taken from the pursuit rather than by subtracting the resynthesis, so it is exactly what
