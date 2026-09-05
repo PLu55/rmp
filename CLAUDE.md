@@ -46,6 +46,10 @@ FFTW_PLAN=patient cargo bench --bench fft
 
 Benchmarks use criterion with `harness = false`, matching rfofs's convention.
 
+`MANUAL.md` is the user-facing settings reference: every knob, what it does to the result and to
+the clock, with the measured numbers. It is the right place for tuning advice; this file is the
+right place for why the code is shaped as it is. Settings guidance added here should end up there.
+
 ## Architecture
 
 The pipeline is: dictionary → correlate every frame → pick the best atom → subtract → repeat. The
