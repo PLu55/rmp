@@ -5,7 +5,12 @@
 
 use crate::fof::AtomParams;
 use crate::signal::snr_db;
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use rfofs::fof::FofParams;
+use std::io::{Read, Write};
+use std::path::Path;
 
 /// One selected atom, with where it came from and what it actually removed.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -115,6 +120,83 @@ impl Book {
     }
 }
 
+
+/// The wire format a path names: TOML or JSON, and whether it is gzipped.
+///
+/// A trailing `.gz` or `.gzip` compresses, and the format is then read from the extension
+/// *beneath* it: `book.json.gz` is gzipped JSON, a bare `book.gz` gzipped TOML. No extension at
+/// all is TOML. This is the single definition of those rules — [`read`] and [`write`] must not
+/// each grow their own, or the two binaries will disagree about what `book.gz` means.
+fn format_of(path: &Path) -> Result<(bool, bool), String> {
+    let gzip = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("gz" | "gzip")
+    );
+    // Strip the .gz to expose the format extension. Only the extension is ever read from this, so
+    // losing the directory to `file_stem` does not matter.
+    let stem = path.file_stem().unwrap_or_default();
+    let format_path = if gzip { Path::new(stem) } else { path };
+
+    let json = match format_path.extension().and_then(|e| e.to_str()) {
+        Some("json") => true,
+        Some("toml") | None => false,
+        Some(other) => {
+            return Err(format!(
+                "unknown book format '.{other}' — use .toml or .json, optionally with a .gz suffix"
+            ));
+        }
+    };
+    Ok((json, gzip))
+}
+
+/// Serialise the book, picking the format from the file extension.
+///
+/// A book is mostly repeated field names and decimal digits, so the `.gz` suffix is worth about 7×.
+pub fn write(path: &Path, book: &Book) -> Result<(), String> {
+    let (json, gzip) = format_of(path)?;
+
+    let text = if json {
+        serde_json::to_string_pretty(book).map_err(|e| format!("serialising book: {e}"))?
+    } else {
+        toml::to_string_pretty(book).map_err(|e| format!("serialising book: {e}"))?
+    };
+
+    let bytes = if gzip {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(text.as_bytes())
+            .and_then(|()| enc.finish())
+            .map_err(|e| format!("compressing book: {e}"))?
+    } else {
+        text.into_bytes()
+    };
+    std::fs::write(path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Read a book back, by the same extension rules [`write`] uses.
+///
+/// `Selection`'s `#[serde(default)]` on `hr_score` and `refined` is what keeps books written
+/// before those fields existed readable.
+pub fn read(path: &Path) -> Result<Book, String> {
+    let (json, gzip) = format_of(path)?;
+
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let text = if gzip {
+        let mut out = String::new();
+        GzDecoder::new(&bytes[..])
+            .read_to_string(&mut out)
+            .map_err(|e| format!("decompressing {}: {e}", path.display()))?;
+        out
+    } else {
+        String::from_utf8(bytes).map_err(|e| format!("reading {}: {e}", path.display()))?
+    };
+
+    if json {
+        serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))
+    } else {
+        toml::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +253,52 @@ mod tests {
         b.selections.push(sel(2, 0.25));
         b.selections.push(sel(0, 0.1));
         assert_eq!(b.block_histogram(3), vec![2, 0, 1]);
+    }
+
+    /// The .gz is stripped before the format is read, the bytes on disk are a gzip member when
+    /// they should be, and every combination round-trips back to the same book.
+    #[test]
+    fn a_gz_suffix_compresses_and_the_format_comes_from_beneath_it() {
+        let dir = std::env::temp_dir().join(format!("rmp-book-io-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut book = Book::new(1.0, 48_000.0);
+        book.selections.push(Selection {
+            hr_score: Some(0.4),
+            ..sel(3, 0.5)
+        });
+
+        for (name, gzipped) in [
+            ("b.json", false),
+            ("b.json.gz", true),
+            ("b.toml", false),
+            ("b.toml.gzip", true),
+            ("b.gz", true),
+            ("b", false),
+        ] {
+            let path = dir.join(name);
+            write(&path, &book).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes.starts_with(&[0x1f, 0x8b]), gzipped, "{name}");
+            // A bare .gz falls through to TOML, the same as no extension at all.
+            assert_eq!(read(&path).unwrap(), book, "{name}");
+        }
+
+        assert!(write(&dir.join("b.yaml"), &book).is_err());
+        assert!(write(&dir.join("b.yaml.gz"), &book).is_err());
+        assert!(read(&dir.join("b.yaml")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A book written before `hr_score` and `refined` existed still reads.
+    #[test]
+    fn missing_optional_fields_default() {
+        let json = r#"{"selections":[{"atom":{"t0":0,"f":440.0,
+            "env":{"alpha":251.0,"beta":0.001,"fade_level":0.001,"fade_dur":0.008},
+            "phi":0.0,"amp":1.0},"block":0,"onset":0,"bin":9,
+            "projected_energy":1.0,"energy_removed":1.0,"residual_energy":0.5}],
+            "initial_energy":1.0,"sample_rate":48000.0}"#;
+        let b: Book = serde_json::from_str(json).unwrap();
+        assert_eq!(b.selections[0].hr_score, None);
+        assert!(!b.selections[0].refined);
     }
 }

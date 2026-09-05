@@ -7,16 +7,13 @@
 //! ```
 
 use clap::Parser;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use rmp::audio;
-use rmp::book::Book;
+use rmp::book;
 use rmp::config::Config;
 use rmp::dict::Dictionary;
 use rmp::fft::Planner;
 use rmp::mp::{Mp, MpConfig};
 use rmp::signal::{db_fs, peak_of, rms_of, Signal};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -217,7 +214,7 @@ fn run(args: &Args) -> Result<(), String> {
     }
 
     if let Some(path) = &args.book {
-        write_book(path, &book)?;
+        book::write(path, &book)?;
         say(&format!("wrote {}", path.display()));
     }
 
@@ -278,45 +275,6 @@ fn load_config(path: Option<&Path>) -> Result<Config, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("reading {}: {e}", path.display()))?;
     Config::from_toml(&text).map_err(|e| format!("parsing {}: {e}", path.display()))
-}
-
-/// Serialise the book, picking the format from the file extension.
-///
-/// A trailing `.gz` or `.gzip` compresses the output, and the format is then read from the
-/// extension beneath it: `book.json.gz` is gzipped JSON, a bare `book.gz` gzipped TOML. A book is
-/// mostly repeated field names and decimal digits, so this is worth about 7×.
-fn write_book(path: &Path, book: &Book) -> Result<(), String> {
-    let gzip = matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("gz" | "gzip")
-    );
-    // Strip the .gz to expose the format extension. Only the extension is ever read from this, so
-    // losing the directory to `file_stem` does not matter.
-    let stem = path.file_stem().unwrap_or_default();
-    let format_path = if gzip { Path::new(stem) } else { path };
-
-    let text = match format_path.extension().and_then(|e| e.to_str()) {
-        Some("json") => serde_json::to_string_pretty(book)
-            .map_err(|e| format!("serialising book: {e}"))?,
-        Some("toml") | None => {
-            toml::to_string_pretty(book).map_err(|e| format!("serialising book: {e}"))?
-        }
-        Some(other) => {
-            return Err(format!(
-                "unknown book format '.{other}' — use .toml or .json, optionally with a .gz suffix"
-            ));
-        }
-    };
-
-    let bytes = if gzip {
-        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
-        enc.write_all(text.as_bytes())
-            .and_then(|()| enc.finish())
-            .map_err(|e| format!("compressing book: {e}"))?
-    } else {
-        text.into_bytes()
-    };
-    std::fs::write(path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 const DEFAULT_CONFIG_HEADER: &str = "\
@@ -446,7 +404,6 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     fn ramp(n: usize) -> Signal {
         Signal::new((0..n).map(|i| i as f32).collect(), 1000.0)
@@ -475,70 +432,6 @@ mod tests {
     fn start_alone_runs_to_the_end() {
         let (off, got) = excerpt(ramp(500), Some(0.25), None).unwrap();
         assert_eq!((off, got.len()), (250, 250));
-    }
-
-    fn a_book() -> Book {
-        let mut b = Book::new(1.0, 48_000.0);
-        b.selections.push(rmp::book::Selection {
-            atom: rmp::fof::AtomParams {
-                t0: 17,
-                f: 440.0,
-                env: rmp::fof::EnvelopeParams::new(251.0, 0.001),
-                phi: 0.5,
-                amp: 0.25,
-            },
-            block: 3,
-            onset: 16,
-            bin: 9,
-            projected_energy: 0.5,
-            energy_removed: 0.5,
-            residual_energy: 0.5,
-            hr_score: None,
-            refined: true,
-        });
-        b
-    }
-
-    /// The .gz is stripped before the format is read, and the bytes on disk are a gzip member that
-    /// inflates back to the same book.
-    #[test]
-    fn a_gz_suffix_compresses_and_the_format_comes_from_beneath_it() {
-        let dir = std::env::temp_dir().join(format!("rmp-book-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let book = a_book();
-
-        for (name, gzipped) in [
-            ("b.json", false),
-            ("b.json.gz", true),
-            ("b.toml.gzip", true),
-            ("b.gz", true),
-        ] {
-            let path = dir.join(name);
-            write_book(&path, &book).unwrap();
-            let bytes = std::fs::read(&path).unwrap();
-            assert_eq!(bytes.starts_with(&[0x1f, 0x8b]), gzipped, "{name}");
-
-            let text = if gzipped {
-                let mut out = String::new();
-                flate2::read::GzDecoder::new(&bytes[..])
-                    .read_to_string(&mut out)
-                    .unwrap();
-                out
-            } else {
-                String::from_utf8(bytes).unwrap()
-            };
-            // A bare .gz falls through to TOML, the same as no extension at all.
-            let back: Book = if name.contains(".json") {
-                serde_json::from_str(&text).unwrap()
-            } else {
-                toml::from_str(&text).unwrap()
-            };
-            assert_eq!(back, book, "{name}");
-        }
-
-        assert!(write_book(&dir.join("b.yaml"), &book).is_err());
-        assert!(write_book(&dir.join("b.yaml.gz"), &book).is_err());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
