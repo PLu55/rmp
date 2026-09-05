@@ -17,6 +17,7 @@ pub mod naive;
 pub mod refine;
 pub mod select;
 pub mod signal;
+pub mod stats;
 
 pub use book::{Book, Selection};
 pub use cand::{Candidate, Seed, top_seeds};
@@ -32,3 +33,4 @@ pub use naive::{NaiveConfig, NaiveMp};
 pub use refine::{EnvelopeCache, RefineConfig, refine};
 pub use select::SegTree;
 pub use signal::Signal;
+pub use stats::{BookSummary, Diagnostics, Evaluator, Histogram, Quantity, Summary, Weight};
