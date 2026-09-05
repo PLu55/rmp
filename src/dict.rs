@@ -216,7 +216,45 @@ fn fold_e2_bin(spectrum: &[Complex32], fft_len: usize, m: usize) -> (f64, f64) {
 ///
 /// Frames sit on a grid of spacing `hop`, so a true onset is at most `hop/2` from the nearest
 /// frame; requiring `capture(hop/2) >= tol` gives `hop = 2 * max{delta : capture(delta) >= tol}`.
+///
+/// Capture falls monotonically with `delta` — the envelope is a rise followed by a decay, and
+/// shifting it further only ever lowers its overlap with itself — so the crossing is found by
+/// galloping out in powers of two and bisecting, rather than stepping `delta` one sample at a time.
+/// Each probe is an O(N) correlation, and at a loose tolerance on a low-`alpha` block the linear
+/// scan took ~16k of them over a 331k window: seconds per block, all of it in a dictionary build
+/// that used to take a millisecond. `hop_search_matches_the_linear_scan` pins the two against each
+/// other on every block of both dictionaries, which is the assumption made checkable.
 fn measure_hop(env: &[f32], fft_len: usize, tol: f64) -> usize {
+    let ok = |delta: usize| delta < fft_len && envelope_capture(env, delta + 1, fft_len) >= tol;
+    if !ok(0) {
+        return 1;
+    }
+    // Invariant: `ok(lo)` holds and, once set, `ok(hi)` does not. The linear scan stops at the
+    // first `delta` that fails and doubles *that*, so the answer is `hi`, not `lo`.
+    let mut lo = 0usize;
+    let mut hi = 1usize;
+    while ok(hi) {
+        lo = hi;
+        hi *= 2;
+        if hi >= fft_len {
+            hi = fft_len;
+            break;
+        }
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if ok(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (2 * hi).max(1)
+}
+
+/// The one-sample-at-a-time form of [`measure_hop`]: the definition, kept for the test.
+#[cfg(test)]
+fn measure_hop_linear(env: &[f32], fft_len: usize, tol: f64) -> usize {
     let mut delta = 0usize;
     while delta < fft_len && envelope_capture(env, delta + 1, fft_len) >= tol {
         delta += 1;
@@ -447,6 +485,40 @@ mod tests {
             b.hop,
             b.fft_len / 2
         );
+    }
+
+    /// Galloping-plus-bisection assumes capture is monotone in `delta`. This checks the assumption
+    /// rather than trusting it, on every shape either dictionary contains, at the tolerances the
+    /// configs use — including the loose ones where the scan was slow enough to matter.
+    #[test]
+    fn hop_search_matches_the_linear_scan() {
+        let mut shapes: Vec<(f32, f32)> = Vec::new();
+        for a in [80.0f32, 128.0, 205.0, 328.0, 524.0, 839.0, 1342.0, 2147.0] {
+            for b in [0.0003f32, 0.001, 0.003] {
+                shapes.push((a, b));
+            }
+        }
+        // The low-alpha grid, at a reduced rate so the test stays quick: the shapes are the same.
+        for a in [1.0f32, 2.0, 4.0, 16.0, 64.0, 256.0] {
+            for b in [0.0003f32, 0.001, 0.003, 0.012] {
+                shapes.push((a, b));
+            }
+        }
+        for (alpha, beta) in shapes {
+            if alpha * beta > 4.0 {
+                continue;
+            }
+            let sr = if alpha < 50.0 { 4_000.0 } else { SR };
+            let env = Envelope::render(EnvelopeParams::new(alpha, beta), sr).unwrap();
+            let fft_len = next_fast_len(env.support_len());
+            for tol in [0.95, 0.7, 0.5, 0.3] {
+                assert_eq!(
+                    measure_hop(&env.samples, fft_len, tol),
+                    measure_hop_linear(&env.samples, fft_len, tol),
+                    "alpha={alpha} beta={beta} tol={tol}"
+                );
+            }
+        }
     }
 
     #[test]

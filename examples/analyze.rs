@@ -4,7 +4,7 @@
 //! 48 kHz, and reports cost, convergence, and parameter recovery.
 //!
 //! ```text
-//! cargo run --release --example analyze [seconds] [max_atoms] [grains_per_sec] [candidates]
+//! cargo run --release --example analyze [seconds] [max_atoms] [grains_per_sec] [candidates] [capture_tol]
 //! ```
 //!
 //! Everything the plan predicted but never measured lands here: the per-iteration cost model, how
@@ -28,14 +28,20 @@ fn main() {
     let max_atoms: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(400);
     let density: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(30.0);
     let candidates: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let capture_tol: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.95);
     let len = (seconds * SR) as usize;
 
     let mut planner = Planner::new();
 
     println!("building voice dictionary at {SR} Hz");
     let t = Instant::now();
-    let dict = Dictionary::voice(SR, &mut planner, &BlockConfig::default()).unwrap();
-    println!("  built {} blocks in {:.2?}\n", dict.blocks.len(), t.elapsed());
+    let cfg = BlockConfig { capture_tol, ..BlockConfig::default() };
+    let dict = Dictionary::voice(SR, &mut planner, &cfg).unwrap();
+    println!(
+        "  built {} blocks in {:.2?} (capture_tolerance {capture_tol})\n",
+        dict.blocks.len(),
+        t.elapsed()
+    );
 
     report_dictionary(&dict, len);
 
