@@ -234,12 +234,46 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
         t.elapsed()
     ));
 
+    let mp_cfg: MpConfig = config.mp_config();
+
+    // A block whose support exceeds `max_atom_samples` can never be refined: `refine` asks the
+    // envelope cache for the seed's own shape first, the cache refuses it as out of bounds, and
+    // refinement declines. The atom is still selected — it is simply pinned to the grid, at grid
+    // frequency, grid onset and grid envelope.
+    //
+    // Reported as a fact rather than a fault, because it cuts both ways. Leaving it unnoticed cost
+    // 13 dB of residual peak on a low-alpha dictionary; but capping *deliberately* below the
+    // longest block is also the best setting measured, since it stops refinement chasing
+    // seven-second atoms it cannot converge on in the rounds available. The `refined:` line below
+    // says what actually happened.
+    if mp_cfg.refine.enabled {
+        let stuck: Vec<&_> = dict
+            .blocks
+            .iter()
+            .filter(|b| b.support_len() > mp_cfg.refine.max_atom_samples)
+            .collect();
+        if !stuck.is_empty() {
+            let longest = stuck.iter().map(|b| b.support_len()).max().unwrap_or(0);
+            say(&format!(
+                "  note: {} of {} blocks are longer than refine.max_atom_samples ({}), so their \
+                 atoms stay on the grid unrefined; longest support {} samples (alpha {:.3})",
+                stuck.len(),
+                dict.blocks.len(),
+                mp_cfg.refine.max_atom_samples,
+                longest,
+                stuck
+                    .iter()
+                    .map(|b| b.env.params.alpha)
+                    .fold(f32::INFINITY, f32::min),
+            ));
+        }
+    }
+
     // ── analyse ─────────────────────────────────────────────────────────────
     let t = Instant::now();
     let mut mp = Mp::new(&dict, &signal, &mut planner);
     let init = t.elapsed();
 
-    let mp_cfg: MpConfig = config.mp_config();
     let t = Instant::now();
     let book = mp.run(&mp_cfg);
     let pursuit = t.elapsed();
@@ -252,6 +286,14 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
         init,
         (init + pursuit).as_secs_f32() / duration.max(1e-9)
     ));
+    if !book.is_empty() && mp_cfg.refine.enabled {
+        let refined = book.selections.iter().filter(|s| s.refined).count();
+        say(&format!(
+            "  refined: {refined}/{} atoms moved off the grid ({:.0}%)",
+            book.len(),
+            100.0 * refined as f64 / book.len() as f64
+        ));
+    }
     if book.is_empty() {
         say("  warning: no atoms selected — check the dictionary covers the signal's content");
     } else if book.snr_db() < mp_cfg.target_snr_db {

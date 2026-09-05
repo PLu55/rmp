@@ -396,6 +396,45 @@ because only the analysis line was being read. Monotonicity is checked, not assu
 `RMP_REFRESH_DETAIL=1` prints per-block bounded/recomputed counts and the transform samples each
 block cost; it is how every attribution above was made.
 
+### Tuning a low-alpha config: what the settings are worth
+
+Measured on 3 s of piano, `mp_1.toml`, every arm driven to the same 35 dB so atoms and wall clock
+are comparable. Residual peak is the quality column that moves: at equal rms it says how well the
+transients are handled, and it is where a badly-placed long atom shows up.
+
+| arm | atoms | wall | resid peak |
+| --- | --- | --- | --- |
+| all six alpha rungs, `max_atom_samples = 65536` | 1631 | 9.9 s | −17.3 dB |
+| alphas `[16,64,256]` only | 1735 | 11.2 s | −30.8 dB |
+| **`max_atom_samples = 150000`, `alpha_bracket = 2.5`, `rounds = 2`** | **1528** | **12.6 s** | **−30.3 dB** |
+| `max_atom_samples = 400000`, `alpha_bracket = 2.5` | 1441 | 27.4 s | −30.6 dB |
+| `max_atom_samples = 400000`, `alpha_bracket = 1.6` | 1448 | 59.2 s | −29.4 dB |
+
+**`refine.max_atom_samples` silently decides whether a block is refined at all.** `refine` asks the
+envelope cache for the seed's own shape before anything else; the cache refuses a shape longer than
+the cap, and refinement declines. The atom is still *selected*, just pinned to grid frequency, grid
+onset and grid envelope. At the default 65536 against a dictionary reaching `alpha = 1`, that was 12
+of 24 blocks and 34% of the atoms in the book — and worth 13 dB of residual peak, invisible in the
+rms figure. `analyse` now prints how many blocks are affected and what fraction of atoms actually
+moved off the grid.
+
+**Capping it *deliberately* below the longest block is the best setting measured.** At `rounds = 2`,
+150000 gives −30.3 dB against 400000's −24.9: letting refinement chase seven-second atoms it cannot
+converge on in two rounds is worse than not letting it start. At `rounds = 3` the ordering reverses
+(−29.7 against −30.6) but costs 17 s against 27 s. The cap is a regularizer, not just a budget.
+
+**A wider `alpha_bracket` is faster, not slower.** 2.5 against 1.6 at `max_atom_samples = 400000`:
+27.4 s against 59.2 s for the same atom count and peak. Golden section covers the range in fewer
+rounds, so `score_tol` ends the search sooner. 4.0 is slower again (39.5 s) with no gain.
+
+**The low rungs earn their keep on this material.** 90–96% of the removed energy sits in `alpha < 8`
+— piano is sustained, and long atoms are right for it. Dropping them is a real trade, not free:
+`[16,64,256]` needs 6% more atoms but has the fastest dictionary build by 26× (2.4 ms against 64 ms)
+and holds the peak, so it is the right answer when the dictionary is rebuilt often.
+
+**`candidate_count` and `golden_iters` do nothing here.** 4 candidates costs 42% more wall for the
+same atoms; `golden_iters = 6` saves 13% and loses 4 dB of peak.
+
 ### HRMP on real material: the two settings that decide everything
 
 The synthetic fixtures are sparse and isolated, and HRMP's original defaults were tuned there. Dense
