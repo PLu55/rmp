@@ -33,6 +33,11 @@ cargo clippy --all-targets
 ./target/release/rmp in.wav -b book.json --residual-book bank.json.gz
 RMP_RESIDUAL_DETAIL=1 ./target/release/rmp in.wav --residual-book bank.json.gz
 
+# residual stochastic synthesis: either kind of book in, soundfile out
+./target/release/rmpsynth -b bank.json.gz -o stochastic.wav
+./target/release/rmpsynth -b book.json.gz --fof-audio fof.wav -o mixed.wav
+./target/release/rmpsynth -b bank.json.gz -o out.wav --seed 7 --gain-db -6 --encoding pcm24
+
 # statistics and visualization over a book
 ./target/release/rmpstat summary book.json [-c settings.toml]
 ./target/release/rmpstat diag    book.json -c settings.toml
@@ -82,7 +87,12 @@ parts that need reading together:
 - **`tfmap`** — the atom-based pseudo-Wigner time-frequency map (spec §21), as diagnostics only.
 - **`residual`** — stochastic analysis of the final residue: an ERB gammatone bank, one-pole band
   power, and a fixed-rate `ResidualBook`. A post-processing stage; it cannot touch the pursuit.
+- **`synth`** — the inverse of `residual`: a power-complementary ERB bank driven by independent
+  per-band noise at `sqrt(P_b)`. Reuses `residual::filter` outright; the only thing it adds is a
+  per-band scale.
 - **`config` / `audio` / `main`** — TOML settings, libsndfile I/O, the CLI.
+- **`bin/rmpsynth`** — the resynthesis CLI. A file and configuration front end over `synth`; no DSP
+  lives in it, so `rmp` can call the same renderer without spawning a process.
 - **`bin/rmpstat`** — the statistics CLI: clap, `plotters`, and text tables. A thin shell, so
   everything worth an oracle lives in `stats`/`tfmap` where `cargo test` reaches it.
 
@@ -242,6 +252,53 @@ correlate and the figure means nothing.
 Costs: 0.5 ms of analysis for 0.5 s of audio at 48 bands, against seconds for the pursuit. The book
 is the expense — 48 bands at 1 ms is 48000 f32 per second of audio, roughly 12× the atom list on a
 0.5 s piano excerpt, which is why `--residual-book` exists.
+
+### Residual ERB synthesis
+
+`rmp_residual_synthesis_spec.md` is the written specification. Five facts that are not obvious from
+the code:
+
+**The spec's §6 and §7 prescribe different levels, and applying both cancels.** §6 says
+`g_b = sqrt(P_b / C_b)` with `C_b` the synthesis band's own noise power; §7 says scale the bands so
+`sum_b |H_b|^2 = 1` and drive them at `sqrt(P_b)`. Dividing by `C_b` undoes exactly that scaling.
+§7 is the one to follow, and the reason is the invariant already recorded above: a unit-noise-power
+band makes `P_b` a weighted *average* of the residual's PSD, a density, not a share of its energy.
+Output PSD is `sum_b g_b^2 |H_b|^2`, so `sqrt(P_b)` into a complementary bank reproduces the
+residual's spectrum, while §6 read with `C_b = 1` reproduces the 27 dB overshoot instead. Measured
+on 1 s of piano the reconstruction lands **0.45 dB** below the residual it came from;
+`white_noise_survives_the_round_trip_at_its_own_level` is the regression that encodes it.
+
+**The calibration is a least-squares fit, not a division at the band centres.** The obvious rule —
+divide each band by `W(f_b)` — was tried first: it drives `W` to exactly 1 at the centres and leaves
+the dips between them, scalloping the default 48-band bank by 0.55 dB. The ISRA multiplicative
+update `c_b^2 *= sum_i m_b[i] / sum_i m_b[i] W[i]` weights by the band's own response, so a band can
+see the gap it is meant to fill: 0.30 dB, RMS 0.072 → 0.044. Both are deterministic; §10 rules out
+Monte Carlo, and a fixed 16384-point grid also means the reported diagnostics repeat exactly.
+
+**How flat `W` comes out is a property of the bank, not of the fit.** 48 bands hold to 0.30 dB and
+64 to 0.08, but 24 bands put the centres 1.7 ERB apart and *no* choice of scales fills between them
+— 5 dB of scalloping, and an audible comb. `a_sparse_bank_cannot_be_made_complementary_and_says_so`
+pins it, and the CLI warns past 1 dB. It is a reason to analyse with 48 bands or more.
+
+**The noise stream's variance is exactly 1, and the calibration depends on it.** The bands are
+scaled against unit-variance white noise, so the uniform `[-1, 1)` that `residual::pseudo_noise`
+produces — variance 1/3 — would put the whole render 4.8 dB low. `rng` emits uniform
+`[-sqrt(3), sqrt(3))` and `the_stream_has_unit_variance` is what stops that drifting.
+
+**The block size cannot reach the output, and that is structural.** Each block is split at the
+book's exact frame boundaries, and every band's noise stream, filter state and gain pole run
+continuously across the splits — so a frame reload is idempotent and block boundaries need no
+special case. `the_block_size_does_not_change_the_output` compares 1, 7, 48, 64, 100 and 256 bit for
+bit.
+
+Nothing here is parallel. 48 bands of a fourth-order complex cascade is ~1500 flops per output
+sample: 8 s of audio renders in 0.22 s, of which 0.06 s is the one-off bank calibration — about 50x
+realtime serially. Rayon would buy nothing and would cost the bit-identical determinism the seed
+exists to provide.
+
+**What it does not reproduce is the peak.** At matched rms the piano residual's reconstruction peaks
+~10 dB lower: the impulsive part of the residue is exactly what a stochastic model does not carry.
+That is the model's boundary, not a bug, and it is why the residual peak is worth reporting.
 
 ### The pseudo-Wigner map
 
@@ -545,8 +602,8 @@ Splitting the replay stream from the diagnostics is where the remaining 22× is,
 **`src/main.rs` must contain a `main`.** An empty file fails the whole build with `E0601`, including
 bench targets, which makes `cargo bench` look broken for an unrelated reason.
 
-**Adding `src/bin/rmpstat/` needed no `[[bin]]` section.** Cargo auto-discovers `src/main.rs` and
-`src/bin/*` together, so `rmp` is unaffected.
+**Adding `src/bin/rmpstat/` and `src/bin/rmpsynth/` needed no `[[bin]]` section.** Cargo
+auto-discovers `src/main.rs` and `src/bin/*` together, so `rmp` is unaffected.
 
 **`fftw` must keep `features = ["system"]`.** The crate's default `source` feature vendors FFTW 3.3.8
 with no SIMD flags at all — the generated `config.h` has `HAVE_AVX`, `HAVE_AVX2`, `HAVE_SSE2` all

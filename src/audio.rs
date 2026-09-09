@@ -1,8 +1,9 @@
 //! Soundfile input and output.
 //!
 //! Uses libsndfile (already a build requirement via rfofs), so WAV, AIFF and FLAC all work as
-//! input. Output is always 32-bit float WAV — the residual routinely contains values that would
-//! clip or quantise badly in a fixed-point format.
+//! input. Output is 32-bit float WAV by default — the residual routinely contains values that would
+//! clip or quantise badly in a fixed-point format. [`write_pcm24`] exists for `rmpsynth`, whose
+//! output is a finished mix rather than a residual.
 
 use crate::signal::Signal;
 use sndfile::{
@@ -89,12 +90,29 @@ pub fn read(path: impl AsRef<Path>) -> Result<Input, AudioError> {
 
 /// Write a mono signal as 32-bit float WAV.
 pub fn write(path: impl AsRef<Path>, signal: &Signal) -> Result<(), AudioError> {
+    write_encoded(path, signal, SubtypeFormat::FLOAT)
+}
+
+/// Write a mono signal as 24-bit PCM WAV.
+///
+/// Offered for the residual synthesiser, whose output is a finished mix rather than a residual and
+/// so has a defined full scale. Anything past `[-1, 1)` wraps in a fixed-point format, which is why
+/// [`crate::synth`] measures and reports overs before it gets here.
+pub fn write_pcm24(path: impl AsRef<Path>, signal: &Signal) -> Result<(), AudioError> {
+    write_encoded(path, signal, SubtypeFormat::PCM_24)
+}
+
+fn write_encoded(
+    path: impl AsRef<Path>,
+    signal: &Signal,
+    subtype: SubtypeFormat,
+) -> Result<(), AudioError> {
     let path = path.as_ref();
     let name = path.display().to_string();
 
     let mut snd = OpenOptions::WriteOnly(WriteOptions::new(
         MajorFormat::WAV,
-        SubtypeFormat::FLOAT,
+        subtype,
         Endian::File,
         signal.sample_rate as usize,
         1,

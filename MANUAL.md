@@ -3,6 +3,9 @@
 `rmp` decomposes a soundfile into FOF atoms (Rodet's Formant Wave Function) by Matching Pursuit,
 and writes them as a *book* that replays through the `rfofs` synthesizer unchanged.
 
+Three binaries: `rmp` analyses and resynthesises, `rmpstat` reports on a book, and `rmpsynth`
+reconstructs the stochastic residual (§10).
+
 This manual covers the command line, every setting, and what each one costs. For the design and its
 internals see `CLAUDE.md`; for the algorithm see `notes.md`.
 
@@ -507,9 +510,92 @@ window apart.
 The analysis is cheap — 0.5 ms for 0.5 s of audio at 48 bands, against seconds for the pursuit — so
 there is no cost argument for leaving it off once you want it.
 
+To play the result back, see §10. If that is the plan, keep `bands` at 48 or above: a sparser bank
+cannot be made power-complementary and the reconstruction combs.
+
 ---
 
-## 10. Tuning recipes
+## 10. `rmpsynth` — playing the residual back
+
+`rmp` measures the residual; `rmpsynth` reconstructs it. It reads a book of either kind — a
+standalone residual book, or a full book carrying one — and writes a soundfile.
+
+```bash
+rmpsynth -b bank.json.gz -o stochastic.wav              # the noise component alone
+rmpsynth -b book.json.gz -o stochastic.wav              # a full book: its residual section is used
+rmpsynth -b book.json.gz --fof-audio fof.wav -o mix.wav # atoms + noise
+```
+
+It does **not** synthesise atoms. Render those with `rmp -b book -o fof.wav` and hand the result to
+`--fof-audio`; nothing is resampled or stretched, and a sample-rate disagreement is an error.
+
+Which kind of book you passed is worked out from the document, so there is no flag for it. A full
+book with no residual section is an error, not a silent empty render.
+
+| flag | meaning |
+| --- | --- |
+| `-b`, `--book` | the book to render. Same extension rules as `rmp --book` |
+| `-o`, `--output` | output soundfile |
+| `--fof-audio` | pre-rendered atom synthesis to mix in |
+| `--seed` — default `1` | the whole of the nondeterminism |
+| `--gain-smoothing-ms` — default `1.0` | one-pole smoothing of the band gains |
+| `--gain-smoothing-mode` — default `fixed` | or `bandwidth-relative` |
+| `--gain-db` — default `0.0` | output gain, applied after mixing |
+| `--encoding` — default `float32` | or `pcm24` |
+| `--clip` / `--error-on-clip` | what to do about samples past full scale. Neither: write and count |
+| `--trim-to-residual` | drop the leading silence a `--start` offset puts in |
+| `-v`, `--verbose` | the per-band table. `RMP_RESIDUAL_DETAIL` does the same |
+
+### How the level is decided, and why it is not obvious
+
+A band power `P_b` is a spectral **density**, not a share of the residual's energy — the bands
+overlap and each is normalised to unit noise power, which is exactly why summing them lands 27 dB
+high (§9). So the reconstruction cannot simply run the analysis filters at `√P_b` and add them up.
+
+Instead the synthesis bands are rescaled so that `Σ_b |H_b(ω)|² ≈ 1` — *power-complementary* — and
+then driven at `g_b = √P_b`. With independent noise per band the output spectrum is `Σ_b g_b²|H_b|²`,
+which is then the residual's own spectrum. Measured on 1 s of piano: the reconstruction lands
+**0.45 dB** below the residual it came from. Without the rescaling it would be roughly 20 dB above.
+
+The scaling is fitted at startup on a fixed 16 384-point frequency grid — a non-negative least
+squares fit, no randomness — and the report prints how flat it came out:
+
+```text
+bank complementarity: -0.30 dB worst, rms 0.044, over 76 .. 18237 Hz
+```
+
+**That figure is a property of `[residual.erb] bands`, not of the fit.** 48 bands hold to 0.3 dB and
+64 to 0.08 dB, but 24 bands put the centres 1.7 ERB apart and no choice of scales fills between
+them — it scallops by 5 dB, and the reconstruction combs. `rmpsynth` warns past 1 dB. If you plan to
+resynthesise, do not analyse with a sparse bank.
+
+### What it does not reproduce
+
+The peak. A stochastic model matches power, and at matched rms the reconstruction of the piano
+residual peaks about 10 dB lower than the residual itself — the impulsive part of the residue is
+precisely what a noise model does not carry. Everything below `min_freq_hz` and above `max_freq_hz`
+is also simply absent.
+
+### Timeline
+
+Output sample 0 is source sample 0. A book analysed with `-s 2.0` therefore renders two seconds of
+leading silence, and `--trim-to-residual` removes it. This matters when mixing: `rmp -s 2.0 -o
+fof.wav` writes the *excerpt* starting at sample 0, so the two need `--trim-to-residual` to line up.
+`rmpsynth` says so when it sees the combination. With `--fof-audio` the output is as long as the
+longer of the two, and a short FOF file is padded rather than truncating the residual.
+
+Nothing is ever normalised, and the render stops exactly at the end of the analysed residual — no
+filter tail is appended.
+
+### Cost
+
+8 s of audio through 48 bands takes 0.22 s, of which 0.06 s is the one-off bank calibration: about
+50× realtime for the DSP itself. Bands are summed serially in a fixed order, so the same seed gives
+bit-identical samples and the block size cannot reach the output.
+
+---
+
+## 11. Tuning recipes
 
 Measured on 3 s of solo piano at 48 kHz, all driven to the same 35 dB so atoms and wall clock are
 comparable. The dictionary reaches `alpha = 1`.
@@ -538,7 +624,7 @@ comparable. The dictionary reaches `alpha = 1`.
 
 ---
 
-## 11. Diagnostics
+## 12. Diagnostics
 
 ```bash
 rmpstat summary book.json -c settings.toml   # atoms, energy, parameter spread
@@ -559,7 +645,7 @@ has no cross-terms. It is diagnostics only and plays no part in the pursuit.
 
 ---
 
-## 12. Things that will bite
+## 13. Things that will bite
 
 **A WAV written twice is not byte-identical.** libsndfile stamps a timestamp into the PEAK chunk of
 a float file. Exactly one byte differs and the audio is untouched — compare the book, or the data

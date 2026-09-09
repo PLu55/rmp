@@ -19,6 +19,7 @@ pub mod residual;
 pub mod select;
 pub mod signal;
 pub mod stats;
+pub mod synth;
 pub mod tfmap;
 
 pub use book::{Book, Selection};
@@ -40,4 +41,9 @@ pub use residual::{
 pub use select::SegTree;
 pub use signal::Signal;
 pub use stats::{BookSummary, Diagnostics, Evaluator, Histogram, Quantity, Summary, Weight};
+pub use synth::{
+    load_book, render_full_book, render_residual_book, render_to_file, BankCalibration, BookInput,
+    ClippingPolicy, GainSmoothingConfig, GainSmoothingMode, OutputEncoding, RenderConfig,
+    RenderError, RenderReport, RenderRequest, SynthesisBank,
+};
 pub use tfmap::{MapGrid, MapOptions, TfMap};
