@@ -12,6 +12,10 @@ use crate::fof::ReleasePolicy;
 use crate::mp::MpConfig;
 use crate::hrmp::{HrmpConfig, MagnitudePolicy, ProbeMode};
 use crate::refine::RefineConfig;
+use crate::residual::book::{ErbFilterKind, ErbNormalization, ErbSpacing, ResidualStorage};
+use crate::residual::config::{ErbBankConfig, ResidualAnalysisConfig};
+use crate::residual::error::ResidualAnalysisError;
+use crate::residual::power::{ResidualPowerConfig, ResidualPowerTimeMode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -23,6 +27,7 @@ pub struct Config {
     pub pursuit: PursuitSettings,
     pub refine: RefineSettings,
     pub hrmp: HrmpSettings,
+    pub residual: ResidualSettings,
 }
 
 /// The release policy, fixed for the whole analysis.
@@ -286,6 +291,121 @@ impl Default for HrmpSettings {
     }
 }
 
+/// Stochastic analysis of what the pursuit could not explain.
+///
+/// Off by default, and a strict post-processing stage: enabling it cannot change which atoms were
+/// selected. See [`crate::residual`] for the model.
+///
+/// Milliseconds here, samples and seconds in [`ResidualAnalysisConfig`] — the conversion happens
+/// once, in [`Config::residual_config`], because it needs the sample rate the file turns out to
+/// have.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ResidualSettings {
+    pub enabled: bool,
+    /// How often a power frame is recorded. Independent of the filter bank's own rate, which is
+    /// always the audio rate.
+    pub update_ms: f64,
+    /// How the stored numbers encode power.
+    pub storage: ResidualStorage,
+    pub erb: ResidualErbSettings,
+    pub power: ResidualPowerSettings,
+}
+
+impl Default for ResidualSettings {
+    fn default() -> Self {
+        let d = ResidualAnalysisConfig::default();
+        Self {
+            enabled: d.enabled,
+            update_ms: 1.0,
+            storage: d.storage,
+            erb: ResidualErbSettings::default(),
+            power: ResidualPowerSettings::default(),
+        }
+    }
+}
+
+/// The analysis filter bank.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ResidualErbSettings {
+    pub bands: usize,
+    pub min_freq_hz: f64,
+    pub max_freq_hz: f64,
+    pub spacing: ErbSpacing,
+    pub filter: ErbFilterKind,
+    pub order: usize,
+    pub normalization: ErbNormalization,
+}
+
+impl Default for ResidualErbSettings {
+    fn default() -> Self {
+        let d = ErbBankConfig::default();
+        Self {
+            bands: d.bands,
+            min_freq_hz: d.min_freq_hz,
+            max_freq_hz: d.max_freq_hz,
+            spacing: d.spacing,
+            filter: d.filter_kind,
+            order: d.filter_order,
+            normalization: d.normalization,
+        }
+    }
+}
+
+impl From<&ResidualErbSettings> for ErbBankConfig {
+    fn from(s: &ResidualErbSettings) -> Self {
+        Self {
+            bands: s.bands,
+            min_freq_hz: s.min_freq_hz,
+            max_freq_hz: s.max_freq_hz,
+            spacing: s.spacing,
+            filter_kind: s.filter,
+            filter_order: s.order,
+            normalization: s.normalization,
+        }
+    }
+}
+
+/// The per-band power detector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ResidualPowerSettings {
+    pub mode: ResidualPowerTimeMode,
+    /// Used by `mode = "fixed"`.
+    pub tau_ms: f64,
+    /// Used by `mode = "bandwidth_relative"`: `tau_b = clamp(tau_scale / bandwidth_b, min, max)`,
+    /// with `tau_scale` dimensionless.
+    pub tau_scale: f64,
+    pub tau_min_ms: f64,
+    pub tau_max_ms: f64,
+}
+
+impl Default for ResidualPowerSettings {
+    fn default() -> Self {
+        let d = ResidualPowerConfig::default();
+        Self {
+            mode: d.mode,
+            tau_ms: d.fixed_tau_seconds * 1e3,
+            tau_scale: d.bandwidth_tau_scale,
+            tau_min_ms: d.tau_min_seconds * 1e3,
+            tau_max_ms: d.tau_max_seconds * 1e3,
+        }
+    }
+}
+
+impl From<&ResidualPowerSettings> for ResidualPowerConfig {
+    fn from(s: &ResidualPowerSettings) -> Self {
+        Self {
+            mode: s.mode,
+            fixed_tau_seconds: s.tau_ms / 1e3,
+            bandwidth_tau_scale: s.tau_scale,
+            tau_min_seconds: s.tau_min_ms / 1e3,
+            tau_max_seconds: s.tau_max_ms / 1e3,
+        }
+    }
+}
+
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
@@ -341,6 +461,42 @@ impl Config {
         }
     }
 
+    /// Residual settings resolved against the sample rate the analysis will actually run at.
+    ///
+    /// This is the only place `update_ms` becomes samples: the spec is explicit that milliseconds
+    /// are converted once and the sample count carried thereafter. Fails rather than clamps —
+    /// `max_freq_hz` above the usable limit at this rate is a settings error, and an `update_ms`
+    /// under a sample is not a request for a one-sample interval.
+    pub fn residual_config(
+        &self,
+        sample_rate: f64,
+    ) -> Result<ResidualAnalysisConfig, ResidualAnalysisError> {
+        let r = &self.residual;
+        if !(r.update_ms.is_finite() && r.update_ms > 0.0) {
+            return Err(ResidualAnalysisError::InvalidUpdateInterval {
+                update_ms: r.update_ms,
+                sample_rate,
+            });
+        }
+        let update = ((r.update_ms * 0.001) * sample_rate).round();
+        if !(update >= 1.0 && update <= usize::MAX as f64) {
+            return Err(ResidualAnalysisError::InvalidUpdateInterval {
+                update_ms: r.update_ms,
+                sample_rate,
+            });
+        }
+
+        let cfg = ResidualAnalysisConfig {
+            enabled: r.enabled,
+            update_samples: update as usize,
+            erb: (&r.erb).into(),
+            power: (&r.power).into(),
+            storage: r.storage,
+        };
+        cfg.validate(sample_rate)?;
+        Ok(cfg)
+    }
+
     /// A fully-populated settings document, for `--write-config`.
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
@@ -367,6 +523,22 @@ impl Config {
         release
             .validate()
             .map_err(|e| format!("[envelope]: {e}"))?;
+
+        // Only when the stage will run. The checks that need a sample rate live in
+        // `residual_config`, which the analysis calls before the dictionary is built; these are the
+        // ones a settings document can be judged on by itself.
+        if self.residual.enabled {
+            let erb: ErbBankConfig = (&self.residual.erb).into();
+            erb.validate().map_err(|e| e.to_string())?;
+            let power: ResidualPowerConfig = (&self.residual.power).into();
+            power.validate().map_err(|e| e.to_string())?;
+            if !(self.residual.update_ms.is_finite() && self.residual.update_ms > 0.0) {
+                return Err(format!(
+                    "residual.update_ms must be a positive number of milliseconds, got {}",
+                    self.residual.update_ms
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -461,6 +633,76 @@ mod tests {
         assert!(bad_tol.validate().is_err());
 
         assert!(Config::default().validate().is_ok());
+    }
+
+    /// §29.5 from the document's side: 1 ms at 48 kHz is 48 samples, converted here and only here.
+    #[test]
+    fn residual_settings_resolve_to_samples_and_seconds() {
+        let cfg = Config::from_toml(
+            "[residual]\nenabled = true\nupdate_ms = 1.0\n\n\
+             [residual.erb]\nbands = 32\nmax_freq_hz = 16000.0\n\n\
+             [residual.power]\nmode = \"fixed\"\ntau_ms = 4.0\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().is_ok());
+
+        let r = cfg.residual_config(48_000.0).unwrap();
+        assert!(r.enabled);
+        assert_eq!(r.update_samples, 48);
+        assert_eq!(r.erb.bands, 32);
+        assert_eq!(r.erb.max_freq_hz, 16_000.0);
+        assert_eq!(r.erb.min_freq_hz, 50.0); // untouched
+        assert_eq!(r.power.mode, ResidualPowerTimeMode::Fixed);
+        assert_eq!(r.power.fixed_tau_seconds, 4e-3);
+        assert_eq!(r.power.tau_max_seconds, 10e-3); // untouched
+
+        // Same document, other rates: the sample count follows.
+        assert_eq!(cfg.residual_config(96_000.0).unwrap().update_samples, 96);
+        assert_eq!(cfg.residual_config(44_100.0).unwrap().update_samples, 44);
+    }
+
+    #[test]
+    fn residual_is_off_and_silent_by_default() {
+        let cfg = Config::from_toml("").unwrap();
+        assert!(!cfg.residual.enabled);
+        assert!(!cfg.residual_config(48_000.0).unwrap().enabled);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn residual_settings_are_validated_when_enabled() {
+        let bad = |doc: &str| {
+            let cfg = Config::from_toml(doc).unwrap();
+            cfg.validate().is_err() || cfg.residual_config(48_000.0).is_err()
+        };
+        assert!(bad("[residual]\nenabled = true\nupdate_ms = 0.0\n"));
+        // Under one sample at 48 kHz.
+        assert!(bad("[residual]\nenabled = true\nupdate_ms = 0.001\n"));
+        assert!(bad("[residual]\nenabled = true\n\n[residual.erb]\nbands = 2\n"));
+        assert!(bad("[residual]\nenabled = true\n\n[residual.erb]\norder = 0\n"));
+        assert!(bad("[residual]\nenabled = true\n\n[residual.erb]\nmin_freq_hz = 9000.0\nmax_freq_hz = 100.0\n"));
+        assert!(bad("[residual]\nenabled = true\n\n[residual.erb]\nmax_freq_hz = 40000.0\n"));
+        assert!(bad("[residual]\nenabled = true\n\n[residual.power]\ntau_min_ms = 20.0\n"));
+        assert!(bad("[residual]\nenabled = true\n\n[residual.power]\ntau_scale = 0.0\n"));
+
+        // Disabled, the same nonsense is nobody's business: the stage will not run.
+        let off = Config::from_toml("[residual]\nenabled = false\nupdate_ms = 0.0\n").unwrap();
+        assert!(off.validate().is_ok());
+    }
+
+    #[test]
+    fn residual_enums_use_the_snake_case_the_rest_of_the_document_uses() {
+        let doc = Config::default().to_toml();
+        for want in [
+            "spacing = \"erb_rate\"",
+            "filter = \"gammatone\"",
+            "normalization = \"unit_noise_power\"",
+            "storage = \"f32_linear_power\"",
+            "mode = \"bandwidth_relative\"",
+        ] {
+            assert!(doc.contains(want), "--write-config is missing {want}\n{doc}");
+        }
+        assert!(Config::from_toml(&doc).is_ok());
     }
 
     #[test]

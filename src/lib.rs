@@ -15,6 +15,7 @@ pub mod hrmp;
 pub mod mp;
 pub mod naive;
 pub mod refine;
+pub mod residual;
 pub mod select;
 pub mod signal;
 pub mod stats;
@@ -32,6 +33,10 @@ pub use hrmp::{HrmpConfig, MagnitudePolicy, Outcome, Placement, ProbeMode, Verdi
 pub use mp::{Mp, MpConfig};
 pub use naive::{NaiveConfig, NaiveMp};
 pub use refine::{EnvelopeCache, RefineConfig, refine};
+pub use residual::{
+    ResidualAnalysisConfig, ResidualAnalysisError, ResidualBook, ResidualPowerConfig,
+    ResidualPowerTimeMode, analyze_residual,
+};
 pub use select::SegTree;
 pub use signal::Signal;
 pub use stats::{BookSummary, Diagnostics, Evaluator, Histogram, Quantity, Summary, Weight};

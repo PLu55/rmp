@@ -4,7 +4,10 @@
 //! diagnose a bad decomposition and enough parameters to replay it through rfofs.
 
 use crate::fof::{AtomParams, Envelope, FofError};
+use crate::residual::ResidualBook;
 use crate::signal::snr_db;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -44,6 +47,14 @@ pub struct Book {
     pub selections: Vec<Selection>,
     pub initial_energy: f64,
     pub sample_rate: f32,
+    /// Stochastic analysis of the final residue, when `[residual]` was enabled.
+    ///
+    /// A section of its own rather than anything mixed into `selections`: atoms are sparse
+    /// deterministic events, residual frames are a matrix on a fixed grid, and neither ordering
+    /// means anything to the other. `skip_serializing_if` keeps a book written with the stage off
+    /// byte-identical to one written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual: Option<ResidualBook>,
 }
 
 impl Book {
@@ -52,6 +63,7 @@ impl Book {
             selections: Vec::new(),
             initial_energy,
             sample_rate,
+            residual: None,
         }
     }
 
@@ -168,13 +180,36 @@ fn format_of(path: &Path) -> Result<(bool, bool), String> {
 /// Serialise the book, picking the format from the file extension.
 ///
 /// A book is mostly repeated field names and decimal digits, so the `.gz` suffix is worth about 7×.
+/// With residual analysis on it is worth a great deal more: a 48-band bank at 1 ms writes 48000
+/// numbers per second of audio, which dwarfs the atom list.
 pub fn write(path: &Path, book: &Book) -> Result<(), String> {
+    write_doc(path, book)
+}
+
+/// Read a book back, by the same extension rules [`write`] uses.
+///
+/// `Selection`'s `#[serde(default)]` on `hr_score` and `refined`, and `Book`'s on `residual`, is
+/// what keeps books written before those fields existed readable.
+pub fn read(path: &Path) -> Result<Book, String> {
+    let book: Book = read_doc(path)?;
+    if let Some(r) = &book.residual {
+        r.validate()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(book)
+}
+
+/// Write any serialisable document by the same extension rules a book follows.
+///
+/// [`format_of`] is the single definition of those rules and this is the single user of it, so the
+/// standalone residual book written by `--residual-book` cannot drift from the main one.
+pub fn write_doc<T: Serialize>(path: &Path, doc: &T) -> Result<(), String> {
     let (json, gzip) = format_of(path)?;
 
     let text = if json {
-        serde_json::to_string_pretty(book).map_err(|e| format!("serialising book: {e}"))?
+        serde_json::to_string_pretty(doc).map_err(|e| format!("serialising book: {e}"))?
     } else {
-        toml::to_string_pretty(book).map_err(|e| format!("serialising book: {e}"))?
+        toml::to_string_pretty(doc).map_err(|e| format!("serialising book: {e}"))?
     };
 
     let bytes = if gzip {
@@ -188,11 +223,8 @@ pub fn write(path: &Path, book: &Book) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
-/// Read a book back, by the same extension rules [`write`] uses.
-///
-/// `Selection`'s `#[serde(default)]` on `hr_score` and `refined` is what keeps books written
-/// before those fields existed readable.
-pub fn read(path: &Path) -> Result<Book, String> {
+/// Read any deserialisable document by the same extension rules [`write_doc`] uses.
+pub fn read_doc<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     let (json, gzip) = format_of(path)?;
 
     let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
@@ -352,5 +384,85 @@ mod tests {
         let b: Book = serde_json::from_str(json).unwrap();
         assert_eq!(b.selections[0].hr_score, None);
         assert!(!b.selections[0].refined);
+        assert_eq!(b.residual, None);
+    }
+
+    /// §29.11: with residual analysis off, the book on disk is exactly what it was before the
+    /// section existed. `skip_serializing_if` is what buys this, and it is worth a test because
+    /// losing it would silently rewrite every book ever produced.
+    #[test]
+    fn a_book_without_residual_analysis_is_unchanged() {
+        let mut book = Book::new(1.0, 48_000.0);
+        book.selections.push(sel(0, 0.5));
+        for text in [
+            serde_json::to_string_pretty(&book).unwrap(),
+            toml::to_string_pretty(&book).unwrap(),
+        ] {
+            // `residual_energy` is a Selection field, so only the section's own key counts.
+            assert!(!text.contains("\"residual\""), "{text}");
+            assert!(!text.contains("[residual"), "{text}");
+        }
+    }
+
+    /// §29.10 end to end: the residual section survives every format the book supports.
+    #[test]
+    fn the_residual_section_round_trips_in_every_format() {
+        let dir = std::env::temp_dir().join(format!("rmp-residual-io-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut book = Book::new(1.0, 48_000.0);
+        book.selections.push(sel(1, 0.25));
+        book.residual = Some(
+            crate::residual::analyze_residual(
+                &crate::residual::pseudo_noise(4800),
+                48_000.0,
+                960,
+                &crate::residual::ResidualAnalysisConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        for name in ["r.json", "r.json.gz", "r.toml", "r.gz"] {
+            let path = dir.join(name);
+            write(&path, &book).unwrap();
+            assert_eq!(read(&path).unwrap(), book, "{name}");
+        }
+
+        // The standalone writer takes the same path through `format_of`.
+        let alone = dir.join("bank.json.gz");
+        write_doc(&alone, book.residual.as_ref().unwrap()).unwrap();
+        let back: crate::residual::ResidualBook = read_doc(&alone).unwrap();
+        assert_eq!(&back, book.residual.as_ref().unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A book claiming a residual section this build cannot read is refused at the door, not half
+    /// interpreted.
+    #[test]
+    fn an_unreadable_residual_section_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("rmp-residual-ver-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("future.json");
+
+        let mut book = Book::new(1.0, 48_000.0);
+        book.residual = Some(crate::residual::ResidualBook {
+            version: crate::residual::RESIDUAL_BOOK_VERSION + 1,
+            ..crate::residual::analyze_residual(
+                &[0.0; 480],
+                48_000.0,
+                0,
+                &crate::residual::ResidualAnalysisConfig::default(),
+            )
+            .unwrap()
+        });
+        std::fs::write(&path, serde_json::to_string(&book).unwrap()).unwrap();
+
+        let err = read(&path).unwrap_err();
+        assert!(err.contains("newer than this build"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

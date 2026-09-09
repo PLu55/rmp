@@ -61,6 +61,24 @@ struct Args {
     #[arg(short, long, value_name = "SECONDS")]
     duration: Option<f32>,
 
+    /// Analyse the final residue into an ERB power book, overriding [residual] enabled.
+    #[arg(long)]
+    residual_analysis: bool,
+
+    /// Skip the residual analysis even if the settings document enables it.
+    #[arg(long, conflicts_with = "residual_analysis")]
+    no_residual_analysis: bool,
+
+    /// Residual-book update interval, overriding [residual] update_ms.
+    #[arg(long, value_name = "MS")]
+    residual_update_ms: Option<f64>,
+
+    /// Write the residual analysis to its own file instead of embedding it in --book. Same format
+    /// rules as --book. The power matrix is far larger than the atom list, so this is how to keep
+    /// the two apart.
+    #[arg(long, value_name = "PATH")]
+    residual_book: Option<PathBuf>,
+
     /// Print a fully-commented default settings document and exit.
     #[arg(long)]
     write_config: bool,
@@ -68,6 +86,19 @@ struct Args {
     /// Suppress progress reporting.
     #[arg(short, long)]
     quiet: bool,
+}
+
+impl Args {
+    /// The residual toggle as an override: `None` when neither flag was given, so the settings
+    /// document keeps its say. Precedence is defaults < settings file < CLI, and a flag that was
+    /// not typed overrides nothing.
+    fn residual_enabled(&self) -> Option<bool> {
+        match (self.residual_analysis, self.no_residual_analysis) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -116,6 +147,10 @@ fn synthesise(args: &Args, book_path: &Path) -> Result<(), String> {
         ("--residual", args.residual.is_some()),
         ("--start", args.start.is_some()),
         ("--duration", args.duration.is_some()),
+        ("--residual-analysis", args.residual_analysis),
+        ("--no-residual-analysis", args.no_residual_analysis),
+        ("--residual-update-ms", args.residual_update_ms.is_some()),
+        ("--residual-book", args.residual_book.is_some()),
     ] {
         if unused {
             return Err(format!("{flag} applies to analysis; synthesising a book ignores it"));
@@ -162,15 +197,32 @@ fn synthesise(args: &Args, book_path: &Path) -> Result<(), String> {
 
 /// Decompose a soundfile, and write whichever of the three outputs were asked for.
 fn analyse(args: &Args, input: &Path) -> Result<(), String> {
-    if args.out.is_none() && args.book.is_none() && args.residual.is_none() {
+    if args.out.is_none()
+        && args.book.is_none()
+        && args.residual.is_none()
+        && args.residual_book.is_none()
+    {
         return Err(
-            "nothing to write: give --out for the resynthesis, --book for the atoms, or \
-             --residual for what is left over"
+            "nothing to write: give --out for the resynthesis, --book for the atoms, \
+             --residual for what is left over, or --residual-book for its ERB analysis"
                 .into(),
         );
     }
 
-    let config = load_config(args.config.as_deref())?;
+    // Defaults < settings file < CLI, and only for the fields actually given on the command line.
+    // There is one configuration path, not two: the flags edit the document and everything
+    // downstream reads the merged result.
+    let mut config = load_config(args.config.as_deref())?;
+    if let Some(enabled) = args.residual_enabled() {
+        config.residual.enabled = enabled;
+    }
+    if let Some(ms) = args.residual_update_ms {
+        config.residual.update_ms = ms;
+    }
+    // `--residual-book` is a request for the analysis, not merely somewhere to put it.
+    if args.residual_book.is_some() && args.residual_enabled().is_none() {
+        config.residual.enabled = true;
+    }
     config.validate()?;
 
     // ── read ────────────────────────────────────────────────────────────────
@@ -216,6 +268,21 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
             "the selected excerpt is silent".to_string()
         });
     }
+
+    // Resolved once, against the rate the file turns out to have, and before any work starts: an
+    // ERB range that does not fit under this Nyquist is a settings error, and finding it out after
+    // a seven-second analysis would be a waste of everyone's time.
+    let residual_cfg = config
+        .residual_config(sr as f64)
+        .map_err(|e| e.to_string())?;
+    if residual_cfg.enabled && args.book.is_none() && args.residual_book.is_none() {
+        say(
+            "  warning: residual analysis is enabled but neither --book nor --residual-book was \
+             given, so there is nowhere to put it; skipping",
+        );
+    }
+    let run_residual =
+        residual_cfg.enabled && (args.book.is_some() || args.residual_book.is_some());
 
     // ── dictionary ──────────────────────────────────────────────────────────
     // Built at the file's own sample rate: hop and bin spacing both depend on it.
@@ -275,7 +342,7 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     let init = t.elapsed();
 
     let t = Instant::now();
-    let book = mp.run(&mp_cfg);
+    let mut book = mp.run(&mp_cfg);
     let pursuit = t.elapsed();
 
     say(&format!(
@@ -344,6 +411,58 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
         db_fs(s_rms),
         db_fs(s_peak),
     ));
+
+    // ── residual analysis ───────────────────────────────────────────────────
+    // Strictly after the pursuit, on the pursuit's own residual buffer. It cannot change which
+    // atoms were selected, and the book above is already final by the time this runs.
+    if run_residual {
+        let t = Instant::now();
+        let rb = rmp::residual::analyze_residual(residual, sr as f64, offset as u64, &residual_cfg)
+            .map_err(|e| format!("residual analysis: {e}"))?;
+        let elapsed = t.elapsed();
+
+        let taus = &rb.bank.power_detector.tau_seconds;
+        let (tau_lo, tau_hi) = (
+            taus.iter().cloned().fold(f64::INFINITY, f64::min) * 1e3,
+            taus.iter().cloned().fold(0.0, f64::max) * 1e3,
+        );
+        say(&format!(
+            "residual analysis: {} ERB bands, {:.1} .. {:.1} Hz, order {} gammatone, in {:.2?}",
+            rb.band_count, rb.bank.min_freq_hz, rb.bank.max_freq_hz, rb.bank.filter_order, elapsed
+        ));
+        say(&format!(
+            "  update: {} samples / {:.3} ms -> {} frames ({} values)",
+            rb.update_samples,
+            rb.update_samples as f64 * 1e3 / sr as f64,
+            rb.frame_count,
+            rb.power.len()
+        ));
+        say(&format!(
+            "  power:  {}, tau {tau_lo:.2} .. {tau_hi:.2} ms",
+            rb.bank.power_detector.mode
+        ));
+        if std::env::var_os("RMP_RESIDUAL_DETAIL").is_some() {
+            say("    band   center_hz  bandwidth_hz  tau_ms   norm_gain");
+            for (b, &tau) in taus.iter().enumerate() {
+                say(&format!(
+                    "    {b:>4}  {:>10.2}  {:>12.2}  {:>6.2}  {:>10.3e}",
+                    rb.bank.center_freq_hz[b],
+                    rb.bank.bandwidth_hz[b],
+                    tau * 1e3,
+                    rb.bank.normalization_gain[b],
+                ));
+            }
+        }
+
+        // Written on its own when asked for, and only then embedded — the power matrix is far
+        // larger than the atom list, and keeping both copies would double a file for nothing.
+        if let Some(path) = &args.residual_book {
+            book::write_doc(path, &rb)?;
+            say(&format!("wrote {}", path.display()));
+        } else {
+            book.residual = Some(rb);
+        }
+    }
 
     // ── write ───────────────────────────────────────────────────────────────
     // Resynthesis is skipped outright when no --out was given: it renders every atom a second
@@ -553,6 +672,55 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #                           periods than this: its Gram cannot be conditioned,
 #                           and an atom that short cannot bridge anything.
 #   magnitude_policy        strict_min is the original criterion.
+#
+# [residual]
+#   Stochastic analysis of what the atoms could not explain. The pursuit leaves
+#   x = sum(FOF) + r; this turns r into a fixed-rate map of power over ERB
+#   bands, which a later noise bank can excite with g_b = sqrt(P_b). It is a
+#   post-processing stage: it runs once, after the pursuit has stopped, and
+#   cannot change which atoms were selected.
+#
+#   Off by default. --residual-analysis turns it on from the command line, and
+#   --residual-book writes it to its own file.
+#
+#   enabled
+#   update_ms   how often a power frame is recorded. Independent of the bank,
+#               which always runs at the audio rate. Converted to an exact
+#               number of samples once, and that count is what the book stores.
+#               This is the size knob: 48 bands at 1 ms is 48000 numbers per
+#               second of audio, which dwarfs the atom list. Give --book a .gz
+#               suffix, or keep the two apart with --residual-book.
+#   storage     f32 linear power. Not quantised.
+#
+# [residual.erb]
+#   bands             band centres are uniform on the ERB-rate scale.
+#   min_freq_hz       the first and last centres sit exactly on these, so the
+#   max_freq_hz       range is the range asked for. max_freq_hz too close to
+#                     Nyquist is an error rather than a silent clamp.
+#   spacing, filter   erb_rate and gammatone. One value each today; they are
+#   normalization     in the document so a book never has to be guessed at.
+#   order             length of the complex one-pole cascade, 1 to 8. 4 is the
+#                     classical gammatone.
+#   normalization     unit_noise_power: each band's gain is measured from its
+#                     own rendered impulse response, so unit-variance white
+#                     noise leaves the band with unit variance and a band power
+#                     can be read as a fraction of the residual's variance.
+#
+# [residual.power]
+#   The only temporal smoothing in the chain, deliberately. A residual carries
+#   rhythm and transients that the atom book does not, and blurring them would
+#   throw away the part worth keeping.
+#
+#   mode          fixed uses tau_ms everywhere. bandwidth_relative sets
+#                 tau_b = clamp(tau_scale / ERB(f_b), tau_min_ms, tau_max_ms):
+#                 a 25 Hz band cannot resolve a half-millisecond event in the
+#                 first place -- its own ringing is 40 ms long -- while a 3 kHz
+#                 band can, and one constant either over-smooths the top of the
+#                 bank or leaves the bottom reading its own envelope ripple.
+#   tau_ms        used by mode = \"fixed\".
+#   tau_scale     dimensionless; used by mode = \"bandwidth_relative\".
+#   tau_min_ms    clamps on the bandwidth-relative time constant. The floor is
+#   tau_max_ms    what bounds how long a transient can smear.
 
 ";
 

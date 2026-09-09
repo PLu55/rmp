@@ -28,6 +28,11 @@ cargo clippy --all-targets
 ./target/release/rmp -b book.toml -o resynth.wav            # synthesise a book, no analysis
 ./target/release/rmp --write-config > settings.toml
 
+# residual stochastic analysis (off by default)
+./target/release/rmp in.wav -b book.json.gz --residual-analysis
+./target/release/rmp in.wav -b book.json --residual-book bank.json.gz
+RMP_RESIDUAL_DETAIL=1 ./target/release/rmp in.wav --residual-book bank.json.gz
+
 # statistics and visualization over a book
 ./target/release/rmpstat summary book.json [-c settings.toml]
 ./target/release/rmpstat diag    book.json -c settings.toml
@@ -75,6 +80,8 @@ parts that need reading together:
 - **`stats`** — aggregation over a book: derived quantities, weighted histograms, diagnostics.
   Nothing here renders.
 - **`tfmap`** — the atom-based pseudo-Wigner time-frequency map (spec §21), as diagnostics only.
+- **`residual`** — stochastic analysis of the final residue: an ERB gammatone bank, one-pole band
+  power, and a fixed-rate `ResidualBook`. A post-processing stage; it cannot touch the pursuit.
 - **`config` / `audio` / `main`** — TOML settings, libsndfile I/O, the CLI.
 - **`bin/rmpstat`** — the statistics CLI: clap, `plotters`, and text tables. A thin shell, so
   everything worth an oracle lives in `stats`/`tfmap` where `cargo test` reaches it.
@@ -197,6 +204,44 @@ recompute 70% of what they bound. What remains for those blocks is the number of
 (`add_at`, `subtract_at`), scoring it (`fit::accumulate`) and invalidating the frames it touched
 (`refresh_stale`) all go through it. `refresh_stale` used to be passed the seed's frame onset, which
 equals the atom's `t0` only until refinement can move it.
+
+### Residual ERB analysis
+
+`rmp_residual_erb_analysis_spec.md` is the written specification. Five facts that are not obvious
+from the code:
+
+**The unit-noise-power gain is measured, not derived.** Each band's `g_b` is `1/sqrt(sum h[n]^2)`
+over its own rendered impulse response, so `(1/2pi) * integral |H_b|^2 dw = 1` exactly, by Parseval.
+A closed-form pole expression would have to model both the `2*Re(.)` negative-frequency image and
+its cross term, and would be a second definition of a filter that already exists. This is the same
+rule the rest of the crate follows for support lengths. Only the *truncation point* is a formula —
+the envelope peaks at `(N-1)/decay` and running `64/decay` past it leaves a tail below 1e-23.
+
+**Bands write disjoint columns, so the parallel result is bit-identical.** Each band owns its filter
+state, detector state and output column; the columns are gathered in band order by an indexed
+`collect`. `the_parallel_bank_matches_a_serial_reference` checks it against the spec's own
+sample-major reference loop, which shares no structure with the chunked band-major one that runs.
+
+**A frame is the detector state *after* its own sample, not before.** Chunking the residual by
+`update_samples` is what makes that structural rather than an off-by-one waiting to happen: the
+first sample of chunk `k` is sample `k*Nu`, and the frame is written the moment it has been through
+the detector.
+
+**`serde_json` needs `features = ["float_roundtrip"]`.** Its default parser is a fast path that is
+not correctly rounded — it reads `1842.6232639284315` back as `...17`. Every f64 in a book goes
+through it, the energies included, so without the feature a book does not survive its own write and
+read. Found by the residual bank's centre frequencies, but it was always true.
+
+**The summed band power is not the residual's energy.** The bands overlap and each reports a
+density, so on 0.5 s of piano the sum sits 27 dB above the residual's variance — explained entirely
+by a bandlimited residual read through 48 overlapping unit-noise-power bands. What it does do is
+track the residual in time: 0.74 correlation against short-time power over 20 ms windows, peaks one
+window apart. Both figures are on material with structure; on a flat noise floor there is nothing to
+correlate and the figure means nothing.
+
+Costs: 0.5 ms of analysis for 0.5 s of audio at 48 bands, against seconds for the pursuit. The book
+is the expense — 48 bands at 1 ms is 48000 f32 per second of audio, roughly 12× the atom list on a
+0.5 s piano excerpt, which is why `--residual-book` exists.
 
 ### The pseudo-Wigner map
 

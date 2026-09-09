@@ -321,6 +321,33 @@ fn cmd_summary(book: &Book, config: Option<&Path>) -> Result<(), String> {
         }
     }
 
+    // The stochastic half, when the book carries one. Only what it is, not what is in it: the
+    // power matrix is a different kind of object from everything above and wants its own reader.
+    if let Some(rb) = &book.residual {
+        println!("\nresidual analysis");
+        println!(
+            "  bank                {} ERB bands, {:.0} .. {:.0} Hz, order {} {}",
+            rb.band_count,
+            rb.bank.min_freq_hz,
+            rb.bank.max_freq_hz,
+            rb.bank.filter_order,
+            rb.bank.filter_kind
+        );
+        println!(
+            "  frames              {} every {} samples ({:.3} ms)",
+            rb.frame_count,
+            rb.update_samples,
+            rb.update_samples as f64 * 1e3 / rb.sample_rate
+        );
+        let taus = &rb.bank.power_detector.tau_seconds;
+        println!(
+            "  power detector      {}, tau {:.2} .. {:.2} ms",
+            rb.bank.power_detector.mode,
+            taus.iter().cloned().fold(f64::INFINITY, f64::min) * 1e3,
+            taus.iter().cloned().fold(0.0, f64::max) * 1e3
+        );
+    }
+
     // The two pictures of the same book: the grid it searched, and where it ended up.
     println!("\nparameters");
     for q in [

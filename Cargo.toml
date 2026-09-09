@@ -15,7 +15,11 @@ rfofs = { path = "../rfofs" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
-serde_json = "1"
+# `float_roundtrip` is not optional. serde_json's default parser is a fast path that is not
+# correctly rounded: it reads 1842.6232639284315 back as ...17. Every f64 in a book goes through it
+# — the energies, and now the residual bank's centre frequencies — so without this a book does not
+# survive its own write/read cycle, and two books that should be identical differ in the last bit.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 flate2 = "1"
 sndfile = "0.1"
 #rustfft = "6.4"

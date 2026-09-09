@@ -47,6 +47,7 @@ rmp in.wav -b book.json                        # atoms only, no render
 rmp in.wav -o resynth.wav -r residual.wav -b book.json.gz
 rmp in.wav -o out.wav -c settings.toml         # with settings
 rmp in.wav -o out.wav -s 2.5 -d 0.5            # one excerpt, in seconds
+rmp in.wav -b book.json --residual-book bank.json.gz   # atoms, plus the ERB residual analysis
 
 # synthesise: no input soundfile, so --book is read rather than written
 rmp -b book.json -o resynth.wav
@@ -63,6 +64,10 @@ rmp --write-config > settings.toml             # a fully commented default docum
 | `-s`, `--start` | offset into the file, seconds |
 | `-d`, `--duration` | length to analyse, seconds |
 | `-q`, `--quiet` | suppress the report |
+| `--residual-analysis` | analyse the final residue into ERB power frames (§9) |
+| `--no-residual-analysis` | skip it even if the settings document enables it |
+| `--residual-update-ms` | frame interval, overriding `[residual] update_ms` |
+| `--residual-book` | write that analysis to its own file instead of into `--book` |
 
 Book format follows the extension: `.toml` or `.json`, either optionally `.gz`. Gzip is worth about
 7× and costs nothing to read back. `book.json.gz` is JSON; a bare `book.gz` is TOML.
@@ -409,7 +414,102 @@ than this — its 2×2 Gram cannot be conditioned, and an atom that short cannot
 
 ---
 
-## 9. Tuning recipes
+## 9. `[residual]` — analysing what is left over
+
+Off by default. The pursuit leaves `x = Σ FOF + r`; this turns `r` into a fixed-rate map of power
+over ERB bands, which a later real-time noise bank can excite with `g_b = √P_b`. It is a strict
+post-processing stage — it runs once, after the pursuit has stopped, on the pursuit's own residual
+buffer, and **cannot change which atoms were selected**.
+
+```bash
+rmp in.wav -b book.json.gz --residual-analysis            # embedded in the book
+rmp in.wav -b book.json --residual-book bank.json.gz      # kept in its own file
+rmp in.wav --residual-book bank.json.gz                   # analysis only, no atom book
+```
+
+`--residual-analysis` / `--no-residual-analysis` and `--residual-update-ms` override
+`[residual] enabled` and `update_ms`; everything else lives in the settings document. Giving
+`--residual-book` turns the stage on by itself. Enabling it with nowhere to write it — no `--book`,
+no `--residual-book` — warns and skips rather than doing the work for nothing.
+
+### What a frame means
+
+A frame is the state of every band's causal power detector **immediately after** processing the
+sample at that frame's offset. With `update_ms = 1` at 48 kHz, frames sit at samples 0, 48, 96, …
+Nothing is stored per frame but the powers: the grid is exact by construction, so a timestamp would
+only be a second definition of it. Frames stop at the end of the residual; no decay tail is
+appended.
+
+### `[residual] update_ms` — default `1.0`
+
+How often a frame is recorded, converted to an exact sample count once. Independent of the filter
+bank, which always runs at the audio rate.
+
+**This is the size knob.** 48 bands at 1 ms is 48 000 numbers per second of audio — far more than
+the atom list. Measured on 0.5 s of piano: the atom book is 104 kB of pretty JSON, and the residual
+section adds ~1.2 MB, or 129 kB gzipped. Give `--book` a `.gz` suffix, use `--residual-book` to keep
+the two apart, or raise `update_ms`. There is no quantisation yet: the stored numbers are `f32`
+linear power.
+
+### `[residual.erb] bands`, `min_freq_hz`, `max_freq_hz` — defaults `48`, `50.0`, `20000.0`
+
+Band centres are uniform on the ERB-rate scale, with the first and last sitting exactly on the
+configured bounds. At the defaults that is 0.85 ERB per step, so neighbouring bands overlap
+substantially — which is the point, but see the warning about summing them below.
+
+`max_freq_hz` must stay under 0.98 × Nyquist. Above it you get an error, not a silent clamp: at
+32 kHz the default 20 kHz top is refused, and you are meant to lower it deliberately. Setting
+`max_freq_hz` near the analysis `f_max` is usually wrong — the residual is exactly where the content
+*above* `f_max` ended up.
+
+### `[residual.erb] order`, `filter`, `spacing`, `normalization` — defaults `4`, `gammatone`, `erb_rate`, `unit_noise_power`
+
+`order` is the length of the complex one-pole cascade, 1 to 8. 4 is the classical gammatone; the
+range exists because the cascade is generic, not because four recipes were written out. The other
+three have one value each today and are in the document so a book never has to be guessed at.
+
+`unit_noise_power` means each band's gain is measured from its own rendered impulse response, so
+unit-variance white noise leaves the band with unit variance. That is what makes a band power
+readable as a fraction of the residual's own variance, and what a synthesis bank needs in order to
+turn one back into a gain.
+
+### `[residual.power] mode` — default `"bandwidth_relative"`
+
+The one-pole detector is the **only** temporal smoothing in the chain, deliberately: a residual
+carries rhythm and transients the atom book does not, and blurring them throws away the part worth
+keeping.
+
+- `"fixed"` uses `tau_ms` for every band.
+- `"bandwidth_relative"` uses `τ_b = clamp(tau_scale / ERB(f_b), tau_min_ms, tau_max_ms)`.
+
+Bandwidth-relative is the default because the bands cannot all resolve the same events. A 25 Hz-wide
+band rings for 40 ms on its own; asking its detector to track a half-millisecond event measures the
+filter, not the signal. A 3 kHz-wide band can track it. One constant either over-smooths the top of
+the bank or leaves the bottom reading its own envelope ripple.
+
+`tau_min_ms` (default `0.5`) is what bounds how far a transient can smear; `tau_max_ms` (default
+`10.0`) how long the narrow bands hold. `tau_scale` (default `1.0`) is dimensionless and moves the
+whole set. At the defaults every band below about 100 Hz sits on the `tau_max` rail and everything
+above about 2 kHz on `tau_min`.
+
+### Reading the output
+
+`RMP_RESIDUAL_DETAIL=1` prints the bank table — band, centre, bandwidth, `tau_ms`, normalisation
+gain — and `rmpstat summary` reports the bank of a book that carries one.
+
+**Do not read the summed band power as the residual's energy.** The bands overlap and are not an
+orthogonal partition, and each reports a *density* rather than a share. On 0.5 s of piano the sum
+sits 27 dB above the residual's own variance, all of it explained by a bandlimited residual measured
+through 48 overlapping unit-noise-power bands. What the sum does do is track the residual in time:
+against the residual's own short-time power over 20 ms windows, 0.74 correlation with the peaks one
+window apart.
+
+The analysis is cheap — 0.5 ms for 0.5 s of audio at 48 bands, against seconds for the pursuit — so
+there is no cost argument for leaving it off once you want it.
+
+---
+
+## 10. Tuning recipes
 
 Measured on 3 s of solo piano at 48 kHz, all driven to the same 35 dB so atoms and wall clock are
 comparable. The dictionary reaches `alpha = 1`.
@@ -438,7 +538,7 @@ comparable. The dictionary reaches `alpha = 1`.
 
 ---
 
-## 10. Diagnostics
+## 11. Diagnostics
 
 ```bash
 rmpstat summary book.json -c settings.toml   # atoms, energy, parameter spread
@@ -459,7 +559,7 @@ has no cross-terms. It is diagnostics only and plays no part in the pursuit.
 
 ---
 
-## 11. Things that will bite
+## 12. Things that will bite
 
 **A WAV written twice is not byte-identical.** libsndfile stamps a timestamp into the PEAK chunk of
 a float file. Exactly one byte differs and the audio is untouched — compare the book, or the data
