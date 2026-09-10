@@ -144,19 +144,52 @@ pub fn add_at(dst: &mut [f32], src: &[f32], offset: i64) {
 /// rendered. rfofs's LUT/polynomial carrier means the rendered atom is not exactly the ideal vector
 /// that was projected onto, so assuming the projected energy would let error accumulate silently.
 pub fn subtract_at(residual: &mut [f32], atom: &[f32], offset: i64, old_energy: f64) -> f64 {
+    let len = residual.len();
+    subtract_at_core(residual, atom, offset, old_energy, old_energy, len).0
+}
+
+/// [`subtract_at`], tracking the energy of a leading *core* range alongside the whole buffer's.
+///
+/// The windowed pursuit analyses `[0, core_len)` and carries `[core_len, len)` only so that an
+/// atom starting near the core's end is scored against real residual instead of an artificial zero
+/// edge. Its stopping rule therefore has to read the core's energy — the guard belongs to the next
+/// window and will be decomposed there, so counting it would make every window look unfinished.
+///
+/// Both energies come out of the one pass, over exactly the samples written, so there is one
+/// definition of what an atom removed and not two that can drift. [`subtract_at`] is the
+/// `core_len == residual.len()` case of this, which is why it delegates rather than repeating it.
+///
+/// Returns `(whole, core)`. The whole-buffer figure is what the book records as `energy_removed`:
+/// an atom's removal is a fact about the atom, not about which window happened to select it.
+pub fn subtract_at_core(
+    residual: &mut [f32],
+    atom: &[f32],
+    offset: i64,
+    old_energy: f64,
+    old_core_energy: f64,
+    core_len: usize,
+) -> (f64, f64) {
     let Some((src_start, dst_start, n)) = overlap(residual.len(), atom.len(), offset) else {
-        return old_energy;
+        return (old_energy, old_core_energy);
     };
 
     let (mut dot, mut norm2) = (0.0f64, 0.0f64);
+    let (mut core_dot, mut core_norm2) = (0.0f64, 0.0f64);
     for i in 0..n {
         let r = residual[dst_start + i] as f64;
         let a = atom[src_start + i] as f64;
         dot += r * a;
         norm2 += a * a;
+        if dst_start + i < core_len {
+            core_dot += r * a;
+            core_norm2 += a * a;
+        }
         residual[dst_start + i] = (r - a) as f32;
     }
-    (old_energy - 2.0 * dot + norm2).max(0.0)
+    (
+        (old_energy - 2.0 * dot + norm2).max(0.0),
+        (old_core_energy - 2.0 * core_dot + core_norm2).max(0.0),
+    )
 }
 
 #[cfg(test)]

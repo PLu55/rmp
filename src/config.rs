@@ -161,6 +161,20 @@ pub struct PursuitSettings {
     /// Only reachable under HRMP. On dense polyphonic material a run of rejections is normal, so
     /// this is what decides whether HRMP declines a few atoms or ends the pursuit outright.
     pub max_stalls: usize,
+    /// Frame-table budget, in MiB, that decides how long a window the pursuit analyses at once.
+    ///
+    /// The tables scale with the *signal*, at a per-sample cost the dictionary sets, so a long clip
+    /// is analysed a window at a time. A signal whose tables fit under this is one window and is
+    /// decomposed exactly as it always was; past it, greedy selection becomes per-window and
+    /// `target_snr_db`, `min_gain` and `max_atoms` become per-window quantities.
+    ///
+    /// Raise it to keep more of the clip under one greedy order; lower it to fit a smaller machine.
+    pub max_memory_mb: usize,
+    /// Analyse windows of exactly this many seconds, ignoring `max_memory_mb`.
+    ///
+    /// The budget picks a window from the machine's memory, which makes a book depend on the
+    /// machine. Set this when a run has to reproduce elsewhere. 0 means "use the budget".
+    pub window_seconds: f32,
 }
 
 impl Default for PursuitSettings {
@@ -172,6 +186,8 @@ impl Default for PursuitSettings {
             min_gain: d.min_gain_fraction,
             candidate_count: d.candidate_count,
             max_stalls: d.max_stalls,
+            max_memory_mb: 1024,
+            window_seconds: 0.0,
         }
     }
 }
@@ -518,6 +534,16 @@ impl Config {
         }
         if !(0.0..1.0).contains(&self.blocks.capture_tolerance) || self.blocks.capture_tolerance == 0.0 {
             return Err("capture_tolerance must be in (0, 1)".into());
+        }
+        if self.pursuit.max_memory_mb == 0 {
+            return Err("pursuit.max_memory_mb must be at least 1".into());
+        }
+        if !(self.pursuit.window_seconds.is_finite() && self.pursuit.window_seconds >= 0.0) {
+            return Err(format!(
+                "pursuit.window_seconds must be 0 (use max_memory_mb) or a positive number of \
+                 seconds, got {}",
+                self.pursuit.window_seconds
+            ));
         }
         let release: ReleasePolicy = (&self.envelope).into();
         release

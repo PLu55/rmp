@@ -358,6 +358,53 @@ of them are ordinary; each stall demotes at least one frame, so a run of stalls 
 than a spin. Setting it small turns a strict HRMP configuration into an early stop, which reads as
 "HRMP produces far too few atoms".
 
+### `max_memory_mb` — default `1024`
+
+The frame-table budget, and so how long a stretch of signal the pursuit analyses at once.
+
+The pursuit's working set is one frame table per block, and a block's frame count is
+`samples / hop` with `hop ∝ 1/alpha` — so the tables grow linearly with the *signal*, at a
+per-sample cost the dictionary sets. That cost is printed when it matters; on the default grid at
+`capture_tolerance = 0.95` it is about **18 bytes per input sample**, which is 2.5 GB for nine
+minutes at 48 kHz. Nothing about this can be streamed to disk: the tables are working state, not
+results.
+
+So a signal too large for the budget is analysed in **windows**. Each window owns a *core* it selects
+atoms in, and carries a *guard* past the core — one full atom's support — so an atom starting at the
+core's end is still scored on all of itself. The window's residual is written back before the next
+window reads it, so every atom is subtracted exactly once and an atom the search wanted in the guard
+is simply deferred to the window that owns it.
+
+**Result.** A signal that fits the budget is one window and is decomposed exactly as it always was,
+bit for bit. Past it, three things change:
+
+- **Selection is greedy within a window, not across the clip.** A quiet passage no longer waits
+  behind a loud one.
+- **`target_snr_db`, `min_gain` and `max_atoms` become per-window.** Each window is driven to
+  `target_snr_db` against *its own core's* energy, and `max_atoms` is shared out by duration. Local
+  quality is uniform rather than front-loaded, which is usually what you want for long material.
+- **The book is in time order, not energy order.** `rmpstat snr` still reads a correct global SNR
+  curve — `residual_energy` is a global running total — but its shape is now progress through the
+  clip rather than convergence, so "atoms to 20 dB" stops meaning what it did.
+
+**Cost.** Each window re-correlates its own frames up front, so the initialisation is paid once per
+window instead of once. That is reported separately from the pursuit time. The guard is re-correlated
+by two windows, so a core much shorter than the guard wastes real work — which is why a window is
+never allowed below four guards, even if the budget asks for it. You are told when that happens.
+
+The guard is the longest atom the run can produce: the longest block support, or
+`refine.max_atom_samples` when refinement is on, whichever is larger. **A low `alpha_min` therefore
+sets a floor on how finely a clip can be windowed** — at `refine.max_atom_samples = 150000` the guard
+is 3.1 s and no window can be shorter than 12.5 s.
+
+### `window_seconds` — default `0` (use the budget)
+
+Analyse windows of exactly this many seconds, ignoring `max_memory_mb`.
+
+The budget picks a window from how much memory you have, which makes the book depend on the machine
+that produced it. Set this when a run has to reproduce elsewhere. It is still raised to the
+four-guard floor if it is below it.
+
 ---
 
 ## 8. `[hrmp]` — rejecting atoms the residual does not support

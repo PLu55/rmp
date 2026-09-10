@@ -17,7 +17,7 @@ use rmp::book;
 use rmp::config::Config;
 use rmp::dict::Dictionary;
 use rmp::fft::Planner;
-use rmp::mp::{Mp, MpConfig};
+use rmp::mp::{self, MpConfig, WindowPlan};
 use rmp::signal::{db_fs, peak_of, rms_of, Signal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -337,13 +337,53 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     }
 
     // ── analyse ─────────────────────────────────────────────────────────────
-    let t = Instant::now();
-    let mut mp = Mp::new(&dict, &signal, &mut planner);
-    let init = t.elapsed();
+    // The frame tables scale with the signal at a per-sample cost the dictionary sets, so a clip
+    // long enough to exceed the budget is decomposed a window at a time. Under the budget this
+    // plans a single window and takes the original path, bit for bit.
+    let forced_core = (config.pursuit.window_seconds > 0.0)
+        .then_some((config.pursuit.window_seconds * sr) as usize);
+    let plan = WindowPlan::new(
+        &dict,
+        signal.len(),
+        &mp_cfg,
+        config.pursuit.max_memory_mb << 20,
+        forced_core,
+    );
+    if plan.count > 1 {
+        say(&format!(
+            "windows: {} x {:.2} s core + {:.2} s guard ({:.1} MiB of frame table each, {:.2} B/sample)",
+            plan.count,
+            plan.core_len as f32 / sr,
+            plan.guard_len as f32 / sr,
+            plan.window_bytes() / (1 << 20) as f64,
+            plan.bytes_per_sample,
+        ));
+        say(
+            "  selection is greedy within a window, not across the clip; target_snr_db, min_gain \
+             and max_atoms apply per window",
+        );
+        if plan.over_budget {
+            say(&format!(
+                "  note: a window cannot be shorter than four guards, so the core was raised to \
+                 {:.2} s past what max_memory_mb ({} MiB) or window_seconds asked for. Shorten \
+                 the longest atom -- a higher dictionary alpha, or a lower \
+                 refine.max_atom_samples -- to window more finely",
+                plan.core_len as f32 / sr,
+                config.pursuit.max_memory_mb
+            ));
+        }
+    }
 
     let t = Instant::now();
-    let mut book = mp.run(&mp_cfg);
-    let pursuit = t.elapsed();
+    let mut progress = |w: usize, of: usize, atoms: usize| {
+        if of > 1 {
+            say(&format!("  window {w}/{of}: {atoms} atoms so far"));
+        }
+    };
+    let run = mp::run_windowed(&dict, &signal, &mut planner, &mp_cfg, &plan, &mut progress);
+    let init = run.init;
+    let pursuit = t.elapsed().saturating_sub(init);
+    let mut book = run.book;
 
     say(&format!(
         "analysis: {} atoms, {:.1} dB in {:.2?} (init {:.2?}, {:.1}x realtime)",
@@ -370,14 +410,14 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
         ));
     }
 
-    let (marked, resolved) = mp.lazy_stats();
+    let (marked, resolved) = (run.marked, run.resolved);
     if marked > 0 {
         say(&format!(
             "  refresh: {marked} frames bounded, {resolved} recomputed ({:.1}%)",
             100.0 * resolved as f64 / marked as f64
         ));
         if std::env::var_os("RMP_REFRESH_DETAIL").is_some() {
-            for (bi, &(m, r)) in mp.lazy_stats_per_block().iter().enumerate() {
+            for (bi, &(m, r)) in run.per_block.iter().enumerate() {
                 let b = &dict.blocks[bi];
                 say(&format!(
                     "    block {bi:>2} alpha {:>6.1} fft {:>7}: {m:>8} bounded {r:>8} recomputed ({:>5.1}%)  ~{:.0} Msamples",
@@ -396,7 +436,7 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     // negated SNR by construction; it is restated here so the two absolute levels beside it do not
     // have to be subtracted by eye. The peak ratio is the one that carries new information: it is
     // where the decomposition is worst rather than where it is on average.
-    let residual = mp.residual();
+    let residual = &run.residual[..];
     let (r_rms, r_peak) = (rms_of(residual), peak_of(residual) as f64);
     let (s_rms, s_peak) = (signal.rms(), signal.peak() as f64);
     say(&format!(
@@ -478,7 +518,7 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     if let Some(path) = &args.residual {
         // Taken from the pursuit rather than by subtracting the resynthesis, so it is exactly what
         // the algorithm could not explain.
-        audio::write_samples(path, mp.residual(), sr).map_err(|e| e.to_string())?;
+        audio::write_samples(path, residual, sr).map_err(|e| e.to_string())?;
         say(&format!("wrote {}", path.display()));
     }
 
@@ -604,6 +644,18 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #                  declining one proposed atom, and on dense material a long run
 #                  of them is ordinary. A small value turns a strict HRMP setting
 #                  into an early stop that looks like 'HRMP finds no atoms'.
+#
+#   max_memory_mb  frame-table budget, and so how long a stretch is analysed at
+#                  once. The tables scale with the signal -- about 18 bytes per
+#                  input sample on this default grid -- so a long clip is cut
+#                  into windows. A signal that fits is one window and is
+#                  decomposed exactly as it always was; past it, selection is
+#                  greedy within a window rather than across the clip, and
+#                  target_snr_db, min_gain and max_atoms become per-window.
+#   window_seconds  analyse windows of exactly this length, ignoring
+#                   max_memory_mb. The budget makes a book depend on the machine
+#                   that produced it; set this when a run must reproduce
+#                   elsewhere. 0 means use the budget.
 #
 #   max_atoms counts atoms actually selected; a rejected iteration adds nothing
 #   to the book and is not charged to the budget.

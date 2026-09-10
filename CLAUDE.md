@@ -76,7 +76,7 @@ parts that need reading together:
 - **`refine`** — bounded 1-D search over `(t0, f, alpha, beta)` after selection.
 - **`hrmp`** — local-support probes and the amplitude clamp.
 - **`mp`** — the pursuit loop with the local update; owns the candidate → refine → validate → select
-  pipeline.
+  pipeline, and the windowing that keeps its frame tables bounded on a long clip.
 - **`naive`** — brute-force oracle. Deliberately shares nothing with `dict`/`corr` beyond the atom
   definition and the search space.
 - **`signal` / `book`** — f64 energy bookkeeping, and the decomposition result. `book::read` /
@@ -221,6 +221,30 @@ of the pursuit. Each is a full envelope, hundreds of KB at a low `alpha_min`. Me
 whole when exceeded, which is safe at any point because it is a pure memo. RSS is flat in atom count
 afterwards. Do not "improve" the eviction into something per-entry: a whole search must fit, and
 clearing whole is what keeps the current search's working set intact.
+
+**A signal too large for the frame-table budget is windowed, and that is the one thing in the crate
+that changes which atoms are selected.** `mp::WindowPlan` sizes a *core* from `max_memory_mb` and the
+dictionary's own per-sample cost, plus a *guard* of one longest atom — the longest block support, or
+`refine.max_atom_samples` when refinement is on. `mp::run_windowed` runs `Mp::with_core` over each,
+writes the window's residual back before the next reads it, and translates onsets and the running
+residual energy into global coordinates. Four things that are load-bearing:
+
+- **A single window takes the original path verbatim**, so a signal under the budget is bit-identical
+  to what the un-windowed pursuit produced. That is both the compatibility guarantee and what keeps
+  every existing oracle gate meaningful; `a_signal_inside_the_budget_is_one_window_and_bit_identical`
+  is the test.
+- **The stopping rule reads the core, not the window.** The guard belongs to the *next* window and
+  will be decomposed there, so counting its energy makes every window look permanently unfinished
+  and spend its whole atom budget failing to finish. `signal::subtract_at_core` tracks both energies
+  in one pass — the core's for the stopping rule, the whole atom's for `energy_removed`, because an
+  atom's removal is a fact about the atom and not about which window selected it.
+- **A window is never shorter than four guards**, whatever the budget says. Below that every window
+  re-correlates more guard than core, and an atom deferred out of one window's tail lands in the next
+  window's tail again. A low `refine.alpha_min` therefore sets a floor on how finely a clip can be
+  windowed, and the CLI says so rather than silently thrashing.
+- **The book comes out in time order rather than energy order.** `residual_energy` is still a global
+  running total, so `rmpstat snr` reads a correct curve, but its *shape* is progress through the clip
+  and "atoms to 20 dB" stops meaning what it did on a single-window book.
 
 **A stale frame is bounded, not recomputed.** After a subtraction, frames overlapping the atom get
 an upper bound — `(sqrt(E_old) + ||P a||)^2`, with `||P a||^2` bounded in O(1) by both `||a||^2` and

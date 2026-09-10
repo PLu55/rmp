@@ -57,7 +57,7 @@ use crate::fft::RealFftPlanner;
 use crate::fit;
 use crate::hrmp::{self, HrmpConfig};
 use crate::refine::{EnvelopeCache, RefineConfig, refine};
-use crate::signal::{Signal, overlap, snr_db, subtract_at};
+use crate::signal::{Signal, overlap, snr_db, subtract_at_core};
 use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -177,12 +177,37 @@ pub struct Mp<'a> {
     per_block: Vec<(usize, usize)>,
     energy: f64,
     initial_energy: f64,
+    /// The leading range of the residual this pursuit is responsible for, and its energy now and at
+    /// the start. Equal to the whole residual unless [`Mp::with_core`] said otherwise.
+    ///
+    /// The stopping rule reads these, not the whole-buffer figures: under [`run_windowed`] the tail
+    /// past the core is a guard the *next* window decomposes, so counting its energy would make
+    /// every window look permanently unfinished and spend its whole atom budget failing to finish.
+    core_len: usize,
+    core_energy: f64,
+    initial_core_energy: f64,
     sample_rate: f32,
 }
 
 impl<'a> Mp<'a> {
     /// Correlate every frame of every block once, up front.
     pub fn new(dict: &'a Dictionary, signal: &Signal, planner: &mut dyn RealFftPlanner) -> Self {
+        let len = signal.len();
+        Self::with_core(dict, signal, planner, len)
+    }
+
+    /// [`Mp::new`], restricted to selecting atoms whose onset falls in `[0, core_len)`.
+    ///
+    /// The rest of the signal is still correlated, still refreshed, and still subtracted from — it
+    /// is what an atom near the core's end extends into, and scoring against a truncated support
+    /// would rank that atom by how much residual it was allowed to ignore rather than by what it
+    /// removes. It is simply not *selected from*.
+    pub fn with_core(
+        dict: &'a Dictionary,
+        signal: &Signal,
+        planner: &mut dyn RealFftPlanner,
+        core_len: usize,
+    ) -> Self {
         let mut corrs: Vec<Correlator> = dict
             .blocks
             .iter()
@@ -240,6 +265,12 @@ impl<'a> Mp<'a> {
             .collect();
 
         let initial_energy = signal.energy();
+        let core_len = core_len.min(signal.len());
+        let initial_core_energy = if core_len == signal.len() {
+            initial_energy
+        } else {
+            signal.samples[..core_len].iter().map(|&x| (x as f64) * (x as f64)).sum()
+        };
         Self {
             dict,
             corrs,
@@ -251,8 +282,26 @@ impl<'a> Mp<'a> {
             per_block: vec![(0, 0); dict.blocks.len()],
             energy: initial_energy,
             initial_energy,
+            core_len,
+            core_energy: initial_core_energy,
+            initial_core_energy,
             sample_rate: signal.sample_rate,
         }
+    }
+
+    /// Frames of block `bi` whose onset falls in the core, or `None` when that is all of them.
+    ///
+    /// Frame `n` starts at `n * hop`, so `n * hop < core_len` is `n < ceil(core_len / hop)`.
+    fn core_frames(&self, bi: usize) -> Option<usize> {
+        if self.core_len == self.residual.len() {
+            return None;
+        }
+        Some(self.core_len.div_ceil(self.dict.blocks[bi].hop))
+    }
+
+    /// The leading range this pursuit selects from, and its energy now.
+    pub fn core(&self) -> (usize, f64) {
+        (self.core_len, self.core_energy)
     }
 
     pub fn residual(&self) -> &[f32] {
@@ -273,7 +322,7 @@ impl<'a> Mp<'a> {
         // on this loop being counted, because each rejection demotes at least one frame to zero and
         // `max_stalls` bounds how many may pass without a selection.
         while book.len() < cfg.max_atoms {
-            if snr_db(self.initial_energy, self.energy) >= cfg.target_snr_db {
+            if snr_db(self.initial_core_energy, self.core_energy) >= cfg.target_snr_db {
                 break;
             }
             // Steps 1-2: promote local maxima and keep the best few.
@@ -284,7 +333,7 @@ impl<'a> Mp<'a> {
                 Some((top.block, top.frame)),
                 "the strongest seed must be the global argmax"
             );
-            if top.energy <= self.energy * cfg.min_gain_fraction {
+            if top.energy <= self.core_energy * cfg.min_gain_fraction {
                 break;
             }
 
@@ -335,7 +384,15 @@ impl<'a> Mp<'a> {
             };
 
             let before = self.energy;
-            self.energy = subtract_at(&mut self.residual, &rendered, best.atom.t0, before);
+            let (after, core_after) = subtract_at_core(
+                &mut self.residual,
+                &rendered,
+                best.atom.t0,
+                before,
+                self.core_energy,
+                self.core_len,
+            );
+            (self.energy, self.core_energy) = (after, core_after);
             book.selections.push(Selection {
                 atom: best.atom,
                 block: best.seed.block,
@@ -400,6 +457,7 @@ impl<'a> Mp<'a> {
                         energy: &st.energy,
                         bin: &st.bin,
                         dirty: Some(&st.dirty),
+                        core_frames: self.core_frames(bi),
                         hop: self.dict.blocks[bi].hop,
                         support_len: self.dict.blocks[bi].support_len(),
                     })
@@ -558,7 +616,8 @@ impl<'a> Mp<'a> {
     fn global_argmax(&self) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize, f64)> = None;
         for (bi, st) in self.states.iter().enumerate() {
-            for (n, &e) in st.energy.iter().enumerate() {
+            let core = self.core_frames(bi).unwrap_or(st.energy.len());
+            for (n, &e) in st.energy.iter().enumerate().take(core) {
                 if e.is_finite() && best.as_ref().is_none_or(|&(_, _, b)| e > b) {
                     best = Some((bi, n, e));
                 }
@@ -704,6 +763,194 @@ where
         .zip(states.par_iter_mut())
         .enumerate()
         .for_each(|(bi, (corr, state))| f(bi, corr, state));
+}
+
+/// Bytes of frame table one frame costs: `energy` (f64), `bin` (u32) and `dirty` (bool).
+///
+/// Used to size a window from a memory budget, so it has to track [`BlockState`]. It is the whole
+/// per-frame cost — everything else in a `BlockState` is per *support sample* or a scalar.
+const FRAME_TABLE_BYTES: usize = 8 + 4 + 1;
+
+/// How a signal too large to analyse at once is cut into windows.
+///
+/// The pursuit's working set is `sum_b frames_b` frame tables, and `frames_b = n / hop_b` with
+/// `hop_b ∝ 1/alpha_b`, so it grows linearly in the signal with a constant the *dictionary* sets —
+/// over five frames per input sample at the default grid and tolerance. Nothing about that can be
+/// streamed away: the tables are working state, not results. What can be bounded is `n`.
+///
+/// So the signal is analysed in windows and the tables sized to one window. This is the one change
+/// in the crate that alters which atoms are selected: greedy order becomes per-window rather than
+/// global, and `target_snr_db` / `min_gain` / `max_atoms` become per-window quantities. A signal
+/// that fits the budget is a single window and takes the original path exactly, bit for bit — which
+/// is both the compatibility guarantee and what keeps every existing oracle gate meaningful.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowPlan {
+    /// Samples each window is responsible for selecting atoms in.
+    pub core_len: usize,
+    /// Samples carried past the core so a core atom is scored on its whole support.
+    pub guard_len: usize,
+    pub count: usize,
+    /// Frame-table bytes one input sample costs, from the dictionary's own hops.
+    pub bytes_per_sample: f64,
+    /// Whether `core_len` had to exceed what was asked for to stay above the guard floor.
+    pub over_budget: bool,
+}
+
+impl WindowPlan {
+    /// Size the windows for `signal_len` under a frame-table budget.
+    ///
+    /// `forced_core` overrides the budget, for a run that must be reproducible across machines.
+    pub fn new(
+        dict: &Dictionary,
+        signal_len: usize,
+        cfg: &MpConfig,
+        budget_bytes: usize,
+        forced_core: Option<usize>,
+    ) -> Self {
+        // The longest atom the run can produce. Refinement is bounded by `max_atom_samples` rather
+        // than by any block, and it can lower `alpha` past the grid, so it sets the guard whenever
+        // it is on. Anything shorter and an atom selected at the core's end would be scored against
+        // a residual that stops inside its own support.
+        let longest_block = dict.blocks.iter().map(|b| b.support_len()).max().unwrap_or(0);
+        let guard_len = if cfg.refine.enabled {
+            longest_block.max(cfg.refine.max_atom_samples)
+        } else {
+            longest_block
+        }
+        .min(signal_len);
+
+        let bytes_per_sample: f64 = dict
+            .blocks
+            .iter()
+            .map(|b| FRAME_TABLE_BYTES as f64 / b.hop as f64)
+            .sum();
+
+        let from_budget = || {
+            let affordable = (budget_bytes as f64 / bytes_per_sample.max(f64::MIN_POSITIVE)) as usize;
+            affordable.saturating_sub(guard_len)
+        };
+        let wanted = forced_core.unwrap_or_else(from_budget);
+
+        // A core shorter than a few guards is not worth cutting: every window would re-correlate
+        // more guard than core, and an atom deferred out of one window's tail would land in the
+        // next window's tail again. Correctness wins over the budget here, and the caller is told.
+        let floor = (4 * guard_len).max(1);
+        let core_len = wanted.max(floor).min(signal_len.max(1));
+        // Reported whenever the floor overrode what was asked for, whether that was the budget or
+        // an explicit `window_seconds`: in both cases the run is not doing what the setting said.
+        let over_budget = core_len < signal_len && core_len > wanted;
+
+        Self {
+            core_len,
+            guard_len,
+            count: signal_len.div_ceil(core_len.max(1)).max(1),
+            bytes_per_sample,
+            over_budget,
+        }
+    }
+
+    /// Frame-table bytes one window costs.
+    pub fn window_bytes(&self) -> f64 {
+        (self.core_len + self.guard_len) as f64 * self.bytes_per_sample
+    }
+}
+
+/// A windowed run's result: the book, what it could not explain, and the refresh counters.
+pub struct WindowedRun {
+    pub book: Book,
+    pub residual: Vec<f32>,
+    /// [`Mp::lazy_stats`], summed over the windows.
+    pub marked: usize,
+    pub resolved: usize,
+    pub per_block: Vec<(usize, usize)>,
+    /// Time spent correlating every frame up front, summed over the windows.
+    ///
+    /// A windowed run pays this once per window rather than once, which is the cost of the whole
+    /// scheme; reporting it separately is what makes that cost visible instead of folded into the
+    /// pursuit and invisible.
+    pub init: std::time::Duration,
+}
+
+/// Decompose `signal` a window at a time, so the frame tables never size to the whole clip.
+///
+/// Each window owns `[offset, offset + core)` and carries a guard past it; the pursuit selects only
+/// from the core, and an atom starting in the core is fully inside the window by construction. The
+/// window's residual — guard included — is written back before the next window reads it, so every
+/// atom is subtracted exactly once and an atom the argmax wanted in the guard is simply deferred to
+/// the window that owns it.
+///
+/// `progress` is called with `(window index, windows, atoms so far)` after each window.
+pub fn run_windowed(
+    dict: &Dictionary,
+    signal: &Signal,
+    planner: &mut dyn RealFftPlanner,
+    cfg: &MpConfig,
+    plan: &WindowPlan,
+    progress: &mut dyn FnMut(usize, usize, usize),
+) -> WindowedRun {
+    if plan.count <= 1 {
+        // The original path, untouched, so a signal that fits the budget is bit-identical.
+        let t = std::time::Instant::now();
+        let mut mp = Mp::new(dict, signal, planner);
+        let init = t.elapsed();
+        let book = mp.run(cfg);
+        let (marked, resolved) = mp.lazy_stats();
+        let per_block = mp.lazy_stats_per_block().to_vec();
+        return WindowedRun { book, residual: mp.residual, marked, resolved, per_block, init };
+    }
+
+    let sr = signal.sample_rate;
+    let total = signal.len();
+    let mut residual = signal.samples.clone();
+    let mut book = Book::new(signal.energy(), sr);
+    // The book's `residual_energy` column is a global running total, not a per-window one: the SNR
+    // curve `stats` and `rmpstat snr` read off it has to mean the same thing end to end.
+    let mut running = signal.energy();
+    let (mut marked, mut resolved) = (0usize, 0usize);
+    let mut per_block = vec![(0usize, 0usize); dict.blocks.len()];
+
+    let mut init = std::time::Duration::ZERO;
+    let mut offset = 0usize;
+    let mut w = 0usize;
+    while offset < total {
+        let core = plan.core_len.min(total - offset);
+        let end = (offset + core + plan.guard_len).min(total);
+        let window = Signal::new(residual[offset..end].to_vec(), sr);
+
+        // The atom budget is shared out by duration, so `max_atoms` still bounds the whole run.
+        let share = (cfg.max_atoms as u128 * core as u128 / total as u128) as usize;
+        let wcfg = MpConfig { max_atoms: share.max(1), ..*cfg };
+
+        let t = std::time::Instant::now();
+        let mut mp = Mp::with_core(dict, &window, planner, core);
+        init += t.elapsed();
+        let wbook = mp.run(&wcfg);
+
+        residual[offset..end].copy_from_slice(&mp.residual);
+        let (m, r) = mp.lazy_stats();
+        marked += m;
+        resolved += r;
+        for (acc, &(bm, br)) in per_block.iter_mut().zip(mp.lazy_stats_per_block()) {
+            acc.0 += bm;
+            acc.1 += br;
+        }
+
+        for mut s in wbook.selections {
+            s.atom.t0 += offset as i64;
+            s.onset += offset;
+            // `energy_removed` is measured over the atom's whole support inside its window, so it
+            // is the atom's true removal and accumulates into a global residual energy directly.
+            running = (running - s.energy_removed).max(0.0);
+            s.residual_energy = running;
+            book.selections.push(s);
+        }
+
+        offset += core;
+        w += 1;
+        progress(w, plan.count, book.len());
+    }
+
+    WindowedRun { book, residual, marked, resolved, per_block, init }
 }
 
 /// Frame count below which the blocks are refreshed on one thread.
@@ -1299,5 +1546,170 @@ mod tests {
         let sig = Signal::silence(300, SR);
         let (book, _) = run(&d, &sig, &MpConfig::default());
         assert!(book.is_empty(), "selected {} atoms from silence", book.len());
+    }
+
+    // ── the windowed pursuit ────────────────────────────────────────────────
+
+    /// A dictionary whose longest support is short enough to window a test-sized signal.
+    fn window_dict() -> Dictionary {
+        tiny_dict()
+    }
+
+    fn plan_for(d: &Dictionary, len: usize, cfg: &MpConfig, core: usize) -> WindowPlan {
+        WindowPlan::new(d, len, cfg, 0, Some(core))
+    }
+
+    fn windowed(d: &Dictionary, sig: &Signal, cfg: &MpConfig, plan: &WindowPlan) -> WindowedRun {
+        let mut planner = Planner::new();
+        run_windowed(d, sig, &mut planner, cfg, plan, &mut |_, _, _| {})
+    }
+
+    /// The compatibility guarantee: a signal that fits the budget is not windowed, and the book is
+    /// the one the un-windowed pursuit always produced -- bit for bit, not merely close.
+    #[test]
+    fn a_signal_inside_the_budget_is_one_window_and_bit_identical() {
+        let d = window_dict();
+        let sig = noise(4000, 0x5eed_1234_9876_0001);
+        let cfg = MpConfig { max_atoms: 20, target_snr_db: f32::INFINITY, ..Default::default() };
+
+        // A budget far above what the tables need.
+        let plan = WindowPlan::new(&d, sig.len(), &cfg, 1 << 30, None);
+        assert_eq!(plan.count, 1, "a small signal should not be windowed");
+
+        let (want, want_res) = run(&d, &sig, &cfg);
+        let got = windowed(&d, &sig, &cfg, &plan);
+        assert_eq!(got.book.selections, want.selections);
+        assert_eq!(got.residual, want_res);
+    }
+
+    /// The budget is what decides, and it decides in the direction it says.
+    #[test]
+    fn a_tighter_budget_cuts_more_windows() {
+        let d = window_dict();
+        let cfg = MpConfig::default();
+        let len = 2_000_000;
+        let generous = WindowPlan::new(&d, len, &cfg, 1 << 30, None);
+        let tight = WindowPlan::new(&d, len, &cfg, 1 << 20, None);
+        assert!(
+            tight.count > generous.count,
+            "tight {} windows, generous {}",
+            tight.count,
+            generous.count
+        );
+        assert!(tight.window_bytes() < generous.window_bytes());
+        // Whatever the budget, a window must carry a whole atom's support past its core.
+        for p in [generous, tight] {
+            assert!(p.guard_len >= d.blocks.iter().map(|b| b.support_len()).max().unwrap());
+        }
+    }
+
+    /// Windowing changes the greedy order, so nothing here is bit-identity. What must hold is that
+    /// the decomposition still works: the residual comes down, and by a comparable amount.
+    #[test]
+    fn windowing_still_decomposes_the_signal() {
+        let d = window_dict();
+        let sig = noise(20_000, 0x5eed_9999_1111_2222);
+        let cfg = MpConfig { max_atoms: 60, target_snr_db: f32::INFINITY, ..Default::default() };
+
+        let whole = windowed(&d, &sig, &cfg, &WindowPlan::new(&d, sig.len(), &cfg, 1 << 30, None));
+        let cut = windowed(&d, &sig, &cfg, &plan_for(&d, sig.len(), &cfg, 4000));
+        assert!(cut.book.len() > 1, "the windowed run selected {} atoms", cut.book.len());
+
+        let energy = |r: &[f32]| r.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+        let (e0, e_whole, e_cut) = (sig.energy(), energy(&whole.residual), energy(&cut.residual));
+        assert!(e_cut < e0, "the windowed run removed no energy");
+        // Within a factor of two of the un-windowed run's residual: the orders differ, the quality
+        // does not collapse.
+        assert!(
+            e_cut < 2.0 * e_whole,
+            "windowed residual {e_cut:.6e} against un-windowed {e_whole:.6e}"
+        );
+    }
+
+    /// The book's own bookkeeping has to survive being assembled from several windows: onsets are
+    /// global, and `residual_energy` is a global running total the SNR curve can be read off.
+    #[test]
+    fn a_windowed_book_reads_as_one_decomposition() {
+        let d = window_dict();
+        let sig = noise(20_000, 0x5eed_4444_5555_6666);
+        let cfg = MpConfig { max_atoms: 60, target_snr_db: f32::INFINITY, ..Default::default() };
+        let got = windowed(&d, &sig, &cfg, &plan_for(&d, sig.len(), &cfg, 4000));
+
+        assert!(got.book.len() > 1);
+        // Onsets are translated out of window coordinates, so they advance through the signal.
+        let onsets: Vec<usize> = got.book.selections.iter().map(|s| s.onset).collect();
+        assert!(
+            onsets.iter().any(|&o| o >= 4000),
+            "no atom past the first core: {onsets:?}"
+        );
+        // The recorded residual energy is monotone and ends at the residual actually left behind.
+        let mut prev = f64::INFINITY;
+        for s in &got.book.selections {
+            assert!(s.residual_energy <= prev, "residual energy rose: {prev} -> {}", s.residual_energy);
+            prev = s.residual_energy;
+        }
+        let measured: f64 = got.residual.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        let recorded = got.book.selections.last().unwrap().residual_energy;
+        assert!(
+            (measured - recorded).abs() <= 1e-6 * measured.max(1e-30) + 1e-9,
+            "book says {recorded:.6e}, the residual is {measured:.6e}"
+        );
+    }
+
+    /// The guard is the whole point: an atom whose onset sits just inside a core must be selected
+    /// once, with its full support, not split at the boundary or dropped.
+    #[test]
+    fn an_atom_astride_a_core_boundary_is_selected_whole() {
+        let d = window_dict();
+        let core = 4000usize;
+        // Planted so that half its support lies on each side of the boundary. Support comes from
+        // rendering, never a formula -- the rule the rest of the crate follows.
+        let support = crate::fof::Envelope::render(d.blocks[0].env.params, SR)
+            .unwrap()
+            .support_len();
+        let t0 = core as i64 - support as i64 / 2;
+        let atom = on_grid(&d, 0, (d.blocks[0].k_lo + d.blocks[0].k_hi) / 2, t0, 1.0, 0.3);
+        assert!(t0 as usize + support > core, "the fixture does not cross the boundary");
+
+        let sig = Signal::from_atoms(&[atom], 20_000, SR).unwrap();
+        let cfg = MpConfig { max_atoms: 4, target_snr_db: 40.0, ..Default::default() };
+        let got = windowed(&d, &sig, &cfg, &plan_for(&d, sig.len(), &cfg, core));
+
+        assert!(!got.book.is_empty(), "the planted atom was not found");
+        let first = got.book.selections[0];
+        assert!(
+            (first.atom.t0 - t0).abs() <= d.blocks[first.block].hop as i64,
+            "recovered t0 {} against planted {t0}",
+            first.atom.t0
+        );
+        // Recovered whole: one atom accounts for nearly all the energy, rather than two half-atoms
+        // meeting at the boundary.
+        assert!(
+            first.energy_removed > 0.95 * sig.energy(),
+            "the first atom removed {:.3} of the signal's energy",
+            first.energy_removed / sig.energy()
+        );
+    }
+
+    /// The stopping rule reads the core, not the whole window. A window whose guard is loud but
+    /// whose core is already explained must stop, or every window spends its whole budget on
+    /// material the next window owns.
+    #[test]
+    fn the_stopping_rule_ignores_the_guard() {
+        let d = window_dict();
+        let core = 4000usize;
+        // Silence in the core, a strong burst well inside the guard.
+        let loud = on_grid(&d, 0, (d.blocks[0].k_lo + d.blocks[0].k_hi) / 2, core as i64 + 500, 1.0, 0.0);
+        let sig = Signal::from_atoms(&[loud], 20_000, SR).unwrap();
+
+        let cfg = MpConfig { max_atoms: 30, target_snr_db: 20.0, ..Default::default() };
+        let mut planner = Planner::new();
+        let mut mp = Mp::with_core(&d, &sig, &mut planner, core);
+        let book = mp.run(&cfg);
+        assert!(
+            book.is_empty(),
+            "selected {} atoms from a silent core",
+            book.len()
+        );
     }
 }

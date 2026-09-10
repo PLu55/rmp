@@ -38,16 +38,26 @@ pub struct FrameTable<'a> {
     /// one `f64` per frame of the whole dictionary, allocated and freed per selected atom. Masking
     /// on read is the same predicate with no allocation at all.
     pub dirty: Option<&'a [bool]>,
+    /// Frames the search may select from — the leading `core_frames`, under the windowed pursuit.
+    ///
+    /// Frames past the core exist and are kept current, because atoms starting inside the core
+    /// reach into them, but selecting one would place an atom the next window is responsible for.
+    /// `None` means the whole table, which is the single-window case.
+    pub core_frames: Option<usize>,
     pub hop: usize,
     pub support_len: usize,
 }
 
 impl FrameTable<'_> {
-    /// The energy the scan sees at frame `n`: `-inf` where the frame is dirty or non-finite.
+    /// The energy the scan sees at frame `n`: `-inf` where the frame is dirty, outside the core, or
+    /// non-finite.
     ///
     /// A non-finite stored value must not block its neighbour either — `x >= NAN` is false, so
     /// comparing against the raw value would silently drop the frame next to it.
     fn masked(&self, n: usize) -> f64 {
+        if self.core_frames.is_some_and(|c| n >= c) {
+            return f64::NEG_INFINITY;
+        }
         if self.dirty.is_some_and(|d| d[n]) {
             return f64::NEG_INFINITY;
         }
@@ -229,7 +239,7 @@ mod tests {
 
     fn table<'a>(block: usize, energy: &'a [f64], bin: &'a [u32], hop: usize, support: usize)
     -> FrameTable<'a> {
-        FrameTable { block, energy, bin, dirty: None, hop, support_len: support }
+        FrameTable { block, energy, bin, dirty: None, core_frames: None, hop, support_len: support }
     }
 
     /// The property that makes `candidate_count = 1` reproduce the old behaviour exactly.

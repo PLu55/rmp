@@ -72,14 +72,24 @@ pub fn read(path: impl AsRef<Path>) -> Result<Input, AudioError> {
         return Err(AudioError::Empty(name));
     }
 
+    // Downmixed in place, into the front of the buffer it reads from, and then truncated. The
+    // obvious `collect()` allocates a second buffer and holds both until the interleaved one is
+    // dropped — an extra `channels/(channels+1)` of the file's samples at the peak, which for a
+    // nine-minute stereo file is 100 MB that nothing ever reads twice. The read is strictly ahead
+    // of the write (`frame*channels >= frame`), so the aliasing is safe by index.
     let samples = if channels <= 1 {
         interleaved
     } else {
+        let mut interleaved = interleaved;
         let scale = 1.0 / channels as f32;
+        let frames = interleaved.len() / channels;
+        for frame in 0..frames {
+            let sum: f32 = interleaved[frame * channels..][..channels].iter().sum();
+            interleaved[frame] = sum * scale;
+        }
+        interleaved.truncate(frames);
+        interleaved.shrink_to_fit();
         interleaved
-            .chunks_exact(channels)
-            .map(|frame| frame.iter().sum::<f32>() * scale)
-            .collect()
     };
 
     Ok(Input {
