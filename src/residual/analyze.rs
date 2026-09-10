@@ -81,9 +81,13 @@ pub fn analyze_residual(
         .collect();
     let columns = columns?;
 
+    // Each column is dropped as it is transposed rather than after the loop, so the band-major
+    // columns and the frame-major matrix are never both fully resident — the peak is one matrix
+    // plus the columns still to be read, not two matrices.
     let mut power = vec![0.0f32; frame_count * bands];
-    for (b, (_, column)) in columns.iter().enumerate() {
-        for (k, &v) in column.iter().enumerate() {
+    let gains: Vec<f64> = columns.iter().map(|(g, _)| *g).collect();
+    for (b, (_, column)) in columns.into_iter().enumerate() {
+        for (k, v) in column.into_iter().enumerate() {
             power[k * bands + b] = v;
         }
     }
@@ -108,7 +112,7 @@ pub fn analyze_residual(
             normalization: cfg.erb.normalization,
             center_freq_hz: centers,
             bandwidth_hz: bandwidths,
-            normalization_gain: columns.iter().map(|&(g, _)| g).collect(),
+            normalization_gain: gains,
             power_detector: ResidualPowerDescriptor {
                 mode: cfg.power.mode,
                 tau_seconds: taus,

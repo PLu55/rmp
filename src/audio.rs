@@ -90,7 +90,20 @@ pub fn read(path: impl AsRef<Path>) -> Result<Input, AudioError> {
 
 /// Write a mono signal as 32-bit float WAV.
 pub fn write(path: impl AsRef<Path>, signal: &Signal) -> Result<(), AudioError> {
-    write_encoded(path, signal, SubtypeFormat::FLOAT)
+    write_samples(path, &signal.samples, signal.sample_rate)
+}
+
+/// [`write`] for samples that are not already owned by a [`Signal`].
+///
+/// The pursuit's residual is a borrowed slice of its working buffer, and wrapping it in a `Signal`
+/// to write it copied the whole thing — a second full-length `f32` buffer live at the one moment
+/// the resynthesis is also resident.
+pub fn write_samples(
+    path: impl AsRef<Path>,
+    samples: &[f32],
+    sample_rate: f32,
+) -> Result<(), AudioError> {
+    write_encoded(path, samples, sample_rate, SubtypeFormat::FLOAT)
 }
 
 /// Write a mono signal as 24-bit PCM WAV.
@@ -99,12 +112,13 @@ pub fn write(path: impl AsRef<Path>, signal: &Signal) -> Result<(), AudioError> 
 /// so has a defined full scale. Anything past `[-1, 1)` wraps in a fixed-point format, which is why
 /// [`crate::synth`] measures and reports overs before it gets here.
 pub fn write_pcm24(path: impl AsRef<Path>, signal: &Signal) -> Result<(), AudioError> {
-    write_encoded(path, signal, SubtypeFormat::PCM_24)
+    write_encoded(path, &signal.samples, signal.sample_rate, SubtypeFormat::PCM_24)
 }
 
 fn write_encoded(
     path: impl AsRef<Path>,
-    signal: &Signal,
+    samples: &[f32],
+    sample_rate: f32,
     subtype: SubtypeFormat,
 ) -> Result<(), AudioError> {
     let path = path.as_ref();
@@ -114,13 +128,13 @@ fn write_encoded(
         MajorFormat::WAV,
         subtype,
         Endian::File,
-        signal.sample_rate as usize,
+        sample_rate as usize,
         1,
     ))
     .from_path(path)
     .map_err(|e| AudioError::Open(format!("{name}: {e:?}")))?;
 
-    <SndFile as SndFileIO<f32>>::write_from_slice(&mut snd, &signal.samples)
+    <SndFile as SndFileIO<f32>>::write_from_slice(&mut snd, samples)
         .map_err(|_| AudioError::Write(name))?;
     Ok(())
 }

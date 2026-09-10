@@ -16,7 +16,6 @@ pub mod mp;
 pub mod naive;
 pub mod refine;
 pub mod residual;
-pub mod select;
 pub mod signal;
 pub mod stats;
 pub mod synth;
@@ -38,7 +37,6 @@ pub use residual::{
     ResidualAnalysisConfig, ResidualAnalysisError, ResidualBook, ResidualPowerConfig,
     ResidualPowerTimeMode, analyze_residual,
 };
-pub use select::SegTree;
 pub use signal::Signal;
 pub use stats::{BookSummary, Diagnostics, Evaluator, Histogram, Quantity, Summary, Weight};
 pub use synth::{

@@ -77,7 +77,6 @@ parts that need reading together:
 - **`hrmp`** — local-support probes and the amplitude clamp.
 - **`mp`** — the pursuit loop with the local update; owns the candidate → refine → validate → select
   pipeline.
-- **`select`** — max segment tree over frames.
 - **`naive`** — brute-force oracle. Deliberately shares nothing with `dict`/`corr` beyond the atom
   definition and the search space.
 - **`signal` / `book`** — f64 energy bookkeeping, and the decomposition result. `book::read` /
@@ -192,6 +191,36 @@ output by rendering each atom's envelope and taking the furthest death, where an
 residual by the input. The atom tails the analysis truncated at the excerpt end are audible again —
 2.9% of the excerpt's energy on a 0.15 s piano fixture. Over the excerpt itself the two renders are
 bit-identical, so this is a longer file, not a different one.
+
+**Memory scales with the signal, so per-frame bytes are a design constraint.** The frame tables
+are `energy` (f64), `bin` (u32) and `dirty` (bool) — **13 bytes per frame** — and a dictionary needs
+`sum_b 1/hop_b` frames per input sample, which at the default grid and tolerance is over five,
+because `hop ∝ 1/alpha` makes the *short* atoms cost the most table. Three things that used to sit
+on top of that are gone, and must not come back:
+
+- A `SegTree` per block, at `2 * next_power_of_two(frames)` f64 — 16–32 bytes/frame, *more than the
+  table itself*. Its only reader was `mp::global_argmax`, called from a `debug_assert!` and nowhere
+  else, so a release build paid for it and never read it. `global_argmax` is now a linear scan;
+  seeds come from `top_seeds`, which scans linearly anyway. Measured on piano at the default config,
+  removing it took the frame tables from 3838 kB to 846 kB per second of audio, **4.5x**.
+- A masked *copy* of every frame table, rebuilt on each pass of `top_candidates`. `cand::FrameTable`
+  now carries `dirty` and masks on read — the same predicate, no allocation.
+- `cand::top_seeds` collecting and sorting every local maximum. It keeps a capped heap of the
+  strongest `max(64k, 1024)` instead; the retained prefix is identical because the tie-break is a
+  strict total order, and the cap doubles and retries in the case suppression exhausts it.
+
+None of the three changed a book by a bit, and the gates that prove it are the `-c mp_1.toml`
+reference book and the whole test suite.
+
+**The envelope cache is bounded, and that is what made long clips possible at all.**
+`refine::EnvelopeCache` is keyed on exact `(alpha, beta)` bits, and refinement moves both
+continuously, so its hit rate *across* atoms is nil — but it used to retain every entry for the life
+of the pursuit. Each is a full envelope, hundreds of KB at a low `alpha_min`. Measured on
+`lux-eterna-1.toml`, that cost **7 MB per selected atom**: 2.3 GB at 300 atoms, and the config's own
+`max_atoms = 7500` would have needed ~50 GB. It now carries a 16 M-sample budget and clears itself
+whole when exceeded, which is safe at any point because it is a pure memo. RSS is flat in atom count
+afterwards. Do not "improve" the eviction into something per-entry: a whole search must fit, and
+clearing whole is what keeps the current search's working set intact.
 
 **A stale frame is bounded, not recomputed.** After a subtraction, frames overlapping the atom get
 an upper bound — `(sqrt(E_old) + ||P a||)^2`, with `||P a||^2` bounded in O(1) by both `||a||^2` and

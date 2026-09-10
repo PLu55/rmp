@@ -110,15 +110,45 @@ impl Default for RefineConfig {
 /// Golden section revisits the same values across rounds and across candidates, and an
 /// [`Envelope::render`] is an allocation plus an rfofs spawn plus a full grain render. Exact-bit
 /// keying is right here because the search proposes bit-identical repeats, not nearby ones.
+///
+/// **The reuse is within one atom's search, not across atoms, and the lifetime must match.**
+/// Refinement moves `(alpha, beta)` continuously, so the next atom's probes are essentially never
+/// bit-identical to this one's: the cross-atom hit rate is nil, but the entries are retained
+/// anyway. Each holds a full envelope — at a low `alpha_min` that is hundreds of KB — and a search
+/// proposes tens of them, so an unbounded cache grows without limit in *atom count*. Measured on
+/// `lux-eterna-1.toml`, which reaches `alpha_min = 4`, it cost about 7 MB per selected atom: 2.3 GB
+/// at 300 atoms, and the config's own `max_atoms = 7500` would have needed ~50 GB. That, not the
+/// frame tables, is what made long clips impossible.
+///
+/// So the cache carries a byte budget and clears itself whole when it is exceeded. Clearing is
+/// always safe — this is a pure memo, and [`get`](Self::get) recomputes exactly what it evicted —
+/// which is why the bound can be crude. Clearing whole rather than evicting one entry keeps the
+/// *current* search's working set intact in the common case, where a whole search fits.
 #[derive(Default)]
 pub struct EnvelopeCache {
     /// Value is the envelope and its fit-region length, so `fit_end`'s scan is paid once.
     entries: HashMap<(u32, u32), Option<(Envelope, usize)>>,
+    /// Envelope samples currently held, and the ceiling on them.
+    samples: usize,
+    budget: usize,
+    /// The high-water mark over the cache's life, for `RMP_REFRESH_DETAIL`.
+    peak_samples: usize,
 }
+
+/// Envelope samples the cache may hold before it clears: 64 MB of `f32`.
+///
+/// Sized to hold a whole refinement search — the widest `alpha_bracket` over the lowest `alpha_min`
+/// in `data/config` is a few hundred envelopes of a few hundred KB — while bounding the total
+/// independently of how many atoms the pursuit selects.
+pub const ENVELOPE_CACHE_SAMPLES: usize = 16 << 20;
 
 impl EnvelopeCache {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_budget(ENVELOPE_CACHE_SAMPLES)
+    }
+
+    pub fn with_budget(budget: usize) -> Self {
+        Self { budget, ..Self::default() }
     }
 
     pub fn len(&self) -> usize {
@@ -127,6 +157,17 @@ impl EnvelopeCache {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Envelope samples held, and the most ever held at once.
+    pub fn usage(&self) -> (usize, usize) {
+        (self.samples, self.peak_samples)
+    }
+
+    /// Drop everything. Safe at any point: the cache is a memo, not state.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.samples = 0;
     }
 
     /// Render `(alpha, beta)` under `policy`, or return `None` if it is out of bounds or unusable.
@@ -151,9 +192,9 @@ impl EnvelopeCache {
         }
 
         let max_len = cfg.max_atom_samples;
-        self.entries
-            .entry((alpha.to_bits(), beta.to_bits()))
-            .or_insert_with(|| {
+        let key = (alpha.to_bits(), beta.to_bits());
+        if !self.entries.contains_key(&key) {
+            let value = (|| {
                 let params = EnvelopeParams::with_policy(alpha, beta, policy);
                 let env = Envelope::render(params, sample_rate).ok()?;
                 if env.support_len() > max_len {
@@ -161,8 +202,18 @@ impl EnvelopeCache {
                 }
                 let cut = fit::fit_end(&env);
                 Some((env, cut))
-            })
-            .as_ref()
+            })();
+            // The budget is enforced *before* the insertion, so the entry just rendered always
+            // survives it: a caller that asked for an envelope gets one back, whatever the ceiling.
+            let cost = value.as_ref().map_or(0, |(env, _)| env.support_len());
+            if self.samples + cost > self.budget {
+                self.clear();
+            }
+            self.samples += cost;
+            self.peak_samples = self.peak_samples.max(self.samples);
+            self.entries.insert(key, value);
+        }
+        self.entries[&key].as_ref()
     }
 }
 

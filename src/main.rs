@@ -478,8 +478,7 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     if let Some(path) = &args.residual {
         // Taken from the pursuit rather than by subtracting the resynthesis, so it is exactly what
         // the algorithm could not explain.
-        let residual = Signal::new(mp.residual().to_vec(), sr);
-        audio::write(path, &residual).map_err(|e| e.to_string())?;
+        audio::write_samples(path, mp.residual(), sr).map_err(|e| e.to_string())?;
         say(&format!("wrote {}", path.display()));
     }
 

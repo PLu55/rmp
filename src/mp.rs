@@ -57,7 +57,6 @@ use crate::fft::RealFftPlanner;
 use crate::fit;
 use crate::hrmp::{self, HrmpConfig};
 use crate::refine::{EnvelopeCache, RefineConfig, refine};
-use crate::select::SegTree;
 use crate::signal::{Signal, overlap, snr_db, subtract_at};
 use rayon::prelude::*;
 
@@ -123,13 +122,19 @@ struct Chosen {
     demote: Vec<(usize, usize, f64)>,
 }
 
-/// Per-block frame table and its max tree.
+/// Per-block frame table.
+///
+/// **There is deliberately no max tree here.** One used to sit alongside `energy`, but its only
+/// reader was [`Mp::global_argmax`], which is called from a `debug_assert!` and nowhere else —
+/// seeds come off [`top_seeds`], which scans linearly anyway. In a release build it was therefore
+/// pure cost: a `2 * next_power_of_two(frames)` array of `f64` is 16–32 bytes per frame against the
+/// 13 the table itself needs, so it was over half of a structure that already scales with the
+/// signal, plus an `O(log F)` write per stale frame per atom on the hot path.
 struct BlockState {
     /// Best projected energy per frame — or, where `dirty`, an upper bound on it.
     energy: Vec<f64>,
     /// Bin achieving that energy. Stale wherever `dirty`.
     bin: Vec<u32>,
-    tree: SegTree,
     /// Frames holding a bound rather than an exact value.
     dirty: Vec<bool>,
     /// Running maxima of the envelope from the left and from the right, and where it peaks, for
@@ -199,8 +204,6 @@ impl<'a> Mp<'a> {
                     energy[n] = p.energy;
                     bin[n] = k as u32;
                 }
-                let tree = SegTree::new(&energy);
-
                 let env = &block.env.samples;
                 let mut env_prefix_max = env.to_vec();
                 for i in 1..env_prefix_max.len() {
@@ -228,7 +231,6 @@ impl<'a> Mp<'a> {
                     dirty: vec![false; frames],
                     energy,
                     bin,
-                    tree,
                     env_prefix_max,
                     env_suffix_max,
                     env_peak,
@@ -303,7 +305,6 @@ impl<'a> Mp<'a> {
             let demoted = !chosen.demote.is_empty();
             for &(bi, frame, energy) in &chosen.demote {
                 self.states[bi].energy[frame] = energy;
-                self.states[bi].tree.set(frame, energy);
                 // A demotion is a deliberate value, not a bound: it must not be "resolved" back.
                 self.states[bi].dirty[frame] = false;
             }
@@ -383,28 +384,22 @@ impl<'a> Mp<'a> {
         // A masked seed is a true local maximum once nothing dirty remains above the line: its
         // clean neighbours are in the scan, and a dirty neighbour's bound — hence its value — is
         // below it. So the list returned is the same one the eager tables would give.
+        //
+        // The masking is a *predicate on read* rather than a masked copy of the tables. The copy
+        // was one `f64` per frame of the whole dictionary, allocated and freed on every pass of
+        // this loop — hundreds of megabytes per selected atom on a long clip, for a value that is
+        // `NEG_INFINITY` wherever `dirty` and the stored energy everywhere else.
         loop {
-            let masked: Vec<Vec<f64>> = self
-                .states
-                .iter()
-                .map(|st| {
-                    st.energy
-                        .iter()
-                        .zip(&st.dirty)
-                        .map(|(&e, &d)| if d { f64::NEG_INFINITY } else { e })
-                        .collect()
-                })
-                .collect();
             let seeds = {
                 let tables: Vec<FrameTable<'_>> = self
                     .states
                     .iter()
-                    .zip(&masked)
                     .enumerate()
-                    .map(|(bi, (st, energy))| FrameTable {
+                    .map(|(bi, st)| FrameTable {
                         block: bi,
-                        energy,
+                        energy: &st.energy,
                         bin: &st.bin,
+                        dirty: Some(&st.dirty),
                         hop: self.dict.blocks[bi].hop,
                         support_len: self.dict.blocks[bi].support_len(),
                     })
@@ -555,15 +550,18 @@ impl<'a> Mp<'a> {
     }
 
     /// Block and frame of the globally best atom. Ties go to the lowest block, then lowest frame.
+    ///
+    /// Only the `debug_assert!` in [`Mp::run`] calls this, so a linear scan is the right shape: it
+    /// costs a debug build one pass over the tables per atom, and it saves a release build the max
+    /// tree that used to answer it in `O(log F)` at 16–32 bytes per frame. Reads the raw table,
+    /// bounds included, which is what the assertion compares against.
     fn global_argmax(&self) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize, f64)> = None;
         for (bi, st) in self.states.iter().enumerate() {
-            if st.tree.is_empty() {
-                continue;
-            }
-            let m = st.tree.max();
-            if m.is_finite() && best.as_ref().is_none_or(|&(_, _, b)| m > b) {
-                best = Some((bi, st.tree.argmax(), m));
+            for (n, &e) in st.energy.iter().enumerate() {
+                if e.is_finite() && best.as_ref().is_none_or(|&(_, _, b)| e > b) {
+                    best = Some((bi, n, e));
+                }
             }
         }
         best.map(|(b, f, _)| (b, f))
@@ -639,7 +637,6 @@ impl<'a> Mp<'a> {
                 let old = st.energy[n].max(0.0);
                 let bound = (old.sqrt() + delta.sqrt()).powi(2) * (1.0 + 1e-4) + 1e-12;
                 st.energy[n] = bound;
-                st.tree.set(n, bound);
                 st.dirty[n] = true;
                 self.marked += 1;
                 self.per_block[bi].0 += 1;
@@ -685,7 +682,7 @@ impl<'a> Mp<'a> {
 /// Run `f` over every block's correlator and frame table, in parallel.
 ///
 /// The whole per-frame cost of the pursuit — one FFT and one bin scan — lives inside this, and
-/// nothing crosses between blocks: each writes only its own table and tree. Results are therefore
+/// nothing crosses between blocks: each writes only its own frame table. Results are therefore
 /// identical to running the blocks in sequence, which is what lets the bit-identity gates keep
 /// their teeth.
 ///
@@ -726,7 +723,6 @@ fn refresh_one(
     let (k, p) = scan_frame(corr, block, residual, block.frame_onset(n));
     state.energy[n] = p.energy;
     state.bin[n] = k as u32;
-    state.tree.set(n, p.energy);
 }
 
 /// Frames of `block` whose read window overlaps `[tau, tau + atom_len)`.

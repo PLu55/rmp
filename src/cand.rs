@@ -14,13 +14,15 @@
 //!
 //! # Tie-breaking
 //!
-//! `(energy desc, block asc, frame asc)`, matching [`crate::select::SegTree`]'s lowest-index rule.
+//! `(energy desc, block asc, frame asc)`, resolving ties to the lowest index.
 //! The plateau test is `e[n] > e[n-1] && e[n] >= e[n+1]`, which picks the *leftmost* frame of a
-//! plateau — again what `SegTree::argmax` would return. Both are needed for `candidate_count = 1`
+//! plateau — the lowest-index frame of the run. Both are needed for `candidate_count = 1`
 //! to reproduce the plain global argmax exactly.
 
 use crate::dict::Block;
 use crate::fof::AtomParams;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 /// One block's frame table, as the candidate search sees it.
 pub struct FrameTable<'a> {
@@ -29,8 +31,29 @@ pub struct FrameTable<'a> {
     pub energy: &'a [f64],
     /// Bin achieving it.
     pub bin: &'a [u32],
+    /// Frames holding a bound rather than an exact value, hidden from the scan. `None` where every
+    /// frame is exact.
+    ///
+    /// The pursuit used to hide them by building a masked *copy* of every table on every pass —
+    /// one `f64` per frame of the whole dictionary, allocated and freed per selected atom. Masking
+    /// on read is the same predicate with no allocation at all.
+    pub dirty: Option<&'a [bool]>,
     pub hop: usize,
     pub support_len: usize,
+}
+
+impl FrameTable<'_> {
+    /// The energy the scan sees at frame `n`: `-inf` where the frame is dirty or non-finite.
+    ///
+    /// A non-finite stored value must not block its neighbour either — `x >= NAN` is false, so
+    /// comparing against the raw value would silently drop the frame next to it.
+    fn masked(&self, n: usize) -> f64 {
+        if self.dirty.is_some_and(|d| d[n]) {
+            return f64::NEG_INFINITY;
+        }
+        let e = self.energy[n];
+        if e.is_finite() { e } else { f64::NEG_INFINITY }
+    }
 }
 
 /// A promoted local maximum, before any refinement.
@@ -92,40 +115,63 @@ pub fn top_seeds(tables: &[FrameTable<'_>], k: usize) -> Vec<Seed> {
     if k == 0 {
         return Vec::new();
     }
-    // A non-finite neighbour must not block a valid frame: `x >= NAN` is false, so comparing
-    // against the raw value would silently drop the frame next to it.
-    let at = |v: &[f64], i: usize| {
-        let e = v[i];
-        if e.is_finite() { e } else { f64::NEG_INFINITY }
-    };
+    // Suppression can reject an arbitrary number of maxima, so a capped scan can in principle run
+    // out of candidates before it has `k`. It cannot then be trusted, and the cap is doubled and
+    // the scan repeated. This is a safety net, not a path: `k` is `candidate_count`, 1 by default,
+    // and suppression only rejects seeds from the *same* block within half a support, so filling
+    // 1024 retained maxima without finding one usable seed does not happen on real material.
+    let mut cap = (k * 64).max(1024);
+    loop {
+        let (kept, saturated) = top_seeds_capped(tables, k, cap);
+        if kept.len() == k || !saturated {
+            return kept;
+        }
+        cap *= 2;
+    }
+}
 
-    let mut maxima = Vec::new();
+/// [`top_seeds`] over the strongest `cap` local maxima, and whether that many were found.
+fn top_seeds_capped(tables: &[FrameTable<'_>], k: usize, cap: usize) -> (Vec<Seed>, bool) {
+    // Only the strongest few maxima can survive suppression, so only the strongest few are kept.
+    //
+    // Collecting *every* local maximum and sorting it was the obvious form and is unusable at
+    // scale: on dense material the maxima are a sizeable fraction of the frames, so a long clip
+    // built and sorted a multi-million-element vector per selected atom. `cap` is the retained
+    // prefix; because `by_rank` is a strict total order, the top-`cap` set is uniquely determined
+    // and identical to what sorting the whole thing and truncating would give.
+    let mut heap: BinaryHeap<Weakest> = BinaryHeap::with_capacity(cap + 1);
     for t in tables {
         for n in 0..t.energy.len() {
-            let e = t.energy[n];
+            let e = t.masked(n);
             if !e.is_finite() {
                 continue;
             }
-            let rising = n == 0 || e > at(t.energy, n - 1);
-            let falling = n + 1 == t.energy.len() || e >= at(t.energy, n + 1);
-            if rising && falling {
-                maxima.push(Seed {
-                    block: t.block,
-                    frame: n,
-                    bin: t.bin[n] as usize,
-                    onset: n * t.hop,
-                    energy: e,
-                });
+            let rising = n == 0 || e > t.masked(n - 1);
+            let falling = n + 1 == t.energy.len() || e >= t.masked(n + 1);
+            if !(rising && falling) {
+                continue;
+            }
+            let seed = Seed {
+                block: t.block,
+                frame: n,
+                bin: t.bin[n] as usize,
+                onset: n * t.hop,
+                energy: e,
+            };
+            // The heap's root is the *weakest* retained seed, so a full heap admits a newcomer only
+            // by displacing it.
+            if heap.len() < cap {
+                heap.push(Weakest(seed));
+            } else if by_rank(&seed, &heap.peek().expect("cap > 0").0).is_lt() {
+                heap.pop();
+                heap.push(Weakest(seed));
             }
         }
     }
+    let saturated = heap.len() == cap;
 
-    maxima.sort_by(|a, b| {
-        b.energy
-            .total_cmp(&a.energy)
-            .then(a.block.cmp(&b.block))
-            .then(a.frame.cmp(&b.frame))
-    });
+    let mut maxima: Vec<Seed> = heap.into_iter().map(|w| w.0).collect();
+    maxima.sort_by(by_rank);
 
     let mut kept: Vec<Seed> = Vec::with_capacity(k);
     for s in maxima {
@@ -143,8 +189,39 @@ pub fn top_seeds(tables: &[FrameTable<'_>], k: usize) -> Vec<Seed> {
             kept.push(s);
         }
     }
-    kept
+    (kept, saturated)
 }
+
+/// The seed ordering: strongest first, ties to the lowest block then the lowest frame.
+///
+/// A strict total order over distinct `(block, frame)`, which is what lets the capped scan retain
+/// exactly the prefix an unbounded sort would.
+fn by_rank(a: &Seed, b: &Seed) -> Ordering {
+    b.energy
+        .total_cmp(&a.energy)
+        .then(a.block.cmp(&b.block))
+        .then(a.frame.cmp(&b.frame))
+}
+
+/// A `Seed` ordered so that [`BinaryHeap`]'s maximum is the *weakest* under [`by_rank`].
+struct Weakest(Seed);
+
+impl Ord for Weakest {
+    fn cmp(&self, other: &Self) -> Ordering {
+        by_rank(&other.0, &self.0)
+    }
+}
+impl PartialOrd for Weakest {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Weakest {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Weakest {}
 
 #[cfg(test)]
 mod tests {
@@ -152,7 +229,7 @@ mod tests {
 
     fn table<'a>(block: usize, energy: &'a [f64], bin: &'a [u32], hop: usize, support: usize)
     -> FrameTable<'a> {
-        FrameTable { block, energy, bin, hop, support_len: support }
+        FrameTable { block, energy, bin, dirty: None, hop, support_len: support }
     }
 
     /// The property that makes `candidate_count = 1` reproduce the old behaviour exactly.

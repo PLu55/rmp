@@ -203,44 +203,81 @@ pub fn read(path: &Path) -> Result<Book, String> {
 ///
 /// [`format_of`] is the single definition of those rules and this is the single user of it, so the
 /// standalone residual book written by `--residual-book` cannot drift from the main one.
+/// JSON goes straight to the file, one `serde` event at a time, so nothing whole is ever resident.
+/// It used to build the entire document as a `String` and then, for a gzipped path, a second full
+/// `Vec<u8>` of compressed bytes beside it. That is affordable for an atom list and is not for a
+/// residual book: 48 bands at 1 ms is 48000 floats per second of audio, and pretty-printed JSON
+/// spends ~25 bytes on each, so a few minutes of audio meant hundreds of megabytes of text held
+/// live purely to hand it to `write`.
+///
+/// TOML has no streaming serialiser, so it keeps the string path. That is a reason to prefer JSON
+/// for a residual book, not a reason to grow a second format: an atom list is small either way.
 pub fn write_doc<T: Serialize>(path: &Path, doc: &T) -> Result<(), String> {
     let (json, gzip) = format_of(path)?;
 
-    let text = if json {
-        serde_json::to_string_pretty(doc).map_err(|e| format!("serialising book: {e}"))?
-    } else {
-        toml::to_string_pretty(doc).map_err(|e| format!("serialising book: {e}"))?
-    };
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    let out = std::io::BufWriter::new(file);
 
-    let bytes = if gzip {
-        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
-        enc.write_all(text.as_bytes())
-            .and_then(|()| enc.finish())
-            .map_err(|e| format!("compressing book: {e}"))?
+    fn finish<W: Write>(mut w: W) -> Result<(), std::io::Error> {
+        w.flush()
+    }
+
+    let written = if json {
+        // The encoder owns the writer, so the two arms are separate types and the generic body is
+        // shared through `to_writer_pretty` rather than through a boxed trait object.
+        if gzip {
+            let mut enc = GzEncoder::new(out, Compression::best());
+            serde_json::to_writer_pretty(&mut enc, doc)
+                .map_err(|e| format!("serialising book: {e}"))?;
+            enc.finish().and_then(finish)
+        } else {
+            let mut w = out;
+            serde_json::to_writer_pretty(&mut w, doc)
+                .map_err(|e| format!("serialising book: {e}"))?;
+            finish(w)
+        }
     } else {
-        text.into_bytes()
+        let text = toml::to_string_pretty(doc).map_err(|e| format!("serialising book: {e}"))?;
+        if gzip {
+            let mut enc = GzEncoder::new(out, Compression::best());
+            enc.write_all(text.as_bytes())
+                .map_err(|e| format!("compressing book: {e}"))?;
+            enc.finish().and_then(finish)
+        } else {
+            let mut w = out;
+            w.write_all(text.as_bytes())
+                .map_err(|e| format!("writing {}: {e}", path.display()))?;
+            finish(w)
+        }
     };
-    std::fs::write(path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))
+    written.map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 /// Read any deserialisable document by the same extension rules [`write_doc`] uses.
+/// The mirror of [`write_doc`], and streaming for the same reason: JSON is parsed straight off the
+/// reader, so the file's bytes and its decompressed text are never both resident.
 pub fn read_doc<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     let (json, gzip) = format_of(path)?;
 
-    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let text = if gzip {
-        let mut out = String::new();
-        GzDecoder::new(&bytes[..])
-            .read_to_string(&mut out)
-            .map_err(|e| format!("decompressing {}: {e}", path.display()))?;
-        out
-    } else {
-        String::from_utf8(bytes).map_err(|e| format!("reading {}: {e}", path.display()))?
-    };
+    let file = std::fs::File::open(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let input = std::io::BufReader::new(file);
 
     if json {
-        serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))
+        if gzip {
+            serde_json::from_reader(std::io::BufReader::new(GzDecoder::new(input)))
+        } else {
+            serde_json::from_reader(input)
+        }
+        .map_err(|e| format!("parsing {}: {e}", path.display()))
     } else {
+        let mut text = String::new();
+        if gzip {
+            GzDecoder::new(input).read_to_string(&mut text)
+        } else {
+            std::io::BufReader::new(input).read_to_string(&mut text)
+        }
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
         toml::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))
     }
 }
