@@ -473,6 +473,19 @@ impl From<&ResidualPowerSettings> for ResidualPowerConfig {
 }
 
 impl Config {
+    /// Read a settings document from a file, or the defaults when there is no path.
+    ///
+    /// `None` is the defaults rather than an error because every front end treats a missing
+    /// settings file that way, and the errors name the path, which [`Config::from_toml`] cannot.
+    pub fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        Self::from_toml(&text).map_err(|e| format!("parsing {}: {e}", path.display()))
+    }
+
     /// Parse a settings document.
     ///
     /// A document written before `[dictionary]` held more than one family puts `alphas` directly

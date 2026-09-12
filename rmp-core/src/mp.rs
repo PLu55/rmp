@@ -313,6 +313,20 @@ impl<'a> Mp<'a> {
     }
 
     pub fn run(&mut self, cfg: &MpConfig) -> Book {
+        self.run_with(cfg, &|| false)
+    }
+
+    /// [`Mp::run`], interruptible.
+    ///
+    /// `cancel` is polled once per iteration, before any work is done for it, and a true answer
+    /// ends the pursuit and returns the book built so far. It must be **sticky** — once true it has
+    /// to stay true — because that is how the caller distinguishes a run that was cut short from
+    /// one that met `target_snr_db`: the book itself looks the same either way.
+    ///
+    /// Polling is per *iteration*, not per unit of time. A single iteration over a low-alpha
+    /// dictionary is hundreds of milliseconds, so this bounds the wait by one atom, not by
+    /// anything finer.
+    pub fn run_with(&mut self, cfg: &MpConfig, cancel: &dyn Fn() -> bool) -> Book {
         let mut book = Book::new(self.initial_energy, self.sample_rate);
         let mut stalls = 0usize;
 
@@ -322,6 +336,9 @@ impl<'a> Mp<'a> {
         // on this loop being counted, because each rejection demotes at least one frame to zero and
         // `max_stalls` bounds how many may pass without a selection.
         while book.len() < cfg.max_atoms {
+            if cancel() {
+                break;
+            }
             if snr_db(self.initial_core_energy, self.core_energy) >= cfg.target_snr_db {
                 break;
             }
@@ -879,7 +896,9 @@ pub struct WindowedRun {
 /// atom is subtracted exactly once and an atom the argmax wanted in the guard is simply deferred to
 /// the window that owns it.
 ///
-/// `progress` is called with `(window index, windows, atoms so far)` after each window.
+/// `progress` is called with `(window index, windows, atoms so far)` after each window. `cancel` is
+/// polled both between windows and inside each window's own pursuit — see [`Mp::run_with`] for what
+/// it has to promise.
 pub fn run_windowed(
     dict: &Dictionary,
     signal: &Signal,
@@ -887,13 +906,14 @@ pub fn run_windowed(
     cfg: &MpConfig,
     plan: &WindowPlan,
     progress: &mut dyn FnMut(usize, usize, usize),
+    cancel: &dyn Fn() -> bool,
 ) -> WindowedRun {
     if plan.count <= 1 {
         // The original path, untouched, so a signal that fits the budget is bit-identical.
         let t = std::time::Instant::now();
         let mut mp = Mp::new(dict, signal, planner);
         let init = t.elapsed();
-        let book = mp.run(cfg);
+        let book = mp.run_with(cfg, cancel);
         let (marked, resolved) = mp.lazy_stats();
         let per_block = mp.lazy_stats_per_block().to_vec();
         return WindowedRun { book, residual: mp.residual, marked, resolved, per_block, init };
@@ -913,6 +933,9 @@ pub fn run_windowed(
     let mut offset = 0usize;
     let mut w = 0usize;
     while offset < total {
+        if cancel() {
+            break;
+        }
         let core = plan.core_len.min(total - offset);
         let end = (offset + core + plan.guard_len).min(total);
         let window = Signal::new(residual[offset..end].to_vec(), sr);
@@ -924,7 +947,7 @@ pub fn run_windowed(
         let t = std::time::Instant::now();
         let mut mp = Mp::with_core(dict, &window, planner, core);
         init += t.elapsed();
-        let wbook = mp.run(&wcfg);
+        let wbook = mp.run_with(&wcfg, cancel);
 
         residual[offset..end].copy_from_slice(&mp.residual);
         let (m, r) = mp.lazy_stats();
@@ -1565,7 +1588,7 @@ mod tests {
 
     fn windowed(d: &Dictionary, sig: &Signal, cfg: &MpConfig, plan: &WindowPlan) -> WindowedRun {
         let mut planner = Planner::new();
-        run_windowed(d, sig, &mut planner, cfg, plan, &mut |_, _, _| {})
+        run_windowed(d, sig, &mut planner, cfg, plan, &mut |_, _, _| {}, &|| false)
     }
 
     /// The compatibility guarantee: a signal that fits the budget is not windowed, and the book is

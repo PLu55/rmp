@@ -36,6 +36,7 @@ pub use fof::{AtomParams, Envelope, EnvelopeParams, FofError, ReleasePolicy};
 pub use hrmp::{HrmpConfig, MagnitudePolicy, Outcome, Placement, ProbeMode, Verdict};
 pub use mp::{Mp, MpConfig};
 pub use naive::{NaiveConfig, NaiveMp};
+pub use pipeline::{Analysis, AnalysisRequest, Event, Refresh, Reporter, Timing, analyse, excerpt};
 pub use refine::{EnvelopeCache, RefineConfig, refine};
 pub use residual::{
     ResidualAnalysisConfig, ResidualAnalysisError, ResidualBook, ResidualPowerConfig,

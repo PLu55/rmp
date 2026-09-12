@@ -8,18 +8,16 @@
 //!
 //! Analysis only. Turning a book back into audio is `rmpsynth`'s job: `rmpsynth -b book -o out.wav`.
 
+mod report;
+
 use clap::Parser;
-use rmp_core::atom::AtomKind;
 use rmp_core::audio;
 use rmp_core::book;
 use rmp_core::config::Config;
-use rmp_core::dict::Dictionary;
 use rmp_core::fft::Planner;
-use rmp_core::mp::{self, MpConfig, WindowPlan};
-use rmp_core::signal::{db_fs, peak_of, rms_of, Signal};
+use rmp_core::pipeline;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -136,6 +134,10 @@ fn run(args: &Args) -> Result<(), String> {
 }
 
 /// Decompose a soundfile, and write whichever of the three outputs were asked for.
+///
+/// The decomposition itself is [`rmp_core::pipeline::analyse`]; what is left here is the command
+/// line's own business — merging the flags into the settings document, reading the file, deciding
+/// where each result goes, and printing progress through [`report::Cli`].
 fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     if args.book.is_none() && args.residual.is_none() && args.residual_book.is_none() {
         return Err(
@@ -148,7 +150,7 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     // Defaults < settings file < CLI, and only for the fields actually given on the command line.
     // There is one configuration path, not two: the flags edit the document and everything
     // downstream reads the merged result.
-    let mut config = load_config(args.config.as_deref())?;
+    let mut config = Config::load(args.config.as_deref())?;
     if let Some(enabled) = args.residual_enabled() {
         config.residual.enabled = enabled;
     }
@@ -168,35 +170,16 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     let whole = read.signal;
     let sr = whole.sample_rate;
     let whole_len = whole.len();
-    let (offset, signal) = excerpt(whole, args.start, args.duration)?;
+    let (offset, signal) = pipeline::excerpt(whole, args.start, args.duration)?;
     let duration = signal.len() as f32 / sr;
 
-    let say = |m: &str| {
-        if !args.quiet {
-            eprintln!("{m}");
-        }
+    let mut cli = report::Cli {
+        quiet: args.quiet,
+        sr,
+        mp_cfg: config.mp_config(),
+        max_memory_mb: config.pursuit.max_memory_mb,
     };
-    say(&format!(
-        "{}: {:.2} s, {} Hz, {} channel(s)",
-        input.display(),
-        whole_len as f32 / sr,
-        sr as u32,
-        channels
-    ));
-    if signal.len() != whole_len {
-        // Everything downstream — atom onsets in the book, the resynthesis, the residual — is
-        // relative to this excerpt, not to the file.
-        say(&format!(
-            "  analysing {:.3}-{:.3} s ({} samples from {})",
-            offset as f32 / sr,
-            (offset + signal.len()) as f32 / sr,
-            signal.len(),
-            offset
-        ));
-    }
-    if downmixed {
-        say("  downmixed to mono; out-of-phase content between channels partially cancels");
-    }
+    cli.input(input, whole_len, channels, downmixed, offset, signal.len());
     if signal.energy() <= 0.0 {
         return Err(if signal.len() == whole_len {
             "input is silent".into()
@@ -212,7 +195,7 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
         .residual_config(sr as f64)
         .map_err(|e| e.to_string())?;
     if residual_cfg.enabled && args.book.is_none() && args.residual_book.is_none() {
-        say(
+        cli.say(
             "  warning: residual analysis is enabled but neither --book nor --residual-book was \
              given, so there is nowhere to put it; skipping",
         );
@@ -220,320 +203,52 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     let run_residual =
         residual_cfg.enabled && (args.book.is_some() || args.residual_book.is_some());
 
-    // ── dictionary ──────────────────────────────────────────────────────────
-    // Built at the file's own sample rate: hop and bin spacing both depend on it.
-    let mut planner = Planner::new();
-    let t = Instant::now();
-    let dict = Dictionary::from_shapes(
-        &config.dictionary_shapes(),
-        sr,
-        &mut planner,
-        &config.block_config(),
-    )
-    .map_err(|e| format!("building dictionary: {e}"))?;
-    let kinds: Vec<(AtomKind, usize)> = AtomKind::ALL
-        .iter()
-        .map(|&k| (k, dict.blocks.iter().filter(|b| b.env.kind() == k).count()))
-        .filter(|&(_, n)| n > 0)
-        .collect();
-    say(&format!(
-        "dictionary: {} blocks ({}) in {:.2?}",
-        dict.blocks.len(),
-        kinds.iter().map(|(k, n)| format!("{n} {k}")).collect::<Vec<_>>().join(", "),
-        t.elapsed()
-    ));
-
-    let mp_cfg: MpConfig = config.mp_config();
-
-    // A block whose support exceeds `max_atom_samples` can never be refined: `refine` asks the
-    // envelope cache for the seed's own shape first, the cache refuses it as out of bounds, and
-    // refinement declines. The atom is still selected — it is simply pinned to the grid, at grid
-    // frequency, grid onset and grid envelope.
-    //
-    // Reported as a fact rather than a fault, because it cuts both ways. Leaving it unnoticed cost
-    // 13 dB of residual peak on a low-alpha dictionary; but capping *deliberately* below the
-    // longest block is also the best setting measured, since it stops refinement chasing
-    // seven-second atoms it cannot converge on in the rounds available. The `refined:` line below
-    // says what actually happened.
-    if mp_cfg.refine.enabled {
-        let stuck: Vec<&_> = dict
-            .blocks
-            .iter()
-            .filter(|b| b.support_len() > mp_cfg.refine.max_atom_samples)
-            .collect();
-        if !stuck.is_empty() {
-            let longest = stuck.iter().max_by_key(|b| b.support_len()).unwrap();
-            say(&format!(
-                "  note: {} of {} blocks are longer than refine.max_atom_samples ({}), so their \
-                 atoms stay on the grid unrefined; longest support {} samples ({})",
-                stuck.len(),
-                dict.blocks.len(),
-                mp_cfg.refine.max_atom_samples,
-                longest.support_len(),
-                longest.env.params.describe(),
-            ));
-        }
-    }
-
     // ── analyse ─────────────────────────────────────────────────────────────
-    // The frame tables scale with the signal at a per-sample cost the dictionary sets, so a clip
-    // long enough to exceed the budget is decomposed a window at a time. Under the budget this
-    // plans a single window and takes the original path, bit for bit.
-    let forced_core = (config.pursuit.window_seconds > 0.0)
-        .then_some((config.pursuit.window_seconds * sr) as usize);
-    let plan = WindowPlan::new(
-        &dict,
-        signal.len(),
-        &mp_cfg,
-        config.pursuit.max_memory_mb << 20,
-        forced_core,
-    );
-    if plan.count > 1 {
-        say(&format!(
-            "windows: {} x {:.2} s core + {:.2} s guard ({:.1} MiB of frame table each, {:.2} B/sample)",
-            plan.count,
-            plan.core_len as f32 / sr,
-            plan.guard_len as f32 / sr,
-            plan.window_bytes() / (1 << 20) as f64,
-            plan.bytes_per_sample,
-        ));
-        say(
-            "  selection is greedy within a window, not across the clip; target_snr_db, min_gain \
-             and max_atoms apply per window",
-        );
-        if plan.over_budget {
-            say(&format!(
-                "  note: a window cannot be shorter than four guards, so the core was raised to \
-                 {:.2} s past what max_memory_mb ({} MiB) or window_seconds asked for. Shorten \
-                 the longest atom -- a higher dictionary alpha, or a lower \
-                 refine.max_atom_samples -- to window more finely",
-                plan.core_len as f32 / sr,
-                config.pursuit.max_memory_mb
-            ));
-        }
-    }
+    let mut planner = Planner::new();
+    let mut result = pipeline::analyse(
+        pipeline::AnalysisRequest {
+            signal: &signal,
+            offset,
+            config: &config,
+            residual: run_residual.then_some(&residual_cfg),
+        },
+        &mut planner,
+        &mut cli,
+    )?;
 
-    let t = Instant::now();
-    let mut progress = |w: usize, of: usize, atoms: usize| {
-        if of > 1 {
-            say(&format!("  window {w}/{of}: {atoms} atoms so far"));
-        }
-    };
-    let run = mp::run_windowed(&dict, &signal, &mut planner, &mp_cfg, &plan, &mut progress);
-    let init = run.init;
-    let pursuit = t.elapsed().saturating_sub(init);
-    let mut book = run.book;
-    // Onsets are relative to the excerpt; this is what puts a rendered book back where it came from.
-    book.start_sample = offset as u64;
-
-    say(&format!(
-        "analysis: {} atoms, {:.1} dB in {:.2?} (init {:.2?}, {:.1}x realtime)",
-        book.len(),
-        book.snr_db(),
-        pursuit,
-        init,
-        (init + pursuit).as_secs_f32() / duration.max(1e-9)
-    ));
-    if !book.is_empty() && mp_cfg.refine.enabled {
-        let refined = book.selections.iter().filter(|s| s.refined).count();
-        say(&format!(
-            "  refined: {refined}/{} atoms moved off the grid ({:.0}%)",
-            book.len(),
-            100.0 * refined as f64 / book.len() as f64
-        ));
-    }
-    // Only worth a line when the dictionary offered a choice.
-    if kinds.len() > 1 && !book.is_empty() {
-        let per_kind: Vec<String> = kinds
-            .iter()
-            .map(|&(k, _)| {
-                let picked: Vec<_> = book.selections.iter().filter(|s| s.atom.kind() == k).collect();
-                let energy: f64 = picked.iter().map(|s| s.energy_removed).sum();
-                let total: f64 = book.selections.iter().map(|s| s.energy_removed).sum();
-                format!(
-                    "{} {k} ({:.0}% of the energy removed)",
-                    picked.len(),
-                    100.0 * energy / total.max(f64::MIN_POSITIVE)
-                )
-            })
-            .collect();
-        say(&format!("  kinds: {}", per_kind.join(", ")));
-    }
-    if book.is_empty() {
-        say("  warning: no atoms selected — check the dictionary covers the signal's content");
-    } else if book.snr_db() < mp_cfg.target_snr_db {
-        say(&format!(
-            "  stopped short of the {:.1} dB target (max_atoms = {})",
-            mp_cfg.target_snr_db, mp_cfg.max_atoms
-        ));
-    }
-
-    let (marked, resolved) = (run.marked, run.resolved);
-    if marked > 0 {
-        say(&format!(
-            "  refresh: {marked} frames bounded, {resolved} recomputed ({:.1}%)",
-            100.0 * resolved as f64 / marked as f64
-        ));
-        if std::env::var_os("RMP_REFRESH_DETAIL").is_some() {
-            for (bi, &(m, r)) in run.per_block.iter().enumerate() {
-                let b = &dict.blocks[bi];
-                say(&format!(
-                    "    block {bi:>2} {:<30} fft {:>7}: {m:>8} bounded {r:>8} recomputed ({:>5.1}%)  ~{:.0} Msamples",
-                    b.env.params.describe(), b.fft_len, 100.0 * r as f64 / m.max(1) as f64,
-                    (r * b.fft_len) as f64 / 1e6
-                ));
-            }
-        }
-    }
-
-    // The residual is the pursuit's own working buffer, so this is the level of what the
-    // decomposition could not explain.
-    //
-    // Reported relative to the input first, because that is the figure you act on — an absolute
-    // dBFS residual means nothing without knowing how loud the input was. The rms ratio is the
-    // negated SNR by construction; it is restated here so the two absolute levels beside it do not
-    // have to be subtracted by eye. The peak ratio is the one that carries new information: it is
-    // where the decomposition is worst rather than where it is on average.
-    let residual = &run.residual[..];
-    let (r_rms, r_peak) = (rms_of(residual), peak_of(residual) as f64);
-    let (s_rms, s_peak) = (signal.rms(), signal.peak() as f64);
-    say(&format!(
-        "residual: {:+.1} dB rms, {:+.1} dB peak relative to input",
-        db_fs(r_rms) - db_fs(s_rms),
-        db_fs(r_peak) - db_fs(s_peak),
-    ));
-    say(&format!(
-        "  absolute: {:.1} dBFS rms, {:.1} dBFS peak (input {:.1} dBFS rms, {:.1} dBFS peak)",
-        db_fs(r_rms),
-        db_fs(r_peak),
-        db_fs(s_rms),
-        db_fs(s_peak),
-    ));
-
-    // ── residual analysis ───────────────────────────────────────────────────
-    // Strictly after the pursuit, on the pursuit's own residual buffer. It cannot change which
-    // atoms were selected, and the book above is already final by the time this runs.
-    if run_residual {
-        let t = Instant::now();
-        let rb = rmp_core::residual::analyze_residual(residual, sr as f64, offset as u64, &residual_cfg)
-            .map_err(|e| format!("residual analysis: {e}"))?;
-        let elapsed = t.elapsed();
-
-        let taus = &rb.bank.power_detector.tau_seconds;
-        let (tau_lo, tau_hi) = (
-            taus.iter().cloned().fold(f64::INFINITY, f64::min) * 1e3,
-            taus.iter().cloned().fold(0.0, f64::max) * 1e3,
-        );
-        say(&format!(
-            "residual analysis: {} ERB bands, {:.1} .. {:.1} Hz, order {} gammatone, in {:.2?}",
-            rb.band_count, rb.bank.min_freq_hz, rb.bank.max_freq_hz, rb.bank.filter_order, elapsed
-        ));
-        say(&format!(
-            "  update: {} samples / {:.3} ms -> {} frames ({} values)",
-            rb.update_samples,
-            rb.update_samples as f64 * 1e3 / sr as f64,
-            rb.frame_count,
-            rb.power.len()
-        ));
-        say(&format!(
-            "  power:  {}, tau {tau_lo:.2} .. {tau_hi:.2} ms",
-            rb.bank.power_detector.mode
-        ));
-        if std::env::var_os("RMP_RESIDUAL_DETAIL").is_some() {
-            say("    band   center_hz  bandwidth_hz  tau_ms   norm_gain");
-            for (b, &tau) in taus.iter().enumerate() {
-                say(&format!(
-                    "    {b:>4}  {:>10.2}  {:>12.2}  {:>6.2}  {:>10.3e}",
-                    rb.bank.center_freq_hz[b],
-                    rb.bank.bandwidth_hz[b],
-                    tau * 1e3,
-                    rb.bank.normalization_gain[b],
-                ));
-            }
-        }
-
-        // Written on its own when asked for, and only then embedded — the power matrix is far
-        // larger than the atom list, and keeping both copies would double a file for nothing.
-        if let Some(path) = &args.residual_book {
-            book::write_doc(path, &rb)?;
-            say(&format!("wrote {}", path.display()));
-        } else {
-            book.residual = Some(rb);
-        }
+    cli.analysis(&result, duration);
+    cli.residual_levels(&result.residual, &signal);
+    if let Some(rb) = &result.residual_book {
+        cli.residual_analysis(rb, result.timing.residual, sr);
     }
 
     // ── write ───────────────────────────────────────────────────────────────
     if let Some(path) = &args.residual {
         // Taken from the pursuit rather than by subtracting the resynthesis, so it is exactly what
         // the algorithm could not explain.
-        audio::write_samples(path, residual, sr).map_err(|e| e.to_string())?;
-        say(&format!("wrote {}", path.display()));
+        audio::write_samples(path, &result.residual, sr).map_err(|e| e.to_string())?;
+        cli.say(&format!("wrote {}", path.display()));
+    }
+
+    // Written on its own when asked for, and only then embedded — the power matrix is far larger
+    // than the atom list, and keeping both copies would double a file for nothing.
+    if let Some(rb) = result.residual_book.take() {
+        match &args.residual_book {
+            Some(path) => {
+                book::write_doc(path, &rb)?;
+                cli.say(&format!("wrote {}", path.display()));
+            }
+            None => result.book.residual = Some(rb),
+        }
     }
 
     if let Some(path) = &args.book {
-        book::write(path, &book)?;
-        say(&format!("wrote {}", path.display()));
+        book::write(path, &result.book)?;
+        cli.say(&format!("wrote {}", path.display()));
     }
 
     Ok(())
 }
-
-/// Cut `[start, start + duration)` out of the signal, in seconds.
-///
-/// Returns the sample offset the excerpt begins at along with the excerpt itself. `None` for
-/// either bound means "the whole file" in that direction; the end is clamped to the file, so
-/// asking for more seconds than remain is not an error, but starting past the end is.
-fn excerpt(
-    signal: Signal,
-    start: Option<f32>,
-    duration: Option<f32>,
-) -> Result<(usize, Signal), String> {
-    if start.is_none() && duration.is_none() {
-        return Ok((0, signal));
-    }
-    let sr = signal.sample_rate;
-
-    let start = start.unwrap_or(0.0);
-    if !(start.is_finite() && start >= 0.0) {
-        return Err(format!("--start must be a non-negative number of seconds, got {start}"));
-    }
-    let begin = (start as f64 * sr as f64).round() as usize;
-    if begin >= signal.len() {
-        return Err(format!(
-            "--start {start} s is at or past the end of the {:.3} s input",
-            signal.len() as f32 / sr
-        ));
-    }
-
-    let end = match duration {
-        None => signal.len(),
-        Some(d) => {
-            if !(d.is_finite() && d > 0.0) {
-                return Err(format!("--duration must be a positive number of seconds, got {d}"));
-            }
-            let n = (d as f64 * sr as f64).round() as usize;
-            if n == 0 {
-                return Err(format!(
-                    "--duration {d} s is under one sample at {} Hz",
-                    sr as u32
-                ));
-            }
-            signal.len().min(begin + n)
-        }
-    };
-
-    Ok((begin, Signal::new(signal.samples[begin..end].to_vec(), sr)))
-}
-
-fn load_config(path: Option<&Path>) -> Result<Config, String> {
-    let Some(path) = path else {
-        return Ok(Config::default());
-    };
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("reading {}: {e}", path.display()))?;
-    Config::from_toml(&text).map_err(|e| format!("parsing {}: {e}", path.display()))
-}
-
 const DEFAULT_CONFIG_HEADER: &str = "\
 # rmp analysis settings.
 #
@@ -737,46 +452,3 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #   tau_max_ms    what bounds how long a transient can smear.
 
 ";
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ramp(n: usize) -> Signal {
-        Signal::new((0..n).map(|i| i as f32).collect(), 1000.0)
-    }
-
-    #[test]
-    fn no_bounds_returns_the_whole_signal() {
-        let (off, got) = excerpt(ramp(500), None, None).unwrap();
-        assert_eq!((off, got.len()), (0, 500));
-    }
-
-    #[test]
-    fn start_and_duration_cut_a_window() {
-        let (off, got) = excerpt(ramp(500), Some(0.1), Some(0.2)).unwrap();
-        assert_eq!((off, got.len()), (100, 200));
-        assert_eq!(got.samples[0], 100.0);
-    }
-
-    #[test]
-    fn duration_is_clamped_to_the_end_of_the_file() {
-        let (off, got) = excerpt(ramp(500), Some(0.4), Some(9.0)).unwrap();
-        assert_eq!((off, got.len()), (400, 100));
-    }
-
-    #[test]
-    fn start_alone_runs_to_the_end() {
-        let (off, got) = excerpt(ramp(500), Some(0.25), None).unwrap();
-        assert_eq!((off, got.len()), (250, 250));
-    }
-
-    #[test]
-    fn out_of_range_or_negative_bounds_are_errors() {
-        assert!(excerpt(ramp(500), Some(0.5), None).is_err());
-        assert!(excerpt(ramp(500), Some(-0.1), None).is_err());
-        assert!(excerpt(ramp(500), None, Some(0.0)).is_err());
-        // Rounds to zero samples at 1 kHz.
-        assert!(excerpt(ramp(500), None, Some(1e-4)).is_err());
-    }
-}
