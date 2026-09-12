@@ -17,10 +17,12 @@ of a book, atoms and stochastic residual alike, is `rmpsynth`'s.
 ## Commands
 
 ```bash
+# a virtual workspace: these still act on all four crates from the root
 cargo build --release
 cargo test
 cargo test <test_name>                       # single test
 cargo clippy --all-targets
+cargo build --release -p rmp-core            # one crate
 
 # analysis: rmp writes a book, and never audio other than the residual
 ./target/release/rmp in.wav -b book.json.gz [-c settings.toml] [-r residual.wav]
@@ -48,12 +50,15 @@ RMP_RESIDUAL_DETAIL=1 ./target/release/rmp in.wav --residual-book bank.json.gz
 ./target/release/rmpstat snr     book.json -f svg -o snr.svg
 ./target/release/rmpstat wv      book.json -f png -o wv.png --log-freq --floor 65
 
-# end-to-end measurement against synthetic ground truth
-cargo run --release --example analyze [seconds] [max_atoms] [grains_per_sec] [candidates]
+# the graphical front end (a scaffold)
+cargo run --release -p rmp-gui
 
-cargo bench --bench fft                      # FFTW planning = MEASURE (default)
-cargo bench --bench pursuit                  # per-stage cost of one decomposition
-FFTW_PLAN=patient cargo bench --bench fft
+# end-to-end measurement against synthetic ground truth
+cargo run --release -p rmp-cli --example analyze [seconds] [max_atoms] [grains_per_sec] [candidates]
+
+cargo bench -p rmp-core --bench fft          # FFTW planning = MEASURE (default)
+cargo bench -p rmp-core --bench pursuit      # per-stage cost of one decomposition
+FFTW_PLAN=patient cargo bench -p rmp-core --bench fft
 ```
 
 Benchmarks use criterion with `harness = false`, matching rfofs's convention.
@@ -64,8 +69,44 @@ right place for why the code is shaped as it is. Settings guidance added here sh
 
 ## Architecture
 
+### Crate layout
+
+A four-crate workspace. The dependency direction is the boundary the split exists to enforce, and
+it points one way only:
+
+```
+rmp-cli  ─┐
+          ├─→  rmp-synthesis  ─→  rmp-core
+rmp-gui  ─┘                          ↑
+                                     └── (rmp-cli and rmp-gui also depend on it directly)
+```
+
+- **`rmp-core`** — all analysis, and everything both front ends need: the atoms, the dictionary, the
+  pursuit, the book format, the settings document, the statistics, the time-frequency map, the ERB
+  residual analysis, and libsndfile I/O. No clap, no plotters, no synthesis.
+- **`rmp-synthesis`** — turning a book back into audio. Was `src/synth/`.
+- **`rmp-cli`** — the three binaries, and the only crate that knows about clap or plotters.
+- **`rmp-gui`** — an eframe front end. A scaffold; see its own module docs.
+
+**Nothing points back up, and one test had to move to keep it that way.** `mp`'s HRMP gap fixture
+measures the energy a book puts into a silent gap, which means rendering the book. A dev-dependency
+from `rmp-core` onto `rmp-synthesis` *compiles* — cargo permits cycles through dev-dependencies —
+but the types do not unify across one: the `rmp_core` linked into a lib-test target is a different
+compilation unit from the one `rmp-synthesis` was built against, so a `Book` made by the test is not
+the `Book` `render_atoms` accepts. The fixture is now `rmp-synthesis/tests/hrmp_gap.rs`. Do not
+reintroduce the dev-dependency to move it back.
+
+`residual::pseudo_noise` is public for the same reason: the residual synthesis tests in the other
+crate compare against that exact stream, and two copies of a fixture whose values matter is the
+drift this codebase avoids everywhere else.
+
+Versions live in `[workspace.dependencies]` at the root; members write `dep.workspace = true`. Path
+dependencies there resolve against the *workspace root*, which is why rfofs is still `../rfofs`.
+
+### Modules
+
 The pipeline is: dictionary → correlate every frame → pick the best atom → subtract → repeat. The
-parts that need reading together:
+parts that need reading together, all in `rmp-core` unless said otherwise:
 
 - **`atom`** — `Shape` (`Fof | Gaussian`), `AtomParams` and the rendered `Envelope`, dispatching to
   the two kinds. Everything downstream of it works from a rendered envelope and never asks which
@@ -95,15 +136,22 @@ parts that need reading together:
 - **`tfmap`** — the atom-based pseudo-Wigner time-frequency map (spec §21), as diagnostics only.
 - **`residual`** — stochastic analysis of the final residue: an ERB gammatone bank, one-pole band
   power, and a fixed-rate `ResidualBook`. A post-processing stage; it cannot touch the pursuit.
-- **`synth`** — all synthesis. `synth::atoms` renders a book's atoms through the same per-atom
+- **`pipeline`** — one analysis end to end: build the dictionary, plan the windows, run the
+  pursuit, analyse the residue. It computes and reports facts and formats nothing, which is what
+  lets the CLI and the GUI drive the same code without one of them dictating how the other reads.
+- **`config` / `audio`** — TOML settings, libsndfile I/O.
+- **`rmp-synthesis`** — all synthesis. `atoms` renders a book's atoms through the same per-atom
   render the pursuit subtracted; the rest is the inverse of `residual`: a power-complementary ERB
-  bank driven by independent per-band noise at `sqrt(P_b)`, reusing `residual::filter` outright.
-  `synth::render` mixes the two on one timeline.
-- **`config` / `audio` / `main`** — TOML settings, libsndfile I/O, the analysis CLI.
-- **`bin/rmpsynth`** — the synthesis CLI. A file and configuration front end over `synth`; no DSP
-  lives in it.
-- **`bin/rmpstat`** — the statistics CLI: clap, `plotters`, and text tables. A thin shell, so
-  everything worth an oracle lives in `stats`/`tfmap` where `cargo test` reaches it.
+  bank driven by independent per-band noise at `sqrt(P_b)`, reusing `rmp_core::residual::filter`
+  outright. `render` mixes the two on one timeline.
+- **`rmp-cli/src/bin/rmp`** — the analysis CLI. Flag merging, file I/O and `report.rs`, which holds
+  every line it prints and nothing else.
+- **`rmp-cli/src/bin/rmpsynth`** — the synthesis CLI. A file and configuration front end over
+  `rmp-synthesis`; no DSP lives in it.
+- **`rmp-cli/src/bin/rmpstat`** — the statistics CLI: clap, `plotters`, and text tables. A thin
+  shell, so everything worth an oracle lives in `stats`/`tfmap` where `cargo test` reaches it.
+- **`rmp-gui`** — the eframe front end. `task` runs a decomposition off the UI thread; everything
+  else is a stub naming the `rmp-core` call it is a view of.
 
 ### Invariants that are not locally obvious
 
@@ -197,14 +245,39 @@ separating.
 `--book` read rather than written when no soundfile was given. Both are gone: `--book` is always an
 output, and a hidden `-o` survives only to point a stale command line at `rmpsynth`. Analysis needs
 at least one of `--book`, `--residual`, `--residual-book`. The pursuit still renders every atom it
-subtracts — that is analysis, not synthesis — and `synth::atoms` renders a book through exactly that
-call, so the two cannot drift.
+subtracts — that is analysis, not synthesis — and `rmp_synthesis::atoms` renders a book through
+exactly that call, so the two cannot drift.
 
-**A synthesised book is longer than the excerpt it came from.** `synth::atoms::natural_len` sizes the
-output by rendering each atom's envelope and taking the furthest death, where analysis sized the
-residual by the input. The atom tails the analysis truncated at the excerpt end are audible again —
-2.9% of the excerpt's energy on a 0.15 s piano fixture. Over the excerpt itself the two renders are
-bit-identical, so this is a longer file, not a different one.
+**The pipeline reports facts; the front end formats them.** `pipeline::analyse` is what the `rmp`
+binary's `analyse` used to be, with every `eprintln!` taken out of it, and it is the reason a GUI
+cannot decompose the same input differently from the command line. Two consequences are worth
+keeping:
+
+- **The `Event` stream carries only what happens while work is in progress** — the dictionary, the
+  window plan, a finished window. Everything a front end reports at the *end* (atom counts, SNR,
+  how many atoms refined, the residual's level, the refresh counters) is a field of `Analysis` or
+  is derived from the book, so it needs no event and can be presented in any order. Adding an
+  event for something already on `Analysis` is how the two halves start disagreeing about when it
+  is true.
+- **Nothing in `pipeline` opens a file.** Reading the soundfile, cutting the excerpt out of it and
+  deciding where each result goes are the caller's, which is what leaves a front end free to
+  analyse a buffer it never read from disk. `Analysis` therefore returns the `ResidualBook` beside
+  the `Book` rather than embedded in it; whether the two share a file is `rmp`'s decision, not the
+  pipeline's.
+
+**Cancellation is sticky, and that is load-bearing.** `Reporter::cancelled` is polled once per
+selected atom by `Mp::run_with` and once per window by `run_windowed`, and `Analysis::cancelled` is
+decided by asking *again* after the run returns — because the book of an interrupted pursuit is a
+perfectly ordinary book and nothing in it says it stopped early. A flag that could go back to false
+would report a completed run. `Mp::run` delegates to `run_with` with a constant false, so every
+existing call site, bench and bit-identity gate is untouched.
+
+**A synthesised book is longer than the excerpt it came from.**
+`rmp_synthesis::atoms::natural_len` sizes the output by rendering each atom's envelope and taking
+the furthest death, where analysis sized the residual by the input. The atom tails the analysis
+truncated at the excerpt end are audible again — 2.9% of the excerpt's energy on a 0.15 s piano
+fixture. Over the excerpt itself the two renders are bit-identical, so this is a longer file, not a
+different one.
 
 **A book records where its excerpt began.** `Book::start_sample` is skipped when zero, so a book
 analysed from the start of its file is byte-identical to one written before the field existed. The
@@ -345,9 +418,9 @@ against the input at 35.01 dB, the reported SNR.
 **Not `rfofs::OfflineRenderer`.** It renders in engine blocks, and a FOF's `decay_acc` is a running
 product across `fill_block` calls, so a block-split grain is not bit-identical to the single-call
 render the pursuit subtracted. It also writes a float WAV directly — nothing can be mixed in — needs
-monotonic non-negative onsets, and stops at a 30 s safety limit. `synth::atoms` uses `FofState` per
-atom through `AtomParams::render`, and the gate is exact: the pre-change `rmp -o` piano render and
-`rmpsynth -b` of the same book agree sample for sample over the excerpt.
+monotonic non-negative onsets, and stops at a 30 s safety limit. `rmp_synthesis::atoms` uses
+`FofState` per atom through `AtomParams::render`, and the gate is exact: the pre-change `rmp -o`
+piano render and `rmpsynth -b` of the same book agree sample for sample over the excerpt.
 
 **Atoms and residual share one timeline.** Both are placed at the excerpt's source sample, or both at
 zero with `--trim-to-excerpt`, and whichever ends later sets the length. The mix is `(atoms +
@@ -583,7 +656,7 @@ over the same run): the strongest seed is also the seed that refines best. It st
 because HRMP can *reject* a candidate rather than merely outscore it, and the loop then needs
 somewhere to fall through to.
 
-`cargo bench --bench pursuit` splits one decomposition by stage. At 0.25 s of off-grid audio, each
+`cargo bench -p rmp-core --bench pursuit` splits one decomposition by stage. At 0.25 s of off-grid audio, each
 arm including its own `init` of 2.94 ms:
 
 | arm | atoms | total | per atom |
@@ -740,18 +813,26 @@ all but one atom of the 3000; the three energies are f64 for what is only ever p
 `fade_level`/`fade_dur` are config constants re-encoded per atom (1 and 7 distinct values in 3000).
 Splitting the replay stream from the diagnostics is where the remaining 22× is, not the encoding.
 
-## Build configuration — three things that will bite
+## Build configuration — four things that will bite
 
-**`src/main.rs` must contain a `main`.** An empty file fails the whole build with `E0601`, including
-bench targets, which makes `cargo bench` look broken for an unrelated reason.
+**The root manifest is virtual: it has a `[workspace]` and no `[package]`.** `cargo build`, `cargo
+test` and `cargo clippy --all-targets` from the root act on all four members, so the everyday
+commands are unchanged; anything that names a *target* needs the crate that owns it
+(`-p rmp-core --bench pursuit`, `-p rmp-cli --example analyze`).
 
-**Adding `src/bin/rmpstat/` and `src/bin/rmpsynth/` needed no `[[bin]]` section.** Cargo
-auto-discovers `src/main.rs` and `src/bin/*` together, so `rmp` is unaffected.
+**None of the three binaries needs a `[[bin]]` section.** Cargo auto-discovers `src/bin/<name>/`
+directories, so `rmp`, `rmpstat` and `rmpsynth` are all found by their directory names.
+
+**`cargo test` runs each crate with its own package root as the working directory, and
+`CARGO_MANIFEST_DIR` one level below the workspace root.** The `data/` fixtures are at the root, so
+the paths that reach them are `include_str!("../../data/config/...")` in `config.rs` and
+`env!("CARGO_MANIFEST_DIR")` + `"../data/books/book1.json"` in `tfmap.rs`. A new fixture path has to
+account for the same step.
 
 **`fftw` must keep `features = ["system"]`.** The crate's default `source` feature vendors FFTW 3.3.8
 with no SIMD flags at all — the generated `config.h` has `HAVE_AVX`, `HAVE_AVX2`, `HAVE_SSE2` all
 `#undef`, producing scalar code ~3× slower. Requires `libfftw3-dev`. Note the **engine uses realfft
-only**; `fftw` exists solely for `benches/fft.rs`.
+only**; `fftw` exists solely for `rmp-core/benches/fft.rs`.
 
 **`.cargo/config.toml` sets `-C target-cpu=native`.** rfofs sets the same flag, and it does *not*
 propagate across a path dependency. rfofs's `wide::f32x8` SIMD width decides which sine approximation
@@ -759,7 +840,8 @@ each sample gets (degree-9 polynomial for full lanes, LUT for the scalar tail), 
 changes atom values between the crates. An explicit `RUSTFLAGS` env var overrides `build.rustflags`
 rather than merging — don't set both.
 
-`rustfft` is deliberately commented out in `Cargo.toml`; it still arrives transitively via `realfft`.
+`rustfft` is deliberately absent from `[workspace.dependencies]`; it still arrives transitively via
+`realfft`.
 
 ## Comparing two decompositions
 
@@ -769,8 +851,8 @@ file reports a difference and reads as nondeterminism. Compare the book, or the 
 
 ## The FFT benchmark
 
-`benches/fft.rs` compares realfft against FFTW at 1024–32768, the range FOF supports land in
-(`support ≈ 6.9·sr/alpha`).
+`rmp-core/benches/fft.rs` compares realfft against FFTW at 1024–32768, the range FOF supports land
+in (`support ≈ 6.9·sr/alpha`).
 
 - `FFTW_PLAN` selects `measure` (default) or `patient`; an unrecognized value panics. The mode is in
   the benchmark id so criterion keeps separate baselines.
