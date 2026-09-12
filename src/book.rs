@@ -1,9 +1,10 @@
 //! The decomposition result.
 //!
 //! A [`Book`] is the output of a pursuit: the atoms selected, in order, with enough provenance to
-//! diagnose a bad decomposition and enough parameters to replay it through rfofs.
+//! diagnose a bad decomposition and enough parameters to replay it. Replaying is `rmpsynth`'s job,
+//! through [`crate::synth::atoms`].
 
-use crate::fof::{AtomParams, Envelope, FofError};
+use crate::fof::AtomParams;
 use crate::residual::ResidualBook;
 use crate::signal::snr_db;
 use serde::Serialize;
@@ -47,6 +48,13 @@ pub struct Book {
     pub selections: Vec<Selection>,
     pub initial_energy: f64,
     pub sample_rate: f32,
+    /// Where the analysed excerpt began in the source file, in samples. Atom onsets are relative to
+    /// it, so this is what puts a rendered book back on the source timeline beside its residual.
+    ///
+    /// Skipped when zero, so a book analysed from the start of its file is byte-identical to one
+    /// written before the field existed, and such an old book reads back as starting at zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub start_sample: u64,
     /// Stochastic analysis of the final residue, when `[residual]` was enabled.
     ///
     /// A section of its own rather than anything mixed into `selections`: atoms are sparse
@@ -57,12 +65,17 @@ pub struct Book {
     pub residual: Option<ResidualBook>,
 }
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 impl Book {
     pub fn new(initial_energy: f64, sample_rate: f32) -> Self {
         Self {
             selections: Vec::new(),
             initial_energy,
             sample_rate,
+            start_sample: 0,
             residual: None,
         }
     }
@@ -102,36 +115,14 @@ impl Book {
             .map(|i| i + 1)
     }
 
-    /// Render the book back to a signal — the analysis inverted.
+    /// Replayable parameters for the FOF atoms, for rendering through rfofs.
     ///
-    /// Uses the same rfofs path the pursuit subtracted with, so a book that reached N dB against
-    /// its input reproduces that input to N dB here.
-    pub fn resynthesize(&self, len: usize) -> Result<crate::signal::Signal, crate::fof::FofError> {
-        let atoms: Vec<AtomParams> = self.selections.iter().map(|s| s.atom).collect();
-        crate::signal::Signal::from_atoms(&atoms, len, self.sample_rate)
-    }
-
-    /// Samples this book occupies, from the analysis origin to the death of the last atom.
-    ///
-    /// This is what [`resynthesize`](Self::resynthesize) needs when there is no input signal to
-    /// take the length from. Atoms with a negative `t0` began before the analysed excerpt and are
-    /// clipped at the origin here exactly as `resynthesize` clips them, so a book replays in the
-    /// same frame it was analysed in. Support lengths come from rendering, never from a formula —
-    /// the same rule the rest of the crate follows.
-    pub fn natural_len(&self) -> Result<usize, FofError> {
-        let mut len = 0i64;
-        for s in &self.selections {
-            let env = Envelope::render(s.atom.env, self.sample_rate)?;
-            len = len.max(s.atom.t0 + env.support_len() as i64);
-        }
-        Ok(len.max(0) as usize)
-    }
-
-    /// Replayable parameters, for rendering through rfofs.
+    /// Gaussian atoms have no rfofs representation and are left out, so on a mixed book this is
+    /// shorter than [`Book::len`]; `rmpsynth` renders every kind.
     pub fn to_fof_params(&self, origin: u64) -> Vec<FofParams> {
         self.selections
             .iter()
-            .map(|s| s.atom.to_fof_params(origin))
+            .filter_map(|s| s.atom.to_fof_params(origin))
             .collect()
     }
 
@@ -292,7 +283,7 @@ mod tests {
             atom: AtomParams {
                 t0: 0,
                 f: 1000.0,
-                env: EnvelopeParams::new(251.0, 0.001),
+                env: EnvelopeParams::new(251.0, 0.001).into(),
                 phi: 0.0,
                 amp: 1.0,
             },
@@ -374,40 +365,41 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `natural_len` has to cover every atom's whole life and no more: rendering into a longer
-    /// buffer must add nothing past it, and the samples just inside it must still be live.
-    ///
-    /// Also the reason a negative `t0` cannot extend it — `resynthesize` clips such an atom at the
-    /// origin, so counting its pre-origin part would pad the output with silence the book does not
-    /// contain.
+    /// The excerpt origin is on disk only when it is not zero, and it survives every format.
     #[test]
-    fn natural_len_is_exactly_where_the_last_atom_dies() {
-        let at = |t0: i64| Selection {
-            atom: AtomParams {
-                t0,
-                ..sel(0, 0.5).atom
-            },
-            ..sel(0, 0.5)
-        };
+    fn start_sample_is_written_only_when_the_excerpt_did_not_start_at_zero() {
+        let mut book = Book::new(1.0, 48_000.0);
+        book.selections.push(sel(0, 0.5));
+        assert!(!serde_json::to_string(&book).unwrap().contains("start_sample"));
+        assert!(!toml::to_string(&book).unwrap().contains("start_sample"));
 
-        let mut b = Book::new(1.0, 48_000.0);
-        assert_eq!(b.natural_len().unwrap(), 0, "an empty book occupies nothing");
+        book.start_sample = 120_000;
+        let text = serde_json::to_string(&book).unwrap();
+        assert!(text.contains("\"start_sample\":120000"), "{text}");
+        assert_eq!(serde_json::from_str::<Book>(&text).unwrap(), book);
+        let doc = toml::to_string(&book).unwrap();
+        assert_eq!(toml::from_str::<Book>(&doc).unwrap(), book);
+    }
 
-        let support = Envelope::render(at(0).atom.env, b.sample_rate).unwrap().support_len();
-        b.selections.push(at(-(support as i64) - 10));
-        assert_eq!(b.natural_len().unwrap(), 0, "an atom entirely before the origin is clipped");
+    /// A book holding both kinds of atom round-trips in every format, and its FOF half still
+    /// converts to rfofs parameters.
+    #[test]
+    fn a_mixed_book_round_trips_and_exports_only_its_fofs() {
+        let dir = std::env::temp_dir().join(format!("rmp-book-mixed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut book = Book::new(1.0, 48_000.0);
+        book.selections.push(sel(0, 0.5));
+        let mut g = sel(1, 0.25);
+        g.atom.env = crate::gauss::GaussianParams { sigma: 0.0071, cutoff_level: 0.001 }.into();
+        book.selections.push(g);
 
-        b.selections.push(at(-200));
-        assert_eq!(b.natural_len().unwrap(), support - 200);
-
-        b.selections.push(at(5_000));
-        let len = b.natural_len().unwrap();
-        assert_eq!(len, support + 5_000);
-
-        // Rendered with room to spare, the book is silent past its own length and audible inside.
-        let s = b.resynthesize(len + 4_096).unwrap();
-        assert!(s.samples[len..].iter().all(|&v| v == 0.0), "energy past natural_len");
-        assert!(s.samples[len - 64..len].iter().any(|&v| v != 0.0), "dead before natural_len");
+        for name in ["m.json", "m.json.gz", "m.toml"] {
+            let path = dir.join(name);
+            write(&path, &book).unwrap();
+            assert_eq!(read(&path).unwrap(), book, "{name}");
+        }
+        assert_eq!(book.to_fof_params(0).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A book written before `hr_score` and `refined` existed still reads.
@@ -422,6 +414,8 @@ mod tests {
         assert_eq!(b.selections[0].hr_score, None);
         assert!(!b.selections[0].refined);
         assert_eq!(b.residual, None);
+        assert_eq!(b.start_sample, 0);
+        assert_eq!(b.selections[0].atom.env.as_fof().unwrap().alpha, 251.0);
     }
 
     /// §29.11: with residual analysis off, the book on disk is exactly what it was before the

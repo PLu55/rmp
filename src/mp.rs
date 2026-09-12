@@ -1003,9 +1003,11 @@ fn scan_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atom::Shape;
     use crate::dict::BlockConfig;
     use crate::fft::Planner;
     use crate::fof::{AtomParams, EnvelopeParams};
+    use crate::gauss::GaussianParams;
     use crate::hrmp::HrmpConfig;
     use crate::refine::RefineConfig;
     use crate::naive::{NaiveConfig, NaiveMp};
@@ -1021,6 +1023,17 @@ mod tests {
         };
         Dictionary::from_grid(&[(2147.0, 0.0003), (1342.0, 0.0003)], SR, &mut planner, &cfg)
             .unwrap()
+    }
+
+    /// One short FOF block and one short Gaussian block, so the gates that run on `tiny_dict` also
+    /// run across kinds: cross-block ranking, the stale range and the lazy bound all have to hold
+    /// when the blocks' envelopes are shaped nothing alike.
+    fn mixed_dict() -> Dictionary {
+        let mut planner = Planner::new();
+        let cfg = BlockConfig { f_min: 500.0, f_max: 6000.0, ..BlockConfig::default() };
+        let shapes: Vec<Shape> =
+            vec![EnvelopeParams::new(2147.0, 0.0003).into(), GaussianParams::new(0.0004).into()];
+        Dictionary::from_shapes(&shapes, SR, &mut planner, &cfg).unwrap()
     }
 
     fn noise(n: usize, seed: u64) -> Signal {
@@ -1157,7 +1170,7 @@ mod tests {
 
         let mut sig = Signal::silence(long_support + 8_000, SR);
         for t0 in [t1, t2] {
-            let a = AtomParams { t0, f, env: short, phi: 0.4, amp: 1.0 };
+            let a = AtomParams { t0, f, env: short.into(), phi: 0.4, amp: 1.0 };
             crate::signal::add_at(&mut sig.samples, &a.render(SR).unwrap(), t0);
         }
 
@@ -1186,7 +1199,7 @@ mod tests {
         assert!(!plain.is_empty(), "plain MP selected nothing");
 
         let gap_energy = |b: &Book| {
-            b.resynthesize(sig.len())
+            crate::synth::atoms::render_atoms(b, sig.len())
                 .map(|r| crate::signal::energy_of(&r.samples[gap.clone()]))
                 .unwrap_or(f64::INFINITY)
         };
@@ -1242,37 +1255,42 @@ mod tests {
     /// trusting the algebra — the f32 transform is where it would quietly fail.
     #[test]
     fn lazy_bounds_never_undercut_the_exact_value() {
-        let d = tiny_dict();
-        let sig = noise(600, 0x1eaf_1eaf_1eaf_1eaf);
-        let mut planner = Planner::new();
-        let mut mp = Mp::new(&d, &sig, &mut planner);
-        let one = MpConfig { max_atoms: 1, target_snr_db: f32::INFINITY, ..Default::default() };
+        for (name, d) in [("fof", tiny_dict()), ("mixed", mixed_dict())] {
+            let sig = noise(600, 0x1eaf_1eaf_1eaf_1eaf);
+            let mut planner = Planner::new();
+            let mut mp = Mp::new(&d, &sig, &mut planner);
+            let one = MpConfig { max_atoms: 1, target_snr_db: f32::INFINITY, ..Default::default() };
 
-        let mut checked = 0usize;
-        for step in 0..12 {
-            let book = mp.run(&one);
-            assert_eq!(book.len(), 1, "step {step}: pursuit stopped early");
-            for bi in 0..d.blocks.len() {
-                let block = &d.blocks[bi];
-                let mut corr = Correlator::new(block, &mut planner);
-                for n in 0..mp.states[bi].energy.len() {
-                    if !mp.states[bi].dirty[n] {
-                        continue;
+            let mut checked = 0usize;
+            for step in 0..12 {
+                let book = mp.run(&one);
+                assert_eq!(book.len(), 1, "{name} step {step}: pursuit stopped early");
+                for bi in 0..d.blocks.len() {
+                    let block = &d.blocks[bi];
+                    let mut corr = Correlator::new(block, &mut planner);
+                    for n in 0..mp.states[bi].energy.len() {
+                        if !mp.states[bi].dirty[n] {
+                            continue;
+                        }
+                        let (_, p) =
+                            scan_frame(&mut corr, block, &mp.residual, block.frame_onset(n));
+                        assert!(
+                            p.energy <= mp.states[bi].energy[n],
+                            "{name} step {step} block {bi} frame {n}: exact {} above bound {}",
+                            p.energy,
+                            mp.states[bi].energy[n]
+                        );
+                        checked += 1;
                     }
-                    let (_, p) = scan_frame(&mut corr, block, &mp.residual, block.frame_onset(n));
-                    assert!(
-                        p.energy <= mp.states[bi].energy[n],
-                        "step {step} block {bi} frame {n}: exact {} above bound {}",
-                        p.energy,
-                        mp.states[bi].energy[n]
-                    );
-                    checked += 1;
                 }
             }
+            assert!(checked > 100, "{name}: only {checked} bounds were ever checked");
+            let (marked, resolved) = mp.lazy_stats();
+            assert!(
+                resolved < marked,
+                "{name}: lazy update resolved every frame it bounded: {resolved}/{marked}"
+            );
         }
-        assert!(checked > 100, "only {checked} bounds were ever checked");
-        let (marked, resolved) = mp.lazy_stats();
-        assert!(resolved < marked, "lazy update resolved every frame it bounded: {resolved}/{marked}");
     }
 
     /// A rejected candidate must send the loop elsewhere, not stop it and not spin it.
@@ -1346,41 +1364,46 @@ mod tests {
     /// would ever have been selected.
     #[test]
     fn stale_set_leaves_every_frame_table_identical_to_full_recompute() {
-        let d = tiny_dict();
-        let sig = noise(600, 0x0fed_cba9_8765_4321);
-        let mut planner = Planner::new();
-        let mut fast = Mp::new(&d, &sig, &mut planner);
-        let mut slow = Mp::new(&d, &sig, &mut planner);
+        for (name, d) in [("fof", tiny_dict()), ("mixed", mixed_dict())] {
+            let sig = noise(600, 0x0fed_cba9_8765_4321);
+            let mut planner = Planner::new();
+            let mut fast = Mp::new(&d, &sig, &mut planner);
+            let mut slow = Mp::new(&d, &sig, &mut planner);
 
-        let one = MpConfig {
-            max_atoms: 1,
-            target_snr_db: f32::INFINITY,
-            ..Default::default()
-        };
-        let one_full = MpConfig {
-            full_update: true,
-            ..one
-        };
+            let one = MpConfig {
+                max_atoms: 1,
+                target_snr_db: f32::INFINITY,
+                ..Default::default()
+            };
+            let one_full = MpConfig {
+                full_update: true,
+                ..one
+            };
 
-        for step in 0..15 {
-            let a = fast.run(&one);
-            let b = slow.run(&one_full);
-            assert_eq!(a.selections, b.selections, "step {step}: different atom");
-            assert_eq!(a.len(), 1, "step {step}: pursuit stopped early");
+            for step in 0..15 {
+                let a = fast.run(&one);
+                let b = slow.run(&one_full);
+                assert_eq!(a.selections, b.selections, "{name} step {step}: different atom");
+                assert_eq!(a.len(), 1, "{name} step {step}: pursuit stopped early");
 
-            // The lazy table holds bounds; only the resolved table is comparable to a recompute.
-            fast.resolve_all();
-            for bi in 0..d.blocks.len() {
-                let (fe, se) = (fast.frame_energy(bi), slow.frame_energy(bi));
-                assert_eq!(fe.len(), se.len());
-                for n in 0..fe.len() {
+                // The lazy table holds bounds; only the resolved table is comparable to a recompute.
+                fast.resolve_all();
+                for bi in 0..d.blocks.len() {
+                    let (fe, se) = (fast.frame_energy(bi), slow.frame_energy(bi));
+                    assert_eq!(fe.len(), se.len());
+                    for n in 0..fe.len() {
+                        assert_eq!(
+                            fe[n], se[n],
+                            "{name} step {step} block {bi} frame {n}: stale energy {} vs fresh {}",
+                            fe[n], se[n]
+                        );
+                    }
                     assert_eq!(
-                        fe[n], se[n],
-                        "step {step} block {bi} frame {n}: stale energy {} vs fresh {}",
-                        fe[n], se[n]
+                        fast.frame_bin(bi),
+                        slow.frame_bin(bi),
+                        "{name} step {step} block {bi}"
                     );
                 }
-                assert_eq!(fast.frame_bin(bi), slow.frame_bin(bi), "step {step} block {bi}");
             }
         }
     }
@@ -1458,6 +1481,61 @@ mod tests {
         let onsets: Vec<usize> = book.selections.iter().take(2).map(|s| s.onset).collect();
         assert!(onsets.contains(&40), "missed onset 40, got {onsets:?}");
         assert!(onsets.contains(&300), "missed onset 300, got {onsets:?}");
+    }
+
+    /// One planted atom of each kind, each found by a block of its own kind at its own onset.
+    ///
+    /// The two supports are shaped nothing alike — a sharp-attack decay against a symmetric bump —
+    /// so a pursuit that ranked them unfairly across blocks would explain one with the other.
+    #[test]
+    fn recovers_planted_atoms_of_both_kinds() {
+        let d = mixed_dict();
+        // On each block's own hop grid, or the "on-grid" atom is not.
+        let (t_f, t_g) = (40 / d.blocks[0].hop * d.blocks[0].hop, 300 / d.blocks[1].hop * d.blocks[1].hop);
+        let atoms = [on_grid(&d, 0, 12, t_f as i64, 1.0, 0.5), on_grid(&d, 1, 8, t_g as i64, 0.7, 1.9)];
+        let sig = Signal::from_atoms(&atoms, 600, SR).unwrap();
+        let (book, _) = run(&d, &sig, &MpConfig { max_atoms: 10, target_snr_db: 40.0, ..Default::default() });
+
+        assert!(book.snr_db() > 30.0, "SNR only {} dB", book.snr_db());
+        let first: Vec<(usize, usize)> =
+            book.selections.iter().take(2).map(|s| (s.block, s.onset)).collect();
+        assert!(first.contains(&(0, t_f)), "missed the FOF at {t_f}, got {first:?}");
+        assert!(first.contains(&(1, t_g)), "missed the gaussian at {t_g}, got {first:?}");
+        for s in book.selections.iter().take(2) {
+            assert_eq!(s.atom.kind(), d.blocks[s.block].env.kind());
+        }
+    }
+
+    /// The oracle gate across kinds: the fast path and the brute-force scan pick the same block, onset
+    /// and bin, atom after atom, when the dictionary offers both a FOF and a Gaussian.
+    #[test]
+    fn matches_the_naive_oracle_on_a_mixed_dictionary() {
+        let mut planner = Planner::new();
+        let cfg = BlockConfig { f_min: 1000.0, f_max: 4000.0, ..BlockConfig::default() };
+        let shapes: Vec<Shape> =
+            vec![EnvelopeParams::new(2147.0, 0.0003).into(), GaussianParams::new(0.0004).into()];
+        let mut d = Dictionary::from_shapes(&shapes, SR, &mut planner, &cfg).unwrap();
+        for b in &mut d.blocks {
+            b.hop = 1; // align the search spaces
+        }
+
+        let sig = noise(320, 0x7777_2222_3333_4444);
+        let cfg = MpConfig { max_atoms: 6, target_snr_db: f32::INFINITY, ..Default::default() };
+        let (fast, _) = run(&d, &sig, &MpConfig { refine: RefineConfig { enabled: false, ..cfg.refine }, ..cfg });
+        let (slow, _) = NaiveMp::new(&d).run(
+            &sig,
+            &NaiveConfig { max_atoms: 6, target_residual_fraction: 0.0, min_gain_fraction: 0.0 },
+        );
+
+        assert_eq!(fast.len(), slow.len());
+        let kinds: std::collections::HashSet<_> = fast.selections.iter().map(|s| s.atom.kind()).collect();
+        assert_eq!(kinds.len(), 2, "the fixture should exercise both kinds");
+        for (i, (a, b)) in fast.selections.iter().zip(&slow.selections).enumerate() {
+            assert_eq!((a.block, a.onset, a.bin), (b.block, b.onset, b.bin), "atom {i}");
+            let rel = (a.projected_energy - b.projected_energy).abs()
+                / b.projected_energy.abs().max(1e-12);
+            assert!(rel < 1e-3, "atom {i}: energy {} vs {}", a.projected_energy, b.projected_energy);
+        }
     }
 
     /// Against the independent brute-force implementation, with hop forced to 1 so both search the

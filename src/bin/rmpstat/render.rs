@@ -162,6 +162,14 @@ pub fn histogram_text(h: &Histogram) -> String {
             ));
         }
     }
+    // Atoms of a kind this quantity does not describe are outside `total` altogether, so they are
+    // stated as a count rather than a share of it.
+    if h.inapplicable > 0.0 {
+        out.push_str(&format!(
+            "  other atom kinds: {} (not described by this quantity, not in the total)\n",
+            num(h.inapplicable)
+        ));
+    }
     out
 }
 

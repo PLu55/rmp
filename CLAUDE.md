@@ -5,12 +5,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `rmp` ("rust matching pursuit") is an **audio analysis** engine: it decomposes a signal into FOF
-atoms (Rodet's Formant Wave Function, from the CHANT synthesizer) using Matching Pursuit. The
-tractability design follows Krstulovic & Gribonval, *"MPTK: Matching Pursuit Made Tractable"*
-(ICASSP 2006); `notes.md` holds the full bibliography.
+atoms (Rodet's Formant Wave Function, from the CHANT synthesizer) and Gaussian (Gabor) atoms using
+Matching Pursuit. The tractability design follows Krstulovic & Gribonval, *"MPTK: Matching Pursuit
+Made Tractable"* (ICASSP 2006); `notes.md` holds the full bibliography.
 
 Analysis is the *inverse* of what `/home/plu/Projects/rfofs` does. rmp finds FOF parameters; rfofs
-synthesizes from them. A decomposition is replayable through rfofs unchanged.
+synthesizes from them. A book's FOF atoms replay through rfofs unchanged; its Gaussian atoms have no
+rfofs representation and are defined and rendered by rmp itself. `rmp` only analyses — every render
+of a book, atoms and stochastic residual alike, is `rmpsynth`'s.
 
 ## Commands
 
@@ -20,12 +22,9 @@ cargo test
 cargo test <test_name>                       # single test
 cargo clippy --all-targets
 
-# the CLI
-./target/release/rmp in.wav -o resynth.wav [-c settings.toml] [-r residual.wav] [-b book.toml]
-./target/release/rmp in.wav -o resynth.wav -s 2.5 -d 0.5   # analyse one excerpt, in seconds
-./target/release/rmp in.wav -o resynth.wav -b book.json.gz   # any book format, compressed
-./target/release/rmp in.wav -b book.toml                    # analyse only, no resynthesis
-./target/release/rmp -b book.toml -o resynth.wav            # synthesise a book, no analysis
+# analysis: rmp writes a book, and never audio other than the residual
+./target/release/rmp in.wav -b book.json.gz [-c settings.toml] [-r residual.wav]
+./target/release/rmp in.wav -b book.toml -s 2.5 -d 0.5      # analyse one excerpt, in seconds
 ./target/release/rmp --write-config > settings.toml
 
 # residual stochastic analysis (off by default)
@@ -33,15 +32,18 @@ cargo clippy --all-targets
 ./target/release/rmp in.wav -b book.json --residual-book bank.json.gz
 RMP_RESIDUAL_DETAIL=1 ./target/release/rmp in.wav --residual-book bank.json.gz
 
-# residual stochastic synthesis: either kind of book in, soundfile out
-./target/release/rmpsynth -b bank.json.gz -o stochastic.wav
-./target/release/rmpsynth -b book.json.gz --fof-audio fof.wav -o mixed.wav
+# synthesis: rmpsynth renders a book's atoms (FOF through rfofs, Gaussian by rmp) and its residual
+./target/release/rmpsynth -b book.json.gz -o resynth.wav                  # atoms + embedded residual
+./target/release/rmpsynth -b book.json.gz --no-residual -o atoms.wav      # atoms only
+./target/release/rmpsynth -b book.json --residual-book bank.json.gz -o mixed.wav
+./target/release/rmpsynth -b bank.json.gz -o stochastic.wav               # residual book: noise only
 ./target/release/rmpsynth -b bank.json.gz -o out.wav --seed 7 --gain-db -6 --encoding pcm24
 
 # statistics and visualization over a book
 ./target/release/rmpstat summary book.json [-c settings.toml]
 ./target/release/rmpstat diag    book.json -c settings.toml
 ./target/release/rmpstat hist    book.json --of alpha,bandwidth,f --weight energy
+./target/release/rmpstat hist    book.json --of sigma,bandwidth              # gaussian atoms
 ./target/release/rmpstat hist    book.json --of alpha,f -f svg -o plots/
 ./target/release/rmpstat snr     book.json -f svg -o snr.svg
 ./target/release/rmpstat wv      book.json -f png -o wv.png --log-freq --floor 65
@@ -65,15 +67,22 @@ right place for why the code is shaped as it is. Settings guidance added here sh
 The pipeline is: dictionary → correlate every frame → pick the best atom → subtract → repeat. The
 parts that need reading together:
 
+- **`atom`** — `Shape` (`Fof | Gaussian`), `AtomParams` and the rendered `Envelope`, dispatching to
+  the two kinds. Everything downstream of it works from a rendered envelope and never asks which
+  kind it holds; what differs between kinds is confined here, to `refine`'s searched parameters,
+  `fit::fit_end`, HRMP's scaled probes, and `stats`.
 - **`fof`** — the bridge to rfofs. Nothing here reimplements FOF math; envelopes and support lengths
   come from *rendering a probe grain* and inspecting it.
-- **`dict`** — blocks, one per `(alpha, beta)` envelope. Owns the Gram tables and the hop.
+- **`gauss`** — the Gaussian atom. rmp owns this definition, so its envelope is the formula and its
+  support a closed form.
+- **`dict`** — blocks, one per envelope shape of either kind. Owns the Gram tables and the hop.
 - **`corr`** — one envelope-windowed FFT per frame yields correlations against every frequency at
   once, then a closed-form 2-D projection.
 - **`fit`** — the same exact projection *off* the grid, by direct f64 summation. Refinement and
   HRMP both need a score where no precomputed Gram exists.
 - **`cand`** — coarse discovery: local time-frequency maxima, merged across blocks.
-- **`refine`** — bounded 1-D search over `(t0, f, alpha, beta)` after selection.
+- **`refine`** — bounded 1-D search over `(t0, f, alpha, beta)` for a FOF, `(t0, f, sigma)` for a
+  Gaussian, after selection.
 - **`hrmp`** — local-support probes and the amplitude clamp.
 - **`mp`** — the pursuit loop with the local update; owns the candidate → refine → validate → select
   pipeline, and the windowing that keeps its frame tables bounded on a long clip.
@@ -86,25 +95,29 @@ parts that need reading together:
 - **`tfmap`** — the atom-based pseudo-Wigner time-frequency map (spec §21), as diagnostics only.
 - **`residual`** — stochastic analysis of the final residue: an ERB gammatone bank, one-pole band
   power, and a fixed-rate `ResidualBook`. A post-processing stage; it cannot touch the pursuit.
-- **`synth`** — the inverse of `residual`: a power-complementary ERB bank driven by independent
-  per-band noise at `sqrt(P_b)`. Reuses `residual::filter` outright; the only thing it adds is a
-  per-band scale.
-- **`config` / `audio` / `main`** — TOML settings, libsndfile I/O, the CLI.
-- **`bin/rmpsynth`** — the resynthesis CLI. A file and configuration front end over `synth`; no DSP
-  lives in it, so `rmp` can call the same renderer without spawning a process.
+- **`synth`** — all synthesis. `synth::atoms` renders a book's atoms through the same per-atom
+  render the pursuit subtracted; the rest is the inverse of `residual`: a power-complementary ERB
+  bank driven by independent per-band noise at `sqrt(P_b)`, reusing `residual::filter` outright.
+  `synth::render` mixes the two on one timeline.
+- **`config` / `audio` / `main`** — TOML settings, libsndfile I/O, the analysis CLI.
+- **`bin/rmpsynth`** — the synthesis CLI. A file and configuration front end over `synth`; no DSP
+  lives in it.
 - **`bin/rmpstat`** — the statistics CLI: clap, `plotters`, and text tables. A thin shell, so
   everything worth an oracle lives in `stats`/`tfmap` where `cargo test` reaches it.
 
 ### Invariants that are not locally obvious
 
-**`E(t)` depends only on `(alpha, beta, fade_*)`, never on `f` or `phi`.** This is what makes one FFT
-per frame serve every frequency, and it is the load-bearing fact of the whole design.
+**`E(t)` depends only on the shape — `(alpha, beta, fade_*)` or `(sigma, cutoff_level)` — never on
+`f` or `phi`.** This is what makes one FFT per frame serve every frequency, and it is the load-bearing
+fact of the whole design. It is also the whole of what a second atom kind had to satisfy.
 
 **Hop scales as `1/alpha`, not as a fraction of the window.** Onset capture falls off as
 `exp(-2*alpha*|delta|)`, a width set by the decay rate. An MPTK-style `hop = L/2` captures ~1e-4 of an
 atom's energy here. Hop is *measured* from each block's own envelope autocorrelation rather than
 derived, so it accounts for `beta` and the fade tail. Because the loss depends on `alpha`, this is a
-correctness property: a fixed hop would bias selection toward small-`alpha` blocks.
+correctness property: a fixed hop would bias selection toward small-`alpha` blocks. A Gaussian's
+capture falls as `exp(-delta^2 / 2 sigma^2)`, so its hop is proportional to `sigma` — and it is
+measured by the same code, which is what keeps ranking across the two kinds fair.
 
 **Phase is solved, not searched.** The dictionary grids `(alpha, beta, t0, f)` only; `phi` and `amp`
 come from `z = G^-1 d`. `amp = hypot(z)` is non-negative by construction, so there is no sign fixup
@@ -180,17 +193,24 @@ p5 0.76, min 0.24 on the 5000-atom piano book. On a book where HRMP did *not* ru
 shortfall would be a parameter-mapping error instead, which is why the two readings need
 separating.
 
-**`--book` is an input or an output depending on whether an input soundfile is given.** With
-one it is written; without one it is read and synthesised, and the whole analysis path — config,
-dictionary, `--start`/`--duration`, `--residual` — is inapplicable rather than merely unused, so
-those flags are errors in that mode. Analysis needs at least one of the three outputs; `--out`
-alone is no longer mandatory, and skipping it also skips the resynthesis render.
+**`rmp` analyses and `rmpsynth` renders; nothing crosses.** `rmp` used to render a book too, with
+`--book` read rather than written when no soundfile was given. Both are gone: `--book` is always an
+output, and a hidden `-o` survives only to point a stale command line at `rmpsynth`. Analysis needs
+at least one of `--book`, `--residual`, `--residual-book`. The pursuit still renders every atom it
+subtracts — that is analysis, not synthesis — and `synth::atoms` renders a book through exactly that
+call, so the two cannot drift.
 
-**A synthesised book is longer than the excerpt it came from.** `Book::natural_len` sizes the
+**A synthesised book is longer than the excerpt it came from.** `synth::atoms::natural_len` sizes the
 output by rendering each atom's envelope and taking the furthest death, where analysis sized the
 residual by the input. The atom tails the analysis truncated at the excerpt end are audible again —
 2.9% of the excerpt's energy on a 0.15 s piano fixture. Over the excerpt itself the two renders are
 bit-identical, so this is a longer file, not a different one.
+
+**A book records where its excerpt began.** `Book::start_sample` is skipped when zero, so a book
+analysed from the start of its file is byte-identical to one written before the field existed. The
+residual book always recorded it, so when the two meet in `rmpsynth` a zero on the book defers to the
+residual — which is what lets an old book with an embedded residual still line up — and only two
+different nonzero origins are an error.
 
 **Memory scales with the signal, so per-frame bytes are a design constraint.** The frame tables
 are `energy` (f64), `bin` (u32) and `dirty` (bool) — **13 bytes per frame** — and a dictionary needs
@@ -213,7 +233,8 @@ None of the three changed a book by a bit, and the gates that prove it are the `
 reference book and the whole test suite.
 
 **The envelope cache is bounded, and that is what made long clips possible at all.**
-`refine::EnvelopeCache` is keyed on exact `(alpha, beta)` bits, and refinement moves both
+`refine::EnvelopeCache` is keyed on exact shape bits (`Shape::cache_key`: `(alpha, beta)` for a FOF,
+`(sigma, cutoff_level)` for a Gaussian), and refinement moves them
 continuously, so its hit rate *across* atoms is nil — but it used to retain every entry for the life
 of the pursuit. Each is a full envelope, hundreds of KB at a low `alpha_min`. Measured on
 `lux-eterna-1.toml`, that cost **7 MB per selected atom**: 2.3 GB at 300 atoms, and the config's own
@@ -267,6 +288,75 @@ recompute 70% of what they bound. What remains for those blocks is the number of
 (`add_at`, `subtract_at`), scoring it (`fit::accumulate`) and invalidating the frames it touched
 (`refresh_stale`) all go through it. `refresh_stale` used to be passed the seed's frame onset, which
 equals the atom's `t0` only until refinement can move it.
+
+### Gaussian atoms
+
+`amp * g[n] * sin(phi + omega n)`, `g[n] = exp(-(n-h)^2 / 2 s^2)` over `n = 0..2h`, with the peak
+exactly 1 and the support cut where `g` falls below `cutoff_level`. Settings are
+`[dictionary.gaussian] sigmas_ms` (empty by default) and `[refine] sigma_*`. Seven facts that are not
+obvious from the code:
+
+**rmp owns the definition, so the rule "derive by rendering, never by formula" does not apply.**
+That rule exists because a formula for a FOF would drift from rfofs's rounding. There is no second
+implementation of a Gaussian to drift from: the formula *is* the atom, for analysis and resynthesis
+alike, and `half_len` is a closed form. The carrier is an exact f64 `sin`, not rfofs's LUT.
+
+**`Shape` is serialised untagged, and that is what keeps every FOF book byte-identical.** A book's
+`env` is the inner struct with no kind tag; the variants are told apart by their fields, and
+`GaussianParams`'s `deny_unknown_fields` keeps the match unambiguous.
+`a_fof_shape_serialises_exactly_as_its_envelope_did` pins it. A tagged enum would have rewritten
+every book ever produced.
+
+**Blocks are built FOF family first, and that is what keeps FOF decompositions bit-identical.** Block
+index is both what a book records and the selection tie-break, so appending the Gaussian blocks
+leaves every FOF block where it was. Verified: re-analysing the `mp_1.toml` piano reference after the
+change gives a byte-identical book and residual.
+
+**The `sigma` stage holds the centre, not `t0`.** `t0` is the first sample of the support for both
+kinds, but a Gaussian's peak sits `half_len(sigma)` later. Searching `sigma` at a fixed `t0` would move
+the peak by ~3.7 samples per sample of `sigma` and turn a width search into a coupled width-and-onset
+search. `recovers_an_off_grid_gaussian_about_its_centre` seeds from the wrong rung and recovers the
+centre to 4 samples. The seed there is centred on the frame grid, because that is where the coarse
+argmax puts a symmetric atom — seeding the *start* of the support at the true start leaves the centre
+hundreds of samples off, further than the onset stage's hop-derived radius can walk.
+
+**A Gaussian's fit region is its whole support.** `fit::fit_end` exists to exclude a FOF's release,
+which says nothing about `alpha` and `beta`. A Gaussian has no release; its tails are already at the
+cutoff.
+
+**The refinement cache key for a FOF ignores the release, and `adopt` keeps the seed's `fade_dur`.**
+Both were true before there was a second kind and both are kept exactly, because changing either moves
+every refined book: a hit serves whichever release the first request rendered, and a refined FOF
+records its seed's `fade_dur` rather than the one its policy would derive.
+
+**HRMP's legacy mode scales a Gaussian by `sigma / 2^depth`**, the one-parameter analogue of a FOF's
+`alpha * 2^depth, beta / 2^depth`. `probe_shape` is the single definition, and
+`a_long_gaussian_bridging_a_gap_is_caught_in_both_modes` covers both probe modes on a symmetric atom.
+
+**Measured, on the first 3 s of `chopin-nocturne-2.wav` at `mp_1.toml` settings to 35 dB:** FOF only
+833 atoms / 5.53 s / −32.2 dB residual peak; FOF + `sigmas_ms = [1, 2.5, 6, 15, 40]` 832 / 5.70 s /
+−31.4 dB, with the Gaussians taking 110 atoms and 2% of the energy; Gaussian only 862 / **1.61 s** /
+−33.8 dB. The Gaussian-only speed is the longest transform — 14,273 samples at 40 ms against 332,053 at
+`alpha = 1` — not anything cheaper per frame. One run each. The atom render of the mixed book null-tests
+against the input at 35.01 dB, the reported SNR.
+
+### Synthesis in `rmpsynth`
+
+**Not `rfofs::OfflineRenderer`.** It renders in engine blocks, and a FOF's `decay_acc` is a running
+product across `fill_block` calls, so a block-split grain is not bit-identical to the single-call
+render the pursuit subtracted. It also writes a float WAV directly — nothing can be mixed in — needs
+monotonic non-negative onsets, and stops at a 30 s safety limit. `synth::atoms` uses `FofState` per
+atom through `AtomParams::render`, and the gate is exact: the pre-change `rmp -o` piano render and
+`rmpsynth -b` of the same book agree sample for sample over the excerpt.
+
+**Atoms and residual share one timeline.** Both are placed at the excerpt's source sample, or both at
+zero with `--trim-to-excerpt`, and whichever ends later sets the length. The mix is `(atoms +
+residual) * gain` in f32, so at 0 dB an atoms-only render is the atom render to the last bit.
+
+**The noise streams run through the timeline lead-in.** The residual renderer draws noise for every
+output sample, including the silent ones before the excerpt, so a trimmed render is a different
+stretch of the same stream from a placed one. Both are correct realisations; they are not
+sample-comparable, and a test that compares them has to silence the residual.
 
 ### Residual ERB analysis
 

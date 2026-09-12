@@ -1,17 +1,15 @@
-//! `rmp` — decompose a soundfile into FOF atoms and resynthesise it.
+//! `rmp` — decompose a soundfile into FOF and Gaussian atoms.
 //!
 //! ```text
-//! rmp input.wav -o resynth.wav [-c settings.toml] [-r residual.wav] [-b book.toml]
+//! rmp input.wav -b book.json.gz [-c settings.toml] [-r residual.wav]
 //!     [-s start_seconds] [-d duration_seconds]
-//! rmp input.wav -b book.toml            # analyse only, no resynthesis
-//! rmp -b book.toml -o resynth.wav       # synthesise a book, no analysis
 //! rmp --write-config > settings.toml
 //! ```
 //!
-//! The two roles of `--book` are told apart by whether an input soundfile is given: with one it is
-//! written, without one it is read.
+//! Analysis only. Turning a book back into audio is `rmpsynth`'s job: `rmpsynth -b book -o out.wav`.
 
 use clap::Parser;
+use rmp::atom::AtomKind;
 use rmp::audio;
 use rmp::book;
 use rmp::config::Config;
@@ -26,17 +24,15 @@ use std::time::Instant;
 #[derive(Parser, Debug)]
 #[command(
     name = "rmp",
-    about = "Matching-pursuit decomposition of audio into FOF atoms",
+    about = "Matching-pursuit decomposition of audio into FOF and Gaussian atoms",
     version
 )]
 struct Args {
-    /// Input soundfile (WAV, AIFF, FLAC). Multi-channel input is downmixed to mono. Omit it to
-    /// synthesise the book given by --book instead of analysing anything.
+    /// Input soundfile (WAV, AIFF, FLAC). Multi-channel input is downmixed to mono.
     input: Option<PathBuf>,
 
-    /// Resynthesised output, as 32-bit float WAV. Optional when analysing — omitting it and
-    /// giving --book analyses without rendering the result.
-    #[arg(short, long)]
+    /// Removed: synthesis moved to rmpsynth. Kept only to say so.
+    #[arg(short, long, hide = true)]
     out: Option<PathBuf>,
 
     /// Settings document (TOML). Defaults are used if omitted.
@@ -47,9 +43,8 @@ struct Args {
     #[arg(short, long)]
     residual: Option<PathBuf>,
 
-    /// The book of atoms: written when a soundfile is analysed, read and synthesised when no
-    /// input soundfile is given. Format follows the extension: .toml or .json, either of which
-    /// may carry a trailing .gz to be compressed.
+    /// Write the book of atoms here. Format follows the extension: .toml or .json, either of which
+    /// may carry a trailing .gz to be compressed. Render it with `rmpsynth -b`.
     #[arg(short, long)]
     book: Option<PathBuf>,
 
@@ -118,93 +113,34 @@ fn run(args: &Args) -> Result<(), String> {
         return Ok(());
     }
 
-    // `--book` is an output when there is something to analyse and an input when there is not.
-    // Nothing else distinguishes the two modes: a book carries its own sample rate and its atoms
-    // are the whole of what synthesis needs.
-    match (args.input.as_deref(), args.book.as_deref()) {
-        (Some(input), _) => analyse(args, input),
-        (None, Some(book)) => synthesise(args, book),
-        (None, None) => Err(
-            "give an input soundfile to analyse, or a book to synthesise with --book".into(),
+    // Synthesis used to live here, with `--book` read rather than written when no soundfile was
+    // given. It is `rmpsynth`'s job now, and a stale command line should be told where it went
+    // rather than fail as an unknown flag.
+    if let Some(out) = &args.out {
+        let book = args
+            .book
+            .as_deref()
+            .map_or_else(|| "book.json".into(), |b| b.display().to_string());
+        return Err(format!(
+            "rmp no longer synthesises; render the book with `rmpsynth -b {book} -o {}`",
+            out.display()
+        ));
+    }
+    match args.input.as_deref() {
+        Some(input) => analyse(args, input),
+        None => Err(
+            "give an input soundfile to analyse; to render a book, use `rmpsynth -b book -o out.wav`"
+                .into(),
         ),
     }
 }
 
-/// Render a book back to audio, with no analysis and no dictionary.
-///
-/// The book is replayed in the frame it was analysed in: sample 0 of the output is the origin the
-/// atom onsets are relative to, and an atom that began before it is clipped there. So a book from
-/// `--start 2.5` synthesises the excerpt, not the file.
-fn synthesise(args: &Args, book_path: &Path) -> Result<(), String> {
-    let Some(out) = args.out.as_deref() else {
-        return Err(format!(
-            "synthesising {} needs somewhere to write it: give --out",
-            book_path.display()
-        ));
-    };
-    for (flag, unused) in [
-        ("--config", args.config.is_some()),
-        ("--residual", args.residual.is_some()),
-        ("--start", args.start.is_some()),
-        ("--duration", args.duration.is_some()),
-        ("--residual-analysis", args.residual_analysis),
-        ("--no-residual-analysis", args.no_residual_analysis),
-        ("--residual-update-ms", args.residual_update_ms.is_some()),
-        ("--residual-book", args.residual_book.is_some()),
-    ] {
-        if unused {
-            return Err(format!("{flag} applies to analysis; synthesising a book ignores it"));
-        }
-    }
-
-    let say = |m: &str| {
-        if !args.quiet {
-            eprintln!("{m}");
-        }
-    };
-
-    let book = book::read(book_path)?;
-    if book.is_empty() {
-        return Err(format!("{} contains no atoms", book_path.display()));
-    }
-    if !(book.sample_rate > 0.0 && book.sample_rate.is_finite()) {
-        return Err(format!(
-            "{} has an unusable sample rate ({})",
-            book_path.display(),
-            book.sample_rate
-        ));
-    }
-
-    let t = Instant::now();
-    let len = book.natural_len().map_err(|e| format!("sizing the book: {e}"))?;
-    let signal = book
-        .resynthesize(len)
-        .map_err(|e| format!("resynthesis: {e}"))?;
-    say(&format!(
-        "{}: {} atoms, {} Hz, {:.2} s reconstructed at {:.1} dB in {:.2?}",
-        book_path.display(),
-        book.len(),
-        book.sample_rate as u32,
-        len as f32 / book.sample_rate,
-        book.snr_db(),
-        t.elapsed()
-    ));
-
-    audio::write(out, &signal).map_err(|e| e.to_string())?;
-    say(&format!("wrote {}", out.display()));
-    Ok(())
-}
-
 /// Decompose a soundfile, and write whichever of the three outputs were asked for.
 fn analyse(args: &Args, input: &Path) -> Result<(), String> {
-    if args.out.is_none()
-        && args.book.is_none()
-        && args.residual.is_none()
-        && args.residual_book.is_none()
-    {
+    if args.book.is_none() && args.residual.is_none() && args.residual_book.is_none() {
         return Err(
-            "nothing to write: give --out for the resynthesis, --book for the atoms, \
-             --residual for what is left over, or --residual-book for its ERB analysis"
+            "nothing to write: give --book for the atoms, --residual for what is left over, or \
+             --residual-book for its ERB analysis"
                 .into(),
         );
     }
@@ -288,16 +224,22 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     // Built at the file's own sample rate: hop and bin spacing both depend on it.
     let mut planner = Planner::new();
     let t = Instant::now();
-    let dict = Dictionary::from_grid(
-        &config.dictionary.grid(),
+    let dict = Dictionary::from_shapes(
+        &config.dictionary_shapes(),
         sr,
         &mut planner,
         &config.block_config(),
     )
     .map_err(|e| format!("building dictionary: {e}"))?;
+    let kinds: Vec<(AtomKind, usize)> = AtomKind::ALL
+        .iter()
+        .map(|&k| (k, dict.blocks.iter().filter(|b| b.env.kind() == k).count()))
+        .filter(|&(_, n)| n > 0)
+        .collect();
     say(&format!(
-        "dictionary: {} blocks in {:.2?}",
+        "dictionary: {} blocks ({}) in {:.2?}",
         dict.blocks.len(),
+        kinds.iter().map(|(k, n)| format!("{n} {k}")).collect::<Vec<_>>().join(", "),
         t.elapsed()
     ));
 
@@ -320,18 +262,15 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
             .filter(|b| b.support_len() > mp_cfg.refine.max_atom_samples)
             .collect();
         if !stuck.is_empty() {
-            let longest = stuck.iter().map(|b| b.support_len()).max().unwrap_or(0);
+            let longest = stuck.iter().max_by_key(|b| b.support_len()).unwrap();
             say(&format!(
                 "  note: {} of {} blocks are longer than refine.max_atom_samples ({}), so their \
-                 atoms stay on the grid unrefined; longest support {} samples (alpha {:.3})",
+                 atoms stay on the grid unrefined; longest support {} samples ({})",
                 stuck.len(),
                 dict.blocks.len(),
                 mp_cfg.refine.max_atom_samples,
-                longest,
-                stuck
-                    .iter()
-                    .map(|b| b.env.params.alpha)
-                    .fold(f32::INFINITY, f32::min),
+                longest.support_len(),
+                longest.env.params.describe(),
             ));
         }
     }
@@ -384,6 +323,8 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     let init = run.init;
     let pursuit = t.elapsed().saturating_sub(init);
     let mut book = run.book;
+    // Onsets are relative to the excerpt; this is what puts a rendered book back where it came from.
+    book.start_sample = offset as u64;
 
     say(&format!(
         "analysis: {} atoms, {:.1} dB in {:.2?} (init {:.2?}, {:.1}x realtime)",
@@ -400,6 +341,23 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
             book.len(),
             100.0 * refined as f64 / book.len() as f64
         ));
+    }
+    // Only worth a line when the dictionary offered a choice.
+    if kinds.len() > 1 && !book.is_empty() {
+        let per_kind: Vec<String> = kinds
+            .iter()
+            .map(|&(k, _)| {
+                let picked: Vec<_> = book.selections.iter().filter(|s| s.atom.kind() == k).collect();
+                let energy: f64 = picked.iter().map(|s| s.energy_removed).sum();
+                let total: f64 = book.selections.iter().map(|s| s.energy_removed).sum();
+                format!(
+                    "{} {k} ({:.0}% of the energy removed)",
+                    picked.len(),
+                    100.0 * energy / total.max(f64::MIN_POSITIVE)
+                )
+            })
+            .collect();
+        say(&format!("  kinds: {}", per_kind.join(", ")));
     }
     if book.is_empty() {
         say("  warning: no atoms selected — check the dictionary covers the signal's content");
@@ -420,8 +378,8 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
             for (bi, &(m, r)) in run.per_block.iter().enumerate() {
                 let b = &dict.blocks[bi];
                 say(&format!(
-                    "    block {bi:>2} alpha {:>6.1} fft {:>7}: {m:>8} bounded {r:>8} recomputed ({:>5.1}%)  ~{:.0} Msamples",
-                    b.env.params.alpha, b.fft_len, 100.0 * r as f64 / m.max(1) as f64,
+                    "    block {bi:>2} {:<30} fft {:>7}: {m:>8} bounded {r:>8} recomputed ({:>5.1}%)  ~{:.0} Msamples",
+                    b.env.params.describe(), b.fft_len, 100.0 * r as f64 / m.max(1) as f64,
                     (r * b.fft_len) as f64 / 1e6
                 ));
             }
@@ -505,16 +463,6 @@ fn analyse(args: &Args, input: &Path) -> Result<(), String> {
     }
 
     // ── write ───────────────────────────────────────────────────────────────
-    // Resynthesis is skipped outright when no --out was given: it renders every atom a second
-    // time, which is not free on a large book, and an analysis-only run has no use for it.
-    if let Some(out) = &args.out {
-        let resynth = book
-            .resynthesize(signal.len())
-            .map_err(|e| format!("resynthesis: {e}"))?;
-        audio::write(out, &resynth).map_err(|e| e.to_string())?;
-        say(&format!("wrote {}", out.display()));
-    }
-
     if let Some(path) = &args.residual {
         // Taken from the pursuit rather than by subtracting the resynthesis, so it is exactly what
         // the algorithm could not explain.
@@ -592,15 +540,28 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 # Every section and field is optional; omitted values fall back to these defaults.
 # Unknown keys are rejected rather than ignored, so a typo fails loudly.
 #
-# [dictionary]
+# [dictionary.fof]
+#   FOF atoms (formant wave functions), rendered through rfofs.
 #   alphas          decay rates in s^-1. The -3 dB bandwidth is alpha/pi Hz, so
 #                   80 -> 25 Hz and 2147 -> 683 Hz. A ratio of about 1.6 between
 #                   neighbours costs roughly 5% of an atom's energy at the worst
-#                   point between two rungs.
+#                   point between two rungs. Empty disables the family.
 #   betas_ms        attack (skirt) durations. Shapes only the first few ms.
 #   alpha_beta_max  combinations above this are dropped. rfofs renders
 #                   alpha*beta > 10 as silence and its amplitude normalisation is
 #                   ill-conditioned well before that.
+#
+# [dictionary.gaussian]
+#   Symmetric Gaussian (Gabor) atoms, rendered by rmp itself. Off by default.
+#   Blocks are built FOF family first, so adding this leaves the FOF blocks'
+#   indices where they were.
+#   sigmas_ms       envelope standard deviations. The -3 dB bandwidth is
+#                   0.265/sigma Hz (5 ms -> 53 Hz) and the atom is 7.4 sigma
+#                   long at the default cutoff. A ratio of about 2.5 between
+#                   rungs matches refine.sigma_bracket; [1, 2.5, 6, 15, 40] is a
+#                   reasonable first ladder. Empty disables the family.
+#   cutoff_level    amplitude relative to the peak where the support is cut.
+#                   0.001 is -60 dB; halving it lengthens every atom by about 5%.
 #
 # [envelope]
 #   The release policy, fixed for the whole analysis and shared with resynthesis.
@@ -662,7 +623,8 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #
 # [refine]
 #   Moves a selected atom off the grid before it is subtracted, by maximising
-#   captured energy over t0, f, alpha and beta one parameter at a time.
+#   captured energy over t0, f and the shape one parameter at a time: alpha and
+#   beta for a FOF, sigma for a gaussian (searched about the atom's centre).
 #   Amplitude and phase are never searched -- they come out of the projection in
 #   closed form. This is the single largest win available: off-grid input needs
 #   12x more atoms than on-grid without it and 3x with it, for about 2% of an
@@ -673,6 +635,7 @@ const DEFAULT_CONFIG_HEADER: &str = "\
 #   score_tol               stop early when a whole round gains less than this.
 #   alpha_*, beta_*_ms      bounds on the refined envelope, deliberately wider
 #                           than the dictionary grid at both ends.
+#   sigma_*_ms              bounds on a refined gaussian's sigma.
 #   max_atom_samples        hard cap on the refined support, whatever the bounds
 #                           imply -- a small alpha is a very long atom.
 #   *_bracket, t0_radius    how far from the seed to search. The defaults reach

@@ -7,8 +7,10 @@
 //! Unknown fields are rejected rather than ignored: in a document whose whole purpose is to be
 //! hand-edited, a silently-dropped typo would look exactly like a setting that had no effect.
 
+use crate::atom::Shape;
 use crate::dict::BlockConfig;
-use crate::fof::ReleasePolicy;
+use crate::fof::{EnvelopeParams, ReleasePolicy};
+use crate::gauss::{DEFAULT_CUTOFF_LEVEL, GaussianParams};
 use crate::mp::MpConfig;
 use crate::hrmp::{HrmpConfig, MagnitudePolicy, ProbeMode};
 use crate::refine::RefineConfig;
@@ -69,11 +71,23 @@ impl From<&EnvelopeSettings> for ReleasePolicy {
     }
 }
 
-/// The `(alpha, beta)` grid.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Which atoms the dictionary offers: one family per atom kind.
+///
+/// Blocks are built FOF family first, then Gaussian. That order is the block index a book records
+/// and the tie-break selection uses, so it is what keeps a FOF-only document decomposing exactly as
+/// it did before there was a second family.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DictionarySettings {
-    /// Decay rates in s^-1. The -3 dB bandwidth is `alpha / pi` Hz.
+    pub fof: FofFamilySettings,
+    pub gaussian: GaussianFamilySettings,
+}
+
+/// The FOF `(alpha, beta)` grid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FofFamilySettings {
+    /// Decay rates in s^-1. The -3 dB bandwidth is `alpha / pi` Hz. Empty disables the family.
     pub alphas: Vec<f32>,
     /// Attack (skirt) durations in milliseconds.
     pub betas_ms: Vec<f32>,
@@ -82,7 +96,7 @@ pub struct DictionarySettings {
     pub alpha_beta_max: f32,
 }
 
-impl Default for DictionarySettings {
+impl Default for FofFamilySettings {
     fn default() -> Self {
         Self {
             alphas: vec![80.0, 128.0, 205.0, 328.0, 524.0, 839.0, 1342.0, 2147.0],
@@ -92,7 +106,7 @@ impl Default for DictionarySettings {
     }
 }
 
-impl DictionarySettings {
+impl FofFamilySettings {
     /// Expand to `(alpha, beta_seconds)` pairs, dropping those past the cap.
     pub fn grid(&self) -> Vec<(f32, f32)> {
         self.alphas
@@ -102,6 +116,35 @@ impl DictionarySettings {
             .collect()
     }
 }
+
+/// The Gaussian `sigma` ladder. Off by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GaussianFamilySettings {
+    /// Envelope standard deviations in milliseconds. The -3 dB bandwidth is `0.265 / sigma` and
+    /// the support `±3.72 sigma` at the default cutoff. Empty disables the family.
+    pub sigmas_ms: Vec<f32>,
+    /// Amplitude relative to the peak at which the support is truncated. 0.001 is -60 dB.
+    pub cutoff_level: f32,
+}
+
+impl Default for GaussianFamilySettings {
+    fn default() -> Self {
+        Self { sigmas_ms: Vec::new(), cutoff_level: DEFAULT_CUTOFF_LEVEL }
+    }
+}
+
+impl GaussianFamilySettings {
+    pub fn shapes(&self) -> Vec<GaussianParams> {
+        self.sigmas_ms
+            .iter()
+            .map(|&s| GaussianParams { sigma: s / 1000.0, cutoff_level: self.cutoff_level })
+            .collect()
+    }
+}
+
+/// Keys that lived directly under `[dictionary]` before it held more than one family.
+const MOVED_TO_FOF: [&str; 3] = ["alphas", "betas_ms", "alpha_beta_max"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -210,7 +253,7 @@ impl From<&PursuitSettings> for MpConfig {
 /// Local refinement of `(t0, f, alpha, beta)` after a candidate is selected.
 ///
 /// The frequency range, the conditioning gate and the `alpha*beta` cap are deliberately absent:
-/// they are shared with `[blocks]` and `[dictionary]`, and [`Config::mp_config`] copies them across
+/// they are shared with `[blocks]` and `[dictionary.fof]`, and [`Config::mp_config`] copies them across
 /// so refinement cannot wander into a region the coarse search treats as dead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -227,12 +270,16 @@ pub struct RefineSettings {
     pub alpha_max: f32,
     pub beta_min_ms: f32,
     pub beta_max_ms: f32,
+    /// Bounds on a refined Gaussian's `sigma`.
+    pub sigma_min_ms: f32,
+    pub sigma_max_ms: f32,
     /// Reject any refined envelope longer than this, whatever the bounds imply.
     pub max_atom_samples: usize,
     /// Search radii around the seed: bins, then multiplicative factors, then samples.
     pub f_bracket_bins: f32,
     pub alpha_bracket: f32,
     pub beta_bracket: f32,
+    pub sigma_bracket: f32,
     /// 0 derives the onset radius from the block's own hop.
     pub t0_radius: usize,
 }
@@ -251,10 +298,13 @@ impl Default for RefineSettings {
             // 0.099999994 in the emitted document, which reads like a bug in a hand-edited file.
             beta_min_ms: 0.1,
             beta_max_ms: 10.0,
+            sigma_min_ms: 0.5,
+            sigma_max_ms: 200.0,
             max_atom_samples: d.max_atom_samples,
             f_bracket_bins: d.f_bracket_bins,
             alpha_bracket: d.alpha_bracket,
             beta_bracket: d.beta_bracket,
+            sigma_bracket: d.sigma_bracket,
             t0_radius: d.t0_radius,
         }
     }
@@ -423,8 +473,36 @@ impl From<&ResidualPowerSettings> for ResidualPowerConfig {
 }
 
 impl Config {
-    pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(text)
+    /// Parse a settings document.
+    ///
+    /// A document written before `[dictionary]` held more than one family puts `alphas` directly
+    /// under it. `deny_unknown_fields` would reject that anyway, but only as "unknown field", which
+    /// reads like a typo in a file that was correct yesterday — so the move is named instead.
+    pub fn from_toml(text: &str) -> Result<Self, String> {
+        let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        if let Some(toml::Value::Table(dict)) = table.get("dictionary")
+            && let Some(key) = MOVED_TO_FOF.iter().find(|k| dict.contains_key(**k))
+        {
+            return Err(format!(
+                "[dictionary] {key} has moved to [dictionary.fof]: the dictionary now holds one \
+                 family per atom kind ([dictionary.fof], [dictionary.gaussian]), so put a \
+                 [dictionary.fof] header above alphas, betas_ms and alpha_beta_max"
+            ));
+        }
+        toml::from_str(text).map_err(|e| e.to_string())
+    }
+
+    /// Every block shape the dictionary will hold, FOF family first.
+    pub fn dictionary_shapes(&self) -> Vec<Shape> {
+        let release: ReleasePolicy = (&self.envelope).into();
+        let fof = self
+            .dictionary
+            .fof
+            .grid()
+            .into_iter()
+            .map(|(a, b)| Shape::from(EnvelopeParams::with_policy(a, b, &release)));
+        let gauss = self.dictionary.gaussian.shapes().into_iter().map(Shape::from);
+        fof.chain(gauss).collect()
     }
 
     /// Block settings with the release policy from `[envelope]` folded in.
@@ -454,11 +532,14 @@ impl Config {
                 alpha_max: r.alpha_max,
                 beta_min: r.beta_min_ms / 1000.0,
                 beta_max: r.beta_max_ms / 1000.0,
-                alpha_beta_max: self.dictionary.alpha_beta_max,
+                alpha_beta_max: self.dictionary.fof.alpha_beta_max,
+                sigma_min: r.sigma_min_ms / 1000.0,
+                sigma_max: r.sigma_max_ms / 1000.0,
                 max_atom_samples: r.max_atom_samples,
                 f_bracket_bins: r.f_bracket_bins,
                 alpha_bracket: r.alpha_bracket,
                 beta_bracket: r.beta_bracket,
+                sigma_bracket: r.sigma_bracket,
                 t0_radius: r.t0_radius,
                 rho_sq_max: self.blocks.rho_sq_max as f64,
             },
@@ -520,10 +601,30 @@ impl Config {
 
     /// Reject settings that would produce an unusable dictionary before any work starts.
     pub fn validate(&self) -> Result<(), String> {
-        if self.dictionary.grid().is_empty() {
+        if self.dictionary_shapes().is_empty() {
             return Err(
-                "dictionary grid is empty: check alphas, betas_ms and alpha_beta_max".into(),
+                "dictionary is empty: [dictionary.fof] (alphas, betas_ms, alpha_beta_max) and \
+                 [dictionary.gaussian] (sigmas_ms) give no shapes between them"
+                    .into(),
             );
+        }
+        let g = &self.dictionary.gaussian;
+        if let Some(s) = g.sigmas_ms.iter().find(|s| !(s.is_finite() && **s > 0.0)) {
+            return Err(format!("[dictionary.gaussian] sigmas_ms must be positive, got {s}"));
+        }
+        if !(g.cutoff_level > 0.0 && g.cutoff_level < 1.0) {
+            return Err(format!(
+                "[dictionary.gaussian] cutoff_level must be in (0, 1), got {}",
+                g.cutoff_level
+            ));
+        }
+        let r = &self.refine;
+        if !(r.sigma_min_ms > 0.0 && r.sigma_min_ms <= r.sigma_max_ms && r.sigma_max_ms.is_finite())
+        {
+            return Err(format!(
+                "[refine] needs 0 < sigma_min_ms <= sigma_max_ms, got {} and {}",
+                r.sigma_min_ms, r.sigma_max_ms
+            ));
         }
         // NaN must fail too, hence >= rather than a negated <.
         if self.blocks.f_min >= self.blocks.f_max || !self.blocks.f_min.is_finite() {
@@ -576,8 +677,10 @@ mod tests {
     #[test]
     fn empty_document_is_the_default_dictionary() {
         let cfg = Config::from_toml("").unwrap();
-        // 8 alphas x 3 betas, less 1342*3ms = 4.026 and 2147*3ms = 6.441.
-        assert_eq!(cfg.dictionary.grid().len(), 22);
+        // 8 alphas x 3 betas, less 1342*3ms = 4.026 and 2147*3ms = 6.441. No Gaussians.
+        assert_eq!(cfg.dictionary.fof.grid().len(), 22);
+        assert_eq!(cfg.dictionary_shapes().len(), 22);
+        assert!(cfg.dictionary_shapes().iter().all(|s| s.as_fof().is_some()));
         assert_eq!(cfg.pursuit.target_snr_db, MpConfig::default().target_snr_db);
     }
 
@@ -586,7 +689,77 @@ mod tests {
         let cfg = Config::from_toml("[pursuit]\nmax_atoms = 12\n").unwrap();
         assert_eq!(cfg.pursuit.max_atoms, 12);
         assert_eq!(cfg.blocks.f_max, BlockConfig::default().f_max);
-        assert_eq!(cfg.dictionary.grid().len(), 22);
+        assert_eq!(cfg.dictionary.fof.grid().len(), 22);
+    }
+
+    #[test]
+    fn both_families_build_shapes_fof_first() {
+        let cfg = Config::from_toml(
+            "[dictionary.gaussian]\nsigmas_ms = [2.0, 10.0]\ncutoff_level = 0.01\n\n\
+             [dictionary.fof]\nalphas = [100.0]\nbetas_ms = [1.0]\n\n\
+             [envelope]\nfade_level = 0.01\n",
+        )
+        .unwrap();
+        assert!(cfg.validate().is_ok());
+        let shapes = cfg.dictionary_shapes();
+        assert_eq!(shapes.len(), 3);
+        // The release policy reaches the FOF family, and the cutoff the Gaussian one.
+        assert_eq!(shapes[0].as_fof().unwrap().fade_level, 0.01);
+        assert_eq!(shapes[1], GaussianParams { sigma: 0.002, cutoff_level: 0.01 }.into());
+        assert_eq!(shapes[2].as_gaussian().unwrap().sigma, 0.01);
+    }
+
+    #[test]
+    fn a_gaussian_only_dictionary_is_legal_and_an_empty_one_is_not() {
+        let only = Config::from_toml(
+            "[dictionary.fof]\nalphas = []\n\n[dictionary.gaussian]\nsigmas_ms = [5.0]\n",
+        )
+        .unwrap();
+        assert!(only.validate().is_ok());
+        assert_eq!(only.dictionary_shapes().len(), 1);
+
+        let none = Config::from_toml("[dictionary.fof]\nalphas = []\n").unwrap();
+        assert!(none.validate().is_err());
+        for bad in [
+            "[dictionary.gaussian]\nsigmas_ms = [0.0]\n",
+            "[dictionary.gaussian]\nsigmas_ms = [5.0]\ncutoff_level = 1.0\n",
+            "[refine]\nsigma_min_ms = 10.0\nsigma_max_ms = 1.0\n",
+        ] {
+            assert!(Config::from_toml(bad).unwrap().validate().is_err(), "{bad}");
+        }
+    }
+
+    /// A document from before the families existed fails with a message naming the fix, not with a
+    /// bare "unknown field".
+    #[test]
+    fn the_flat_dictionary_section_is_rejected_with_directions() {
+        for doc in [
+            "[dictionary]\nalphas = [100.0]\n",
+            "[dictionary]\nbetas_ms = [1.0]\n",
+            "[dictionary]\nalpha_beta_max = 4.0\n",
+        ] {
+            let err = Config::from_toml(doc).unwrap_err();
+            assert!(err.contains("[dictionary.fof]"), "{doc}: {err}");
+        }
+    }
+
+    /// The shipped settings documents parse, validate, and hold the families their names promise.
+    #[test]
+    fn the_shipped_configs_parse() {
+        // (name, document, has FOFs, has Gaussians)
+        for (name, text, fof, gauss) in [
+            ("mp_1", include_str!("../data/config/mp_1.toml"), true, false),
+            ("lux-eterna-1", include_str!("../data/config/lux-eterna-1.toml"), true, false),
+            ("lux-eterna-1-mixed", include_str!("../data/config/lux-eterna-1-mixed.toml"), true, true),
+            ("lux-eterna-1-gaussian", include_str!("../data/config/lux-eterna-1-gaussian.toml"), false, true),
+            ("chopin-nocturne-2", include_str!("../data/config/chopin-nocturne-2.toml"), true, false),
+            ("zyklus-mp-1", include_str!("../data/config/zyklus-mp-1.toml"), true, false),
+        ] {
+            let cfg = Config::from_toml(text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(cfg.validate().is_ok(), "{name}");
+            assert_eq!(!cfg.dictionary.fof.grid().is_empty(), fof, "{name}: FOF family");
+            assert_eq!(!cfg.dictionary.gaussian.sigmas_ms.is_empty(), gauss, "{name}: Gaussian family");
+        }
     }
 
     #[test]
@@ -633,23 +806,23 @@ mod tests {
     #[test]
     fn grid_applies_the_alpha_beta_cap() {
         let cfg = Config::from_toml(
-            "[dictionary]\nalphas = [100.0, 2000.0]\nbetas_ms = [1.0, 5.0]\nalpha_beta_max = 4.0\n",
+            "[dictionary.fof]\nalphas = [100.0, 2000.0]\nbetas_ms = [1.0, 5.0]\nalpha_beta_max = 4.0\n",
         )
         .unwrap();
         // 100*0.001, 100*0.005, 2000*0.001 pass; 2000*0.005 = 10 does not.
-        assert_eq!(cfg.dictionary.grid().len(), 3);
+        assert_eq!(cfg.dictionary.fof.grid().len(), 3);
     }
 
     #[test]
     fn betas_are_milliseconds_in_the_document_and_seconds_in_the_grid() {
         let cfg =
-            Config::from_toml("[dictionary]\nalphas = [100.0]\nbetas_ms = [2.5]\n").unwrap();
-        assert_eq!(cfg.dictionary.grid(), vec![(100.0, 0.0025)]);
+            Config::from_toml("[dictionary.fof]\nalphas = [100.0]\nbetas_ms = [2.5]\n").unwrap();
+        assert_eq!(cfg.dictionary.fof.grid(), vec![(100.0, 0.0025)]);
     }
 
     #[test]
     fn validation_catches_unusable_settings() {
-        let empty = Config::from_toml("[dictionary]\nalphas = []\n").unwrap();
+        let empty = Config::from_toml("[dictionary.fof]\nalphas = []\n").unwrap();
         assert!(empty.validate().is_err());
 
         let inverted = Config::from_toml("[blocks]\nf_min = 9000.0\nf_max = 100.0\n").unwrap();
@@ -733,9 +906,13 @@ mod tests {
 
     #[test]
     fn round_trips_through_toml() {
-        let cfg = Config::default();
-        let restored = Config::from_toml(&cfg.to_toml()).unwrap();
-        assert_eq!(cfg.dictionary.grid(), restored.dictionary.grid());
+        let mut cfg = Config::default();
+        cfg.dictionary.gaussian.sigmas_ms = vec![1.5, 6.0];
+        let doc = cfg.to_toml();
+        assert!(doc.contains("[dictionary.fof]") && doc.contains("[dictionary.gaussian]"), "{doc}");
+        let restored = Config::from_toml(&doc).unwrap();
+        assert_eq!(cfg.dictionary_shapes(), restored.dictionary_shapes());
+        assert_eq!(cfg.refine.sigma_bracket, restored.refine.sigma_bracket);
         assert_eq!(cfg.pursuit.max_atoms, restored.pursuit.max_atoms);
     }
 }

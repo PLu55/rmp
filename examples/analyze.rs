@@ -14,7 +14,7 @@
 use rmp::book::Book;
 use rmp::dict::{BlockConfig, Dictionary};
 use rmp::fft::Planner;
-use rmp::fof::{AtomParams, EnvelopeParams};
+use rmp::fof::AtomParams;
 use rmp::mp::{Mp, MpConfig};
 use rmp::refine::RefineConfig;
 use rmp::signal::Signal;
@@ -123,12 +123,15 @@ fn report_refinement(book: &Book, dict: &Dictionary) {
     for s in &book.selections {
         // `Selection::block` is the seed's provenance, so the block's own envelope is the
         // before-picture and `atom.env` is whatever refinement settled on.
-        let seed = dict.blocks[s.block].env.params;
-        if seed.alpha != s.atom.env.alpha || seed.beta != s.atom.env.beta {
+        let (Some(seed), Some(atom)) = (dict.blocks[s.block].env.params.as_fof(), s.atom.env.as_fof())
+        else {
+            continue;
+        };
+        if seed.alpha != atom.alpha || seed.beta != atom.beta {
             moved += 1;
         }
-        d_alpha += (s.atom.env.alpha as f64 / seed.alpha as f64).ln().abs();
-        d_beta += (s.atom.env.beta as f64 / seed.beta as f64).ln().abs();
+        d_alpha += (atom.alpha as f64 / seed.alpha as f64).ln().abs();
+        d_beta += (atom.beta as f64 / seed.beta as f64).ln().abs();
     }
     let n = book.len() as f64;
     println!("\nrefinement");
@@ -143,17 +146,16 @@ fn report_refinement(book: &Book, dict: &Dictionary) {
 
 fn report_dictionary(dict: &Dictionary, len: usize) {
     println!(
-        "{:>7} {:>8} {:>7} {:>6} {:>8} {:>7} {:>9}",
-        "alpha", "beta_ms", "support", "hop", "fft_len", "bins", "frames"
+        "{:<28} {:>7} {:>6} {:>8} {:>7} {:>9}",
+        "shape", "support", "hop", "fft_len", "bins", "frames"
     );
     let mut total_frames = 0usize;
     for b in &dict.blocks {
         let frames = b.frame_count(len);
         total_frames += frames;
         println!(
-            "{:>7.0} {:>8.2} {:>7} {:>6} {:>8} {:>7} {:>9}",
-            b.env.params.alpha,
-            b.env.params.beta * 1000.0,
+            "{:<28} {:>7} {:>6} {:>8} {:>7} {:>9}",
+            b.env.params.describe(),
             b.support_len(),
             b.hop,
             b.fft_len,
@@ -194,7 +196,7 @@ fn plant_atoms(dict: &Dictionary, len: usize, off_grid: bool, per_second: f32) -
             AtomParams {
                 t0: t0 as i64,
                 f,
-                env: EnvelopeParams::new(b.env.params.alpha, b.env.params.beta),
+                env: b.env.params,
                 phi: rnd() * std::f32::consts::TAU,
                 amp: 0.3 + 0.7 * rnd(),
             }
@@ -218,13 +220,9 @@ fn report_convergence(book: &Book, dict: &Dictionary, signal: &Signal) {
         .iter()
         .enumerate()
         .filter(|&(_, &c)| c > 0)
-        .map(|(i, &c)| {
-            format!(
-                "a{:.0}/b{:.1}:{}",
-                dict.blocks[i].env.params.alpha,
-                dict.blocks[i].env.params.beta * 1000.0,
-                c
-            )
+        .map(|(i, &c)| match dict.blocks[i].env.params {
+            rmp::Shape::Fof(p) => format!("a{:.0}/b{:.1}:{c}", p.alpha, p.beta * 1000.0),
+            rmp::Shape::Gaussian(g) => format!("s{:.1}:{c}", g.sigma * 1000.0),
         })
         .collect();
     println!("  blocks used         {}", used.join("  "));
@@ -298,7 +296,7 @@ fn report_recovery(book: &Book, truth: &[AtomParams]) {
 }
 
 fn report_roundtrip(book: &Book, signal: &Signal) {
-    let resynth = book.resynthesize(signal.len()).unwrap();
+    let resynth = rmp::synth::atoms::render_atoms(book, signal.len()).unwrap();
     let err: f64 = signal
         .samples
         .iter()

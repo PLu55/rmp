@@ -1,7 +1,8 @@
 //! The block-structured dictionary.
 //!
-//! A *block* fixes one envelope shape `(alpha, beta)`. Its atoms are indexed by frame (onset on a
-//! hop grid) and frequency bin. Because `E(t)` does not depend on `f`, one FFT of an
+//! A *block* fixes one envelope shape — a FOF's `(alpha, beta)` or a Gaussian's `sigma`. Its atoms
+//! are indexed by frame (onset on a hop grid) and frequency bin. Nothing below this line knows which
+//! kind a block holds: it works from the rendered envelope alone. Because `E(t)` does not depend on `f`, one FFT of an
 //! envelope-windowed frame yields correlations against every bin at once — that is what makes the
 //! pursuit tractable, and why the FFT layer is the engine's inner loop.
 //!
@@ -18,6 +19,7 @@
 //! is a *correctness* property: a fixed hop would bias selection toward small-`alpha` blocks and
 //! make cross-block ranking unfair.
 
+use crate::atom::Shape;
 use crate::fft::{RealFftPlanner, next_fast_len};
 use crate::fof::{Envelope, EnvelopeParams, FofError, ReleasePolicy};
 use realfft::num_complex::Complex32;
@@ -72,7 +74,7 @@ pub struct Block {
 impl Block {
     /// Build a block for one envelope shape.
     pub fn new(
-        params: EnvelopeParams,
+        params: impl Into<Shape>,
         sample_rate: f32,
         planner: &mut dyn RealFftPlanner,
         cfg: &BlockConfig,
@@ -286,7 +288,7 @@ fn envelope_capture(env: &[f32], delta: usize, fft_len: usize) -> f64 {
     dot * dot / (ea * eb)
 }
 
-/// A set of blocks covering an `(alpha, beta)` grid.
+/// A set of blocks, one per envelope shape, of any mix of kinds.
 #[derive(Clone, Debug)]
 pub struct Dictionary {
     pub blocks: Vec<Block>,
@@ -294,17 +296,35 @@ pub struct Dictionary {
 }
 
 impl Dictionary {
-    /// Build from an explicit `(alpha, beta)` list, skipping combinations past the `amax` cliff.
+    /// Build from an explicit `(alpha, beta)` FOF list under `cfg`'s release policy, skipping
+    /// combinations past the `amax` cliff.
     pub fn from_grid(
         grid: &[(f32, f32)],
         sample_rate: f32,
         planner: &mut dyn RealFftPlanner,
         cfg: &BlockConfig,
     ) -> Result<Self, FofError> {
+        let shapes: Vec<Shape> = grid
+            .iter()
+            .map(|&(alpha, beta)| EnvelopeParams::with_policy(alpha, beta, &cfg.release).into())
+            .collect();
+        Self::from_shapes(&shapes, sample_rate, planner, cfg)
+    }
+
+    /// Build one block per shape, in the order given, skipping FOFs past the `amax` cliff.
+    ///
+    /// The order is the block index a book records and the tie-break selection uses, so a caller
+    /// mixing kinds should keep one kind's blocks where they were — the settings put FOFs first,
+    /// which is what leaves a FOF-only decomposition bit-identical when Gaussians are added.
+    pub fn from_shapes(
+        shapes: &[Shape],
+        sample_rate: f32,
+        planner: &mut dyn RealFftPlanner,
+        cfg: &BlockConfig,
+    ) -> Result<Self, FofError> {
         cfg.release.validate()?;
         let mut blocks = Vec::new();
-        for &(alpha, beta) in grid {
-            let params = EnvelopeParams::with_policy(alpha, beta, &cfg.release);
+        for &params in shapes {
             match Block::new(params, sample_rate, planner, cfg) {
                 Ok(b) => blocks.push(b),
                 // A grain that renders silent is simply not a usable atom shape.
@@ -344,9 +364,15 @@ impl Dictionary {
 mod tests {
     use super::*;
     use crate::fft::Planner;
+    use crate::gauss::GaussianParams;
     use std::f64::consts::TAU;
 
     const SR: f32 = 48_000.0;
+
+    fn gauss_block(sigma: f32) -> Block {
+        let mut planner = Planner::new();
+        Block::new(GaussianParams::new(sigma), SR, &mut planner, &BlockConfig::default()).unwrap()
+    }
 
     fn block(alpha: f32, beta: f32) -> Block {
         let mut planner = Planner::new();
@@ -533,6 +559,67 @@ mod tests {
         }
     }
 
+    // ── gaussian blocks ─────────────────────────────────────────────────────────────────────────
+
+    /// The block machinery never asks which kind of envelope it holds; this is the check that it
+    /// does not need to. Same oracle, same tolerance as the FOF blocks.
+    #[test]
+    fn gram_inverse_is_exact_for_gaussian_blocks() {
+        for sigma in [0.001f32, 0.004, 0.02] {
+            let b = gauss_block(sigma);
+            let probes = [b.k_lo, b.k_lo + 1, b.k_lo + 3, b.fft_len / 8, b.fft_len / 5, b.k_hi];
+            assert_gram_inverse_exact(&b, &probes);
+        }
+    }
+
+    /// Capture of a shifted Gaussian is monotone in the shift, so the galloping search must agree
+    /// with the definition here too — checked, not assumed, at every tolerance the configs use.
+    #[test]
+    fn hop_search_matches_the_linear_scan_for_gaussians() {
+        for sigma in [0.0005f32, 0.002, 0.008, 0.03, 0.1] {
+            // Wide ones at a reduced rate so the linear scan stays quick: the shape is the same.
+            let sr = if sigma > 0.01 { 4_000.0 } else { SR };
+            let env = Envelope::render(GaussianParams::new(sigma), sr).unwrap();
+            let fft_len = next_fast_len(env.support_len());
+            for tol in [0.95, 0.7, 0.5, 0.3] {
+                assert_eq!(
+                    measure_hop(&env.samples, fft_len, tol),
+                    measure_hop_linear(&env.samples, fft_len, tol),
+                    "sigma={sigma} tol={tol}"
+                );
+            }
+        }
+    }
+
+    /// A Gaussian's hop is set by its width, as a FOF's is by `1/alpha`: capture falls as
+    /// `exp(-delta^2 / 2 sigma^2)`, so the hop is proportional to sigma and meets its tolerance.
+    #[test]
+    fn gaussian_hop_scales_with_sigma_and_meets_its_tolerance() {
+        let (narrow, wide) = (gauss_block(0.002), gauss_block(0.008));
+        let ratio = wide.hop as f64 / narrow.hop as f64;
+        assert!((3.6..4.4).contains(&ratio), "hop {} -> {}: ratio {ratio:.2}", narrow.hop, wide.hop);
+        for b in [&narrow, &wide] {
+            let worst = envelope_capture(&b.env.samples, b.hop / 2, b.fft_len);
+            assert!(worst >= 0.94, "{}: capture at hop/2 = {worst:.4}", b.env.params.describe());
+        }
+    }
+
+    /// Blocks come out in the order the shapes went in, kinds mixed, because that order is the
+    /// block index a book records and the tie-break selection uses.
+    #[test]
+    fn a_mixed_dictionary_keeps_the_shape_order() {
+        let mut planner = Planner::new();
+        let shapes: Vec<Shape> = vec![
+            EnvelopeParams::new(800.0, 0.001).into(),
+            GaussianParams::new(0.003).into(),
+            EnvelopeParams::new(2000.0, 0.01).into(), // past the amax cliff: skipped
+            GaussianParams::new(0.001).into(),
+        ];
+        let d = Dictionary::from_shapes(&shapes, SR, &mut planner, &BlockConfig::default()).unwrap();
+        let got: Vec<Shape> = d.blocks.iter().map(|b| b.env.params).collect();
+        assert_eq!(got, vec![shapes[0], shapes[1], shapes[3]]);
+    }
+
     #[test]
     fn voice_dictionary_covers_the_grid_and_skips_the_cliff() {
         let mut planner = Planner::new();
@@ -540,18 +627,15 @@ mod tests {
         // 8 alphas x 3 betas = 24, less two past the alpha*beta <= 4 cap:
         // 1342*0.003 = 4.026 and 2147*0.003 = 6.441.
         assert_eq!(d.blocks.len(), 22);
+        let fof = |b: &Block| b.env.params.as_fof().unwrap();
         for b in &d.blocks {
-            assert!(b.env.params.alpha_beta() <= 4.0);
+            assert!(fof(b).alpha_beta() <= 4.0);
             assert!(b.hop >= 1 && b.hop < b.fft_len);
             assert!(b.k_lo <= b.k_hi);
         }
         // Support (and so fft_len) must shrink as alpha grows.
-        let mut by_alpha: Vec<_> = d
-            .blocks
-            .iter()
-            .filter(|b| b.env.params.beta == 0.0003)
-            .collect();
-        by_alpha.sort_by(|a, b| a.env.params.alpha.total_cmp(&b.env.params.alpha));
+        let mut by_alpha: Vec<_> = d.blocks.iter().filter(|b| fof(b).beta == 0.0003).collect();
+        by_alpha.sort_by(|a, b| fof(a).alpha.total_cmp(&fof(b).alpha));
         for w in by_alpha.windows(2) {
             assert!(w[0].fft_len >= w[1].fft_len);
         }

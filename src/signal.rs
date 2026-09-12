@@ -203,7 +203,7 @@ mod tests {
         AtomParams {
             t0,
             f,
-            env: EnvelopeParams::new(2147.0, 0.0003),
+            env: EnvelopeParams::new(2147.0, 0.0003).into(),
             phi: 0.0,
             amp,
         }

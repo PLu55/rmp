@@ -1,10 +1,11 @@
 # rmp — user manual
 
-`rmp` decomposes a soundfile into FOF atoms (Rodet's Formant Wave Function) by Matching Pursuit,
-and writes them as a *book* that replays through the `rfofs` synthesizer unchanged.
+`rmp` decomposes a soundfile into FOF atoms (Rodet's Formant Wave Function) and, optionally,
+Gaussian atoms by Matching Pursuit, and writes them as a *book*. A book's FOF atoms replay through
+the `rfofs` synthesizer unchanged; its Gaussian atoms are rmp's own.
 
-Three binaries: `rmp` analyses and resynthesises, `rmpstat` reports on a book, and `rmpsynth`
-reconstructs the stochastic residual (§10).
+Three binaries: `rmp` analyses, `rmpsynth` renders a book — its atoms, its stochastic residual, or
+both (§10) — and `rmpstat` reports on it.
 
 This manual covers the command line, every setting, and what each one costs. For the design and its
 internals see `CLAUDE.md`; for the algorithm see `notes.md`.
@@ -15,23 +16,28 @@ internals see `CLAUDE.md`; for the algorithm see `notes.md`.
 
 Three stages, and every setting belongs to exactly one of them.
 
-**The dictionary** is a set of *blocks*. A block fixes one envelope shape — a decay rate `alpha` and
-an attack duration `beta` — and offers that shape at every onset on a time grid and every frequency
-on an FFT grid. `[dictionary]`, `[envelope]` and `[blocks]` build it.
+**The dictionary** is a set of *blocks*. A block fixes one envelope shape and offers it at every
+onset on a time grid and every frequency on an FFT grid. There are two kinds of shape, each its own
+family: a **FOF** — a decay rate `alpha` and an attack duration `beta`, a sharp onset and an
+exponential tail — and a **Gaussian** — a width `sigma`, symmetric about its peak.
+`[dictionary.fof]`, `[dictionary.gaussian]`, `[envelope]` and `[blocks]` build it. Every block of
+either kind competes for every atom on equal terms.
 
 **The pursuit** repeatedly finds the single best-matching atom in the dictionary, subtracts it from
 the residual, and repeats. `[pursuit]` decides when to stop.
 
 **Refinement** takes each selected atom off the grid before subtracting it, adjusting
-`(t0, f, alpha, beta)` by local search. `[refine]` controls it. `[hrmp]` optionally vetoes atoms the
-residual does not support across their whole length.
+`(t0, f, alpha, beta)` for a FOF or `(t0, f, sigma)` for a Gaussian by local search. `[refine]`
+controls it. `[hrmp]` optionally vetoes atoms the residual does not support across their whole length.
 
-Two relations are worth carrying in your head, because most settings act through them:
+The relations worth carrying in your head, because most settings act through them:
 
 ```text
--3 dB bandwidth  ≈  alpha / pi          Hz          alpha = 100  ->   32 Hz wide
-atom length      ≈  6.9 * sr / alpha    samples     alpha = 100  ->  3300 samples at 48 kHz
-attack duration  =  beta                seconds
+FOF       -3 dB bandwidth  ≈  alpha / pi          Hz        alpha = 100   ->   32 Hz wide
+          atom length      ≈  6.9 * sr / alpha    samples   alpha = 100   ->  3300 samples at 48 kHz
+          attack duration  =  beta                seconds
+Gaussian  -3 dB bandwidth  ≈  0.265 / sigma       Hz        sigma = 5 ms  ->   53 Hz wide
+          atom length      ≈  7.4 * sigma * sr    samples   sigma = 5 ms  ->  1785 samples at 48 kHz
 ```
 
 So **`alpha` is the one parameter that sets both an atom's frequency width and its length**, in
@@ -45,25 +51,26 @@ dictionary.
 
 ```bash
 # analyse: needs at least one output
-rmp in.wav -o resynth.wav                      # resynthesis
-rmp in.wav -b book.json                        # atoms only, no render
-rmp in.wav -o resynth.wav -r residual.wav -b book.json.gz
-rmp in.wav -o out.wav -c settings.toml         # with settings
-rmp in.wav -o out.wav -s 2.5 -d 0.5            # one excerpt, in seconds
+rmp in.wav -b book.json.gz                     # the atoms
+rmp in.wav -b book.json.gz -r residual.wav     # and what they could not explain
+rmp in.wav -b book.json -c settings.toml       # with settings
+rmp in.wav -b book.json -s 2.5 -d 0.5          # one excerpt, in seconds
 rmp in.wav -b book.json --residual-book bank.json.gz   # atoms, plus the ERB residual analysis
 
-# synthesise: no input soundfile, so --book is read rather than written
-rmp -b book.json -o resynth.wav
+# render: rmpsynth, not rmp (§10)
+rmpsynth -b book.json.gz -o resynth.wav
 
 rmp --write-config > settings.toml             # a fully commented default document
 ```
 
+`rmp` does not render books. An old `rmp ... -o out.wav` command line fails with the `rmpsynth`
+command to use instead.
+
 | flag | meaning |
 | --- | --- |
-| `-o`, `--out` | resynthesis, 32-bit float WAV. Optional when analysing |
 | `-c`, `--config` | settings document. Defaults are used if omitted |
 | `-r`, `--residual` | what the decomposition could not explain |
-| `-b`, `--book` | the atoms. **Output when analysing, input when not** |
+| `-b`, `--book` | the atoms, written here |
 | `-s`, `--start` | offset into the file, seconds |
 | `-d`, `--duration` | length to analyse, seconds |
 | `-q`, `--quiet` | suppress the report |
@@ -78,8 +85,9 @@ Book format follows the extension: `.toml` or `.json`, either optionally `.gz`. 
 Multi-channel input is downmixed to mono by averaging, which partially cancels out-of-phase content
 between channels. The run says so when it happens.
 
-Everything is relative to the excerpt, not the file: with `--start 2.5`, atom onsets in the book
-count from that point, and synthesising the book gives you the excerpt.
+Atom onsets are relative to the excerpt, not the file: with `--start 2.5`, onsets in the book count
+from that point. The book also records where the excerpt began, so `rmpsynth` puts the render back
+at 2.5 s in the source's timeline — or at zero with `--trim-to-excerpt`.
 
 ### Reading the report
 
@@ -87,9 +95,9 @@ count from that point, and synthesising the book gives you the excerpt.
 in.wav: 29.07 s, 48000 Hz, 2 channel(s)
   analysing 5.000-8.000 s (144000 samples from 240000)
   downmixed to mono; out-of-phase content between channels partially cancels
-dictionary: 24 blocks in 13.68ms
+dictionary: 24 blocks (24 fof) in 13.68ms
   note: 8 of 24 blocks are longer than refine.max_atom_samples (150000), so their
-        atoms stay on the grid unrefined; longest support 332053 samples (alpha 1.000)
+        atoms stay on the grid unrefined; longest support 332053 samples (fof alpha 1.000 beta 0.30 ms)
 analysis: 1528 atoms, 35.0 dB in 12.64s (init 13.68ms, 4.2x realtime)
   refined: 1291/1528 atoms moved off the grid (84%)
   refresh: 1266438 frames bounded, 416712 recomputed (32.9%)
@@ -100,6 +108,8 @@ residual: -35.0 dB rms, -30.3 dB peak relative to input
 - **`4.2x realtime`** is wall clock over audio duration. Below 1.0 is faster than realtime.
 - **`refined: N/M`** — how many atoms moved off the grid. Well under 100% with refinement enabled
   means `max_atom_samples` is blocking blocks; see §6.
+- **`kinds:`** — printed only when the dictionary holds both families: how many atoms of each kind
+  were selected, and what share of the removed energy each carries.
 - **`refresh: bounded/recomputed`** — the lazy update's hit rate. Lower recomputed % is faster; it
   is diagnostic, not a setting.
 - **`-35.0 dB rms`** is the negated SNR, so it restates the line above.
@@ -109,12 +119,19 @@ residual: -35.0 dB rms, -30.3 dB peak relative to input
 
 ---
 
-## 3. `[dictionary]` — which envelope shapes exist
+## 3. `[dictionary.fof]` and `[dictionary.gaussian]` — which envelope shapes exist
 
-The seed grid. With refinement on, these are starting points rather than the final parameters, so
-the grid needs to *bracket* the material rather than resolve it.
+The seed grid, one section per atom kind. With refinement on, these are starting points rather than
+the final parameters, so each grid needs to *bracket* the material rather than resolve it.
 
-### `alphas` — default `[80, 128, 205, 328, 524, 839, 1342, 2147]`
+Either family may be empty, but not both. The blocks are built FOF family first, so adding Gaussians
+to a document leaves its FOF blocks — and their indices in the book — exactly where they were.
+
+**A settings document from before the families existed** puts `alphas` directly under
+`[dictionary]`. That is refused with a message saying so: add a `[dictionary.fof]` header above
+`alphas`, `betas_ms` and `alpha_beta_max`.
+
+### `[dictionary.fof] alphas` — default `[80, 128, 205, 328, 524, 839, 1342, 2147]`
 
 Decay rates in s⁻¹, one block per `(alpha, beta)` pair.
 
@@ -132,7 +149,7 @@ Measured, 3 s of piano at a fixed 35 dB: dropping `alpha = 1` from a six-rung gr
 dictionary build from 64 ms to 32 ms and the analysis from 9.9 s to 8.4 s. Keeping only
 `[16, 64, 256]` built the dictionary 26× faster (2.4 ms) and cost 6% more atoms.
 
-### `betas_ms` — default `[0.3, 1.0, 3.0]`
+### `[dictionary.fof] betas_ms` — default `[0.3, 1.0, 3.0]`
 
 Attack durations in milliseconds — the half-cosine rise at the atom's onset.
 
@@ -143,13 +160,60 @@ body of the atom. Refinement moves it freely, so two or three well-spread rungs 
 cutting `[0.3, 1, 3, 12]` to `[1, 12]` made a piano run *slower* (16.3 s against 9.9 s), because the
 seeds fit worse and the pursuit needed more of the expensive long blocks.
 
-### `alpha_beta_max` — default `4.0`
+### `[dictionary.fof] alpha_beta_max` — default `4.0`
 
 Drops `(alpha, beta)` combinations whose product exceeds this.
 
 **Result.** A guard, not a tuning knob. rfofs renders `alpha*beta > 10` as silence outright, and its
 amplitude normalisation is ill-conditioned well before that. Raising it above ~4 admits blocks whose
 peak normalisation is unreliable. Leave it.
+
+### `[dictionary.gaussian] sigmas_ms` — default `[]` (off)
+
+Envelope standard deviations in milliseconds, one block per value. The atom is
+`amp · exp(-(t-c)²/2σ²) · sin(2πft + φ)`, symmetric about its centre, with a peak of exactly `amp`.
+
+**Result.** A FOF has a sharp attack and a long exponential tail; a Gaussian has neither, so it fits
+what a FOF fits badly: events that swell and fade symmetrically, bowed or blown tones, and the parts
+of a sustained sound between its attacks. A ratio of about 2.5 between rungs matches the default
+`refine.sigma_bracket`, so `[1, 2.5, 6, 15, 40]` covers 6.6–265 Hz of bandwidth with no rung out of
+refinement's reach.
+
+**Cost.** Like `alphas`, set by the longest atom: a block's transform is `≈ 7.4·σ·sr` samples, so
+`σ = 40 ms` is a 14,300-point transform — about a FOF at `alpha = 23`. Its hop grows with `σ` too,
+so a wide rung costs fewer frames than its length suggests.
+
+### `[dictionary.gaussian] cutoff_level` — default `0.001` (−60 dB)
+
+Where the support is cut, relative to the peak.
+
+**Result.** The cut is a hard step of this size, which sets a leakage floor near it. Leave it unless
+the residual shows a floor at that level.
+
+**Cost.** The length grows as `√ln(1/cutoff_level)`: halving it lengthens every Gaussian by about 5%.
+
+### What a Gaussian family is worth, measured
+
+The first 3 s of `data/audio/chopin-nocturne-2.wav` at `mp_1.toml`'s settings, every arm driven to
+the same 35 dB. One run each, so treat differences under 5% as noise.
+
+| dictionary | blocks | atoms | wall | residual peak |
+| --- | --- | --- | --- | --- |
+| FOF only — `mp_1.toml` as shipped | 24 | 833 | 5.53 s | −32.2 dB |
+| FOF + `sigmas_ms = [1, 2.5, 6, 15, 40]` | 29 | 832 | 5.70 s | −31.4 dB |
+| Gaussian only — the same ladder, `alphas = []` | 5 | 862 | 1.61 s | −33.8 dB |
+
+**Adding the family to a FOF dictionary changed nothing measurable here.** The pursuit took 110
+Gaussians, carrying 2% of the removed energy, for the same atom count and wall clock: piano partials
+have a sharp attack and an exponential tail, which is a FOF's shape, so the FOFs win the competition.
+
+**A Gaussian-only dictionary is the surprise.** It reached the same SNR with 3.5% more atoms, 3.4×
+faster and with a better residual peak — its longest block is a 14,000-sample transform against the
+FOF family's 332,000. On this material that makes it a serious fast arm rather than an add-on. It is
+one excerpt of one instrument, so measure it on yours before relying on it.
+
+`rmpstat diag` flagged 37% of the Gaussian seeds on the 1 ms and 40 ms rungs, and refinement walked
+`sigma` out to 78 ms: on sustained material the ladder wants a wider top rung than the suggested one.
 
 ---
 
@@ -283,7 +347,8 @@ about the optimum.
 
 ### `rounds` — default `3` · `golden_iters` — default `10` · `score_tol` — default `0.0001`
 
-Work per candidate. A round is one `f → alpha → beta → t0` cycle; `golden_iters` is the
+Work per candidate. A round is one `f → alpha → beta → t0` cycle for a FOF, `f → sigma → t0` for a
+Gaussian; `golden_iters` is the
 golden-section evaluations per parameter; `score_tol` ends the search when a whole round gains less
 than that fraction.
 
@@ -304,7 +369,17 @@ Hard bounds on where refinement may go, deliberately wider than the dictionary g
 **Result.** These stop the optimizer wandering somewhere non-physical. If your `alphas` reach below
 `alpha_min`, refinement cannot even hold the seed value — set `alpha_min` at or below your lowest
 rung. The frequency range and the `alpha*beta` cap are *not* here: they are shared with `[blocks]`
-and `[dictionary]` so the coarse and refined paths cannot disagree about what is representable.
+and `[dictionary.fof]` so the coarse and refined paths cannot disagree about what is representable.
+
+### `sigma_min_ms` / `sigma_max_ms` — default `0.5` / `200.0` · `sigma_bracket` — default `2.5`
+
+The Gaussian counterparts of the `alpha` bounds and bracket: where a refined `sigma` may go, and how
+far from the seed it is searched, multiplicatively.
+
+**Result.** The width is searched with the atom's *centre* held still, so it does not drag the onset
+around while it moves. `max_atom_samples` applies to Gaussians as well, and a rung whose support
+already exceeds it is never refined, exactly as for a FOF. Set `sigma_min_ms` at or below your
+narrowest rung, or refinement cannot hold the seed.
 
 ### `t0_radius` — default `0`
 
@@ -562,35 +637,39 @@ cannot be made power-complementary and the reconstruction combs.
 
 ---
 
-## 10. `rmpsynth` — playing the residual back
+## 10. `rmpsynth` — rendering a book
 
-`rmp` measures the residual; `rmpsynth` reconstructs it. It reads a book of either kind — a
-standalone residual book, or a full book carrying one — and writes a soundfile.
+`rmp` analyses; `rmpsynth` renders. It reads a book of either kind — a full book, or a standalone
+residual book — and writes a soundfile: the atoms, the stochastic residual, or both mixed.
 
 ```bash
-rmpsynth -b bank.json.gz -o stochastic.wav              # the noise component alone
-rmpsynth -b book.json.gz -o stochastic.wav              # a full book: its residual section is used
-rmpsynth -b book.json.gz --fof-audio fof.wav -o mix.wav # atoms + noise
+rmpsynth -b book.json.gz -o resynth.wav                         # atoms + the book's own residual
+rmpsynth -b book.json.gz --no-residual -o atoms.wav             # the atoms alone
+rmpsynth -b book.json --residual-book bank.json.gz -o mix.wav   # atoms + a standalone residual
+rmpsynth -b bank.json.gz -o stochastic.wav                      # a residual book: noise only
 ```
 
-It does **not** synthesise atoms. Render those with `rmp -b book -o fof.wav` and hand the result to
-`--fof-audio`; nothing is resampled or stretched, and a sample-rate disagreement is an error.
+FOF atoms render through rfofs and Gaussian atoms through rmp's own definition, each exactly as the
+analysis subtracted it: over the analysed excerpt an atoms-only render is, sample for sample, the
+signal the decomposition explained. A full book with no residual section simply renders its atoms.
 
-Which kind of book you passed is worked out from the document, so there is no flag for it. A full
-book with no residual section is an error, not a silent empty render.
+Which kind of book you passed is worked out from the document, so there is no flag for it. The atoms
+and the residual must come from the same analysis — a sample-rate or excerpt-origin disagreement
+between the book and `--residual-book` is an error.
 
 | flag | meaning |
 | --- | --- |
 | `-b`, `--book` | the book to render. Same extension rules as `rmp --book` |
 | `-o`, `--output` | output soundfile |
-| `--fof-audio` | pre-rendered atom synthesis to mix in |
+| `--residual-book` | a standalone residual book to render with the atoms, replacing any embedded one |
+| `--no-atoms` / `--no-residual` | leave that component out |
 | `--seed` — default `1` | the whole of the nondeterminism |
 | `--gain-smoothing-ms` — default `1.0` | one-pole smoothing of the band gains |
 | `--gain-smoothing-mode` — default `fixed` | or `bandwidth-relative` |
 | `--gain-db` — default `0.0` | output gain, applied after mixing |
 | `--encoding` — default `float32` | or `pcm24` |
 | `--clip` / `--error-on-clip` | what to do about samples past full scale. Neither: write and count |
-| `--trim-to-residual` | drop the leading silence a `--start` offset puts in |
+| `--trim-to-excerpt` | drop the leading silence a `--start` offset puts in (`--trim-to-residual` still works) |
 | `-v`, `--verbose` | the per-band table. `RMP_RESIDUAL_DETAIL` does the same |
 
 ### How the level is decided, and why it is not obvious
@@ -626,13 +705,16 @@ is also simply absent.
 ### Timeline
 
 Output sample 0 is source sample 0. A book analysed with `-s 2.0` therefore renders two seconds of
-leading silence, and `--trim-to-residual` removes it. This matters when mixing: `rmp -s 2.0 -o
-fof.wav` writes the *excerpt* starting at sample 0, so the two need `--trim-to-residual` to line up.
-`rmpsynth` says so when it sees the combination. With `--fof-audio` the output is as long as the
-longer of the two, and a short FOF file is padded rather than truncating the residual.
+leading silence, and `--trim-to-excerpt` removes it. The atoms and the residual are always placed
+together: both at the excerpt's source position, or both at zero.
 
-Nothing is ever normalised, and the render stops exactly at the end of the analysed residual — no
-filter tail is appended.
+The output is as long as the longer of the two. That is usually the atoms: the residual stops exactly
+at the end of the analysed excerpt, with no filter tail, but the atoms' tails run on past it — the
+parts the analysis truncated at the excerpt end are audible again. Nothing is ever normalised.
+
+A trimmed render's *noise* is a different realisation from an untrimmed one's: the noise streams
+also run through the leading silence. Both have the same spectrum and level; they are just not the
+same samples.
 
 ### Cost
 
@@ -678,9 +760,14 @@ rmpstat summary book.json -c settings.toml   # atoms, energy, parameter spread
 rmpstat diag    book.json -c settings.toml   # per-block seeds and energy share,
                                              #   refinement drift, conditioning
 rmpstat hist    book.json --of alpha,bandwidth,f --weight energy
+rmpstat hist    book.json --of sigma,bandwidth   # gaussian atoms; alpha/beta skip them
 rmpstat snr     book.json -f svg -o snr.svg  # convergence curve
 rmpstat wv      book.json -f png -o wv.png --log-freq --floor 65
 ```
+
+`alpha`, `beta`, `alpha-beta`, `fade-dur` and `rho` describe FOF atoms only and `sigma` Gaussian atoms
+only; on a mixed book a histogram of one of them counts the other kind separately, outside its total.
+`bandwidth`, `q`, `support` and the placement and energy quantities apply to both.
 
 `diag` answers the two questions that decide most settings: **which blocks are actually earning
 their keep** (its energy-share column — if a rung takes 1% of energy for 5% of the seeds, drop it),
@@ -698,13 +785,20 @@ has no cross-terms. It is diagnostics only and plays no part in the pursuit.
 a float file. Exactly one byte differs and the audio is untouched — compare the book, or the data
 past byte 72.
 
-**A synthesised book is longer than the excerpt it came from.** Analysis sizes the residual by the
-input; synthesis sizes the output by the furthest atom death, so tails the analysis truncated at the
-excerpt end become audible. Over the excerpt itself the two renders are identical.
+**A rendered book is longer than the excerpt it came from.** Analysis sizes the residual by the
+input; `rmpsynth` sizes the output by the furthest atom death, so tails the analysis truncated at the
+excerpt end become audible. Over the excerpt itself the two are identical.
 
 **Unknown settings are rejected, not ignored.** A typo fails loudly, which is what you want in a
 hand-edited document.
 
-**`--book` reverses direction with no other signal.** With an input soundfile it is written; without
-one it is read and synthesised, and `--config`, `--start`, `--duration` and `--residual` become
-errors rather than being silently ignored.
+**`[dictionary] alphas` is refused.** The dictionary holds one section per atom kind now; put a
+`[dictionary.fof]` header above `alphas`, `betas_ms` and `alpha_beta_max`. The shipped documents in
+`data/config` are already migrated.
+
+**`rmp` no longer renders.** `rmp in.wav -o out.wav` and `rmp -b book.json -o out.wav` both fail,
+naming the `rmpsynth -b ... -o ...` command that replaces them. `--fof-audio` is gone from `rmpsynth`
+because it renders the atoms itself.
+
+**A mixed book does not fully replay through rfofs.** Its FOF atoms convert to rfofs parameters
+unchanged; its Gaussian atoms have no rfofs representation. `rmpsynth` renders both.

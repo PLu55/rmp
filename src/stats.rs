@@ -17,10 +17,17 @@
 //! ([`crate::fof::EnvelopeParams::with_policy`]), so its distribution is a function of alpha's and
 //! piles up on the rails. It is exposed because that pile-up says whether the alpha range has
 //! escaped the release policy, not because it varies independently.
+//!
+//! **Most shape quantities belong to one atom kind.** `alpha`, `beta`, `alpha*beta`, `fade_dur` and
+//! `rho` describe a FOF and `sigma` a Gaussian; [`Evaluator::eval`] returns `None` for an atom they
+//! do not describe, and a histogram counts that mass as [`Histogram::inapplicable`] rather than
+//! inventing a value for it. `bandwidth`, `Q`, `support` and everything about placement and energy
+//! apply to both.
 
+use crate::atom::{AtomKind, Shape};
 use crate::book::Book;
 use crate::dict::Dictionary;
-use crate::fof::{Envelope, EnvelopeParams, FofError};
+use crate::fof::{Envelope, FofError};
 use crate::signal::db_fs;
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -75,8 +82,10 @@ impl Summary {
 pub enum Quantity {
     /// Decay coefficient, s^-1.
     Alpha,
-    /// The -3 dB bandwidth, `alpha / PI` Hz (`fof::EnvelopeParams::alpha`).
+    /// The -3 dB bandwidth: `alpha / PI` Hz for a FOF, `sqrt(ln 2) / (PI sigma)` for a Gaussian.
     Bandwidth,
+    /// A Gaussian's envelope standard deviation, milliseconds.
+    Sigma,
     /// Attack duration, milliseconds.
     Beta,
     /// `alpha * beta`. Walls at 4 (the grid and refinement cap), 6.908 (`ln(1/fade_level)`, where
@@ -94,7 +103,7 @@ pub enum Quantity {
     SupportMs,
     /// Fade-out ramp, milliseconds. Expect rails — see the module docs.
     FadeDurMs,
-    /// `f * PI / alpha`, the formant's Q.
+    /// `f / bandwidth`: the formant's Q, `f * PI / alpha` for a FOF.
     Q,
     /// `alpha / (2 * PI * f)`, the u/v coherence the projection sees. Near 1 is ill-conditioned
     /// (`dict::Block::rho`).
@@ -111,6 +120,7 @@ impl Quantity {
         match self {
             Self::Alpha => "alpha (1/s)",
             Self::Bandwidth => "bandwidth (Hz)",
+            Self::Sigma => "sigma (ms)",
             Self::Beta => "beta (ms)",
             Self::AlphaBeta => "alpha*beta",
             Self::Freq => "f (Hz)",
@@ -119,7 +129,7 @@ impl Quantity {
             Self::T0 => "t0 (s)",
             Self::SupportMs => "support (ms)",
             Self::FadeDurMs => "fade_dur (ms)",
-            Self::Q => "Q = f*pi/alpha",
+            Self::Q => "Q = f/bandwidth",
             Self::Rho => "rho = alpha/(2*pi*f)",
             Self::Periods => "carrier periods",
             Self::Block => "seed block",
@@ -135,6 +145,7 @@ impl Quantity {
             self,
             Self::Alpha
                 | Self::Bandwidth
+                | Self::Sigma
                 | Self::Beta
                 | Self::AlphaBeta
                 | Self::Freq
@@ -159,6 +170,7 @@ impl std::str::FromStr for Quantity {
         Ok(match k.as_str() {
             "alpha" => Self::Alpha,
             "bandwidth" | "bw" => Self::Bandwidth,
+            "sigma" | "sigmams" => Self::Sigma,
             "beta" => Self::Beta,
             "alphabeta" | "ab" => Self::AlphaBeta,
             "f" | "freq" | "frequency" => Self::Freq,
@@ -178,16 +190,18 @@ impl std::str::FromStr for Quantity {
 
 /// Evaluates a [`Quantity`] over a book, rendering envelopes only when one is actually needed.
 ///
-/// The memo is on the exact `(alpha, beta)` bits. That is worth nothing on a refined book — the
-/// values are continuous, so essentially every atom is distinct — and collapses an unrefined one
-/// to the handful of dictionary blocks for free. Quantizing the key would not help: measured on a
-/// 5000-atom refined book, 3125 atoms still land in distinct buckets at 5% log quantization.
+/// The memo is on the exact shape bits ([`Shape::cache_key`]). That is worth nothing on a refined
+/// book — the values are continuous, so essentially every atom is distinct — and collapses an
+/// unrefined one to the handful of dictionary blocks for free. Quantizing the key would not help:
+/// measured on a 5000-atom refined book, 3125 atoms still land in distinct buckets at 5% log
+/// quantization.
 pub struct Evaluator {
     sample_rate: f32,
     initial_energy: f64,
-    /// Skip the render and use `support ~= ln(1/fade_level) * sr / alpha`.
+    /// Skip the render and use [`Shape::approx_support_len`]: `ln(1/fade_level) * sr / alpha` for a
+    /// FOF, exact for a Gaussian.
     pub fast_support: bool,
-    support: HashMap<(u32, u32), usize>,
+    support: HashMap<(u8, u32, u32), usize>,
 }
 
 impl Evaluator {
@@ -205,13 +219,11 @@ impl Evaluator {
     /// The formula is an estimate, not a definition: rfofs clamps `decay_end` to at least
     /// `attack_end` and its death sample depends on internal rounding, which is why the engine
     /// derives support by rendering. The two agree within a factor of 0.8..1.6.
-    fn support_len(&mut self, env: EnvelopeParams) -> Result<usize, FofError> {
+    fn support_len(&mut self, env: Shape) -> Result<usize, FofError> {
         if self.fast_support {
-            let n = -(env.fade_level as f64).ln() * self.sample_rate as f64 / env.alpha as f64;
-            let attack = (env.beta * self.sample_rate).ceil() as f64;
-            return Ok(n.max(attack).ceil().max(1.0) as usize);
+            return Ok(env.approx_support_len(self.sample_rate));
         }
-        let key = (env.alpha.to_bits(), env.beta.to_bits());
+        let key = env.cache_key();
         if let Some(&n) = self.support.get(&key) {
             return Ok(n);
         }
@@ -220,18 +232,36 @@ impl Evaluator {
         Ok(n)
     }
 
-    /// `q` evaluated on one selection.
-    pub fn eval(&mut self, s: &crate::book::Selection, q: Quantity) -> Result<f64, FofError> {
-        let (a, b, f) = (
-            s.atom.env.alpha as f64,
-            s.atom.env.beta as f64,
-            s.atom.f as f64,
-        );
-        Ok(match q {
-            Quantity::Alpha => a,
-            Quantity::Bandwidth => a / PI,
-            Quantity::Beta => b * 1e3,
-            Quantity::AlphaBeta => a * b,
+    /// `q` evaluated on one selection, or `None` when `q` does not describe this atom's kind.
+    pub fn eval(
+        &mut self,
+        s: &crate::book::Selection,
+        q: Quantity,
+    ) -> Result<Option<f64>, FofError> {
+        let f = s.atom.f as f64;
+        let (fof, gauss) = (s.atom.env.as_fof(), s.atom.env.as_gaussian());
+        Ok(Some(match q {
+            Quantity::Alpha => {
+                let Some(p) = fof else { return Ok(None) };
+                p.alpha as f64
+            }
+            Quantity::Bandwidth => match (fof, gauss) {
+                (Some(p), _) => p.alpha as f64 / PI,
+                (_, Some(g)) => g.bandwidth_hz() as f64,
+                _ => unreachable!(),
+            },
+            Quantity::Sigma => {
+                let Some(g) = gauss else { return Ok(None) };
+                g.sigma as f64 * 1e3
+            }
+            Quantity::Beta => {
+                let Some(p) = fof else { return Ok(None) };
+                p.beta as f64 * 1e3
+            }
+            Quantity::AlphaBeta => {
+                let Some(p) = fof else { return Ok(None) };
+                p.alpha as f64 * p.beta as f64
+            }
             Quantity::Freq => f,
             Quantity::AmpDb => db_fs(s.atom.amp as f64) as f64,
             Quantity::EnergyDb => {
@@ -245,17 +275,23 @@ impl Evaluator {
             Quantity::SupportMs => {
                 self.support_len(s.atom.env)? as f64 * 1e3 / self.sample_rate as f64
             }
-            Quantity::FadeDurMs => s.atom.env.fade_dur as f64 * 1e3,
+            Quantity::FadeDurMs => {
+                let Some(p) = fof else { return Ok(None) };
+                p.fade_dur as f64 * 1e3
+            }
             Quantity::Q => {
-                if a > 0.0 {
-                    f * PI / a
-                } else {
-                    f64::INFINITY
-                }
+                // Written per kind so a FOF's Q stays `f * PI / alpha` to the last bit.
+                let (num, den) = match (fof, gauss) {
+                    (Some(p), _) => (f * PI, p.alpha as f64),
+                    (_, Some(g)) => (f, g.bandwidth_hz() as f64),
+                    _ => unreachable!(),
+                };
+                if den > 0.0 { num / den } else { f64::INFINITY }
             }
             Quantity::Rho => {
+                let Some(p) = fof else { return Ok(None) };
                 if f > 0.0 {
-                    a / (2.0 * PI * f)
+                    p.alpha as f64 / (2.0 * PI * f)
                 } else {
                     f64::INFINITY
                 }
@@ -264,11 +300,11 @@ impl Evaluator {
                 self.support_len(s.atom.env)? as f64 * f / self.sample_rate as f64
             }
             Quantity::Block => s.block as f64,
-        })
+        }))
     }
 
-    /// `q` over every selection, in book order.
-    pub fn column(&mut self, book: &Book, q: Quantity) -> Result<Vec<f64>, FofError> {
+    /// `q` over every selection, in book order. `None` where `q` does not describe the atom.
+    pub fn column(&mut self, book: &Book, q: Quantity) -> Result<Vec<Option<f64>>, FofError> {
         book.selections.iter().map(|s| self.eval(s, q)).collect()
     }
 }
@@ -297,6 +333,9 @@ pub struct Histogram {
     pub above: f64,
     /// Mass that had no finite value — a zero-frequency atom's `Q`, say.
     pub skipped: f64,
+    /// Mass from atoms the quantity does not describe — a Gaussian's `alpha`. Not part of `total`:
+    /// a histogram of `alpha` is a histogram over the FOFs.
+    pub inapplicable: f64,
     pub total: f64,
     pub log: bool,
     pub stats: Summary,
@@ -333,6 +372,7 @@ pub fn histogram(
 
     let usable: Vec<f64> = xs
         .iter()
+        .flatten()
         .copied()
         .filter(|x| x.is_finite() && (!log || *x > 0.0))
         .collect();
@@ -366,7 +406,12 @@ pub fn histogram(
 
     let mut counts = vec![0.0; bins];
     let (mut below, mut above, mut skipped, mut total) = (0.0, 0.0, 0.0, 0.0);
+    let mut inapplicable = 0.0;
     for (&x, &wt) in xs.iter().zip(&ws) {
+        let Some(x) = x else {
+            inapplicable += wt;
+            continue;
+        };
         total += wt;
         if !x.is_finite() || (log && x <= 0.0) {
             skipped += wt;
@@ -394,6 +439,7 @@ pub fn histogram(
         below,
         above,
         skipped,
+        inapplicable,
         total,
         log,
         stats,
@@ -506,8 +552,7 @@ fn frac(k: usize, n: usize) -> f64 {
 #[derive(Clone, Copy, Debug)]
 pub struct BlockUse {
     pub index: usize,
-    pub alpha: f32,
-    pub beta_ms: f32,
+    pub shape: Shape,
     pub support_len: usize,
     pub count: usize,
     /// Share of `sum(energy_removed)` the block's seeds account for.
@@ -523,13 +568,15 @@ pub struct BlockUse {
 #[derive(Clone, Debug)]
 pub struct Diagnostics {
     pub blocks: Vec<BlockUse>,
-    /// Set when more than a quarter of the seeds sit on the first or last alpha rung.
+    /// Set when more than a quarter of a family's seeds sit on its first or last rung.
     pub edge_pileup: Option<String>,
-    /// `|ln(alpha / alpha_seed)|` — how far refinement walked, in ladder rungs. The alpha ladder
-    /// steps by 1.6, so `ln 1.6 = 0.47` is one rung.
+    /// `|ln(alpha / alpha_seed)|` over the FOFs — how far refinement walked, in ladder rungs. The
+    /// alpha ladder steps by 1.6, so `ln 1.6 = 0.47` is one rung.
     pub d_ln_alpha: Summary,
     /// `|ln(beta / beta_seed)|`. The beta ladder steps by about 3.3, so one rung is `ln 3.3 = 1.19`.
     pub d_ln_beta: Summary,
+    /// `|ln(sigma / sigma_seed)|` over the Gaussians. A 2.5 ladder puts one rung at `ln 2.5 = 0.92`.
+    pub d_ln_sigma: Summary,
     /// `|f - bin_hz(bin)|`, Hz.
     pub d_f_hz: Summary,
     /// `|t0 - onset|`, samples.
@@ -544,7 +591,7 @@ pub fn diagnose(book: &Book, dict: &Dictionary, rho_sq_max: f32) -> Diagnostics 
     let n_blocks = dict.blocks.len();
     let hist = book.block_histogram(n_blocks);
     let mut energy = vec![0.0f64; n_blocks];
-    let (mut d_a, mut d_b, mut d_f, mut d_t) = (vec![], vec![], vec![], vec![]);
+    let (mut d_a, mut d_b, mut d_s, mut d_f, mut d_t) = (vec![], vec![], vec![], vec![], vec![]);
     let (mut off_grid, mut ill) = (0usize, 0usize);
     let mut total_energy = 0.0f64;
 
@@ -558,10 +605,22 @@ pub fn diagnose(book: &Book, dict: &Dictionary, rho_sq_max: f32) -> Diagnostics 
 
         // `Selection::block` is the seed's provenance, so the block's own envelope is the
         // before-picture and `atom.env` is whatever refinement settled on.
-        let seed = block.env.params;
-        d_a.push((s.atom.env.alpha as f64 / seed.alpha as f64).ln().abs());
-        if seed.beta > 0.0 && s.atom.env.beta > 0.0 {
-            d_b.push((s.atom.env.beta as f64 / seed.beta as f64).ln().abs());
+        match (block.env.params, s.atom.env) {
+            (Shape::Fof(seed), Shape::Fof(atom)) => {
+                d_a.push((atom.alpha as f64 / seed.alpha as f64).ln().abs());
+                if seed.beta > 0.0 && atom.beta > 0.0 {
+                    d_b.push((atom.beta as f64 / seed.beta as f64).ln().abs());
+                }
+            }
+            (Shape::Gaussian(seed), Shape::Gaussian(atom)) => {
+                d_s.push((atom.sigma as f64 / seed.sigma as f64).ln().abs());
+            }
+            // Refinement never changes kind, so a seed block of the other kind means the config
+            // does not describe the run that wrote this book.
+            _ => {
+                off_grid += 1;
+                continue;
+            }
         }
         d_f.push((s.atom.f - block.bin_hz(s.bin)).abs() as f64);
         d_t.push((s.atom.t0 - s.onset as i64).abs() as f64);
@@ -579,8 +638,7 @@ pub fn diagnose(book: &Book, dict: &Dictionary, rho_sq_max: f32) -> Diagnostics 
         .enumerate()
         .map(|(i, b)| BlockUse {
             index: i,
-            alpha: b.env.params.alpha,
-            beta_ms: b.env.params.beta * 1e3,
+            shape: b.env.params,
             support_len: b.support_len(),
             count: hist[i],
             energy_share: if total_energy > 0.0 {
@@ -591,28 +649,39 @@ pub fn diagnose(book: &Book, dict: &Dictionary, rho_sq_max: f32) -> Diagnostics 
         })
         .collect();
 
-    // Selections piling up at an alpha edge mean the ladder is mis-sized: the pursuit wants a
-    // shape the grid does not reach and settles for the nearest rung.
-    let total: usize = hist.iter().sum();
-    let edge_pileup = (n_blocks > 0 && total > 0)
-        .then(|| {
-            // The grid is generated alpha-major, so the first and last blocks are the extreme
-            // rungs whatever the beta count is.
-            let edge = hist[0] + hist[n_blocks - 1];
-            (edge * 4 > total).then(|| {
-                format!(
-                    "{:.0}% of seeds are on the first or last alpha rung — the ladder may not reach far enough",
-                    100.0 * edge as f64 / total as f64
-                )
-            })
-        })
-        .flatten();
+    // Selections piling up at a ladder edge mean it is mis-sized: the pursuit wants a shape the grid
+    // does not reach and settles for the nearest rung. Judged per family, since each is its own
+    // ladder, and against that family's own seeds.
+    let mut warnings = Vec::new();
+    for (kind, rung) in [(AtomKind::Fof, "alpha"), (AtomKind::Gaussian, "sigma")] {
+        let family: Vec<usize> =
+            (0..n_blocks).filter(|&i| dict.blocks[i].env.kind() == kind).collect();
+        let (Some(&first), Some(&last)) = (family.first(), family.last()) else {
+            continue;
+        };
+        let seeds: usize = family.iter().map(|&i| hist[i]).sum();
+        if seeds == 0 {
+            continue;
+        }
+        // Each family is generated rung-major (alpha before beta), so its first and last blocks
+        // are the extreme rungs whatever the beta count is.
+        let edge = hist[first] + hist[last];
+        if edge * 4 > seeds {
+            warnings.push(format!(
+                "{:.0}% of {kind} seeds are on the first or last {rung} rung — the ladder may not \
+                 reach far enough",
+                100.0 * edge as f64 / seeds as f64
+            ));
+        }
+    }
+    let edge_pileup = (!warnings.is_empty()).then(|| warnings.join("; "));
 
     Diagnostics {
         blocks,
         edge_pileup,
         d_ln_alpha: Summary::of(&d_a),
         d_ln_beta: Summary::of(&d_b),
+        d_ln_sigma: Summary::of(&d_s),
         d_f_hz: Summary::of(&d_f),
         d_t0: Summary::of(&d_t),
         off_grid_seeds: off_grid,
@@ -624,14 +693,15 @@ pub fn diagnose(book: &Book, dict: &Dictionary, rho_sq_max: f32) -> Diagnostics 
 mod tests {
     use super::*;
     use crate::book::Selection;
-    use crate::fof::AtomParams;
+    use crate::fof::{AtomParams, EnvelopeParams};
+    use crate::gauss::GaussianParams;
 
     fn sel(alpha: f32, beta: f32, f: f32, amp: f32, energy: f64) -> Selection {
         Selection {
             atom: AtomParams {
                 t0: 0,
                 f,
-                env: EnvelopeParams::new(alpha, beta),
+                env: EnvelopeParams::new(alpha, beta).into(),
                 phi: 0.0,
                 amp,
             },
@@ -735,12 +805,41 @@ mod tests {
         let b = book_of(vec![sel(314.159_27, 0.002, 1000.0, 0.5, 1.0)]);
         let mut ev = Evaluator::new(&b);
         let s = &b.selections[0];
-        assert!((ev.eval(s, Quantity::Bandwidth).unwrap() - 100.0).abs() < 1e-3);
-        assert!((ev.eval(s, Quantity::Beta).unwrap() - 2.0).abs() < 1e-6);
-        assert!((ev.eval(s, Quantity::AlphaBeta).unwrap() - 0.628_318_5).abs() < 1e-6);
+        let mut at = |q| ev.eval(s, q).unwrap();
+        assert!((at(Quantity::Bandwidth).unwrap() - 100.0).abs() < 1e-3);
+        assert!((at(Quantity::Beta).unwrap() - 2.0).abs() < 1e-6);
+        assert!((at(Quantity::AlphaBeta).unwrap() - 0.628_318_5).abs() < 1e-6);
         // Q = f*pi/alpha = 1000*pi/314.15927 = 10.
-        assert!((ev.eval(s, Quantity::Q).unwrap() - 10.0).abs() < 1e-4);
-        assert!((ev.eval(s, Quantity::AmpDb).unwrap() + 6.0206).abs() < 1e-3);
+        assert!((at(Quantity::Q).unwrap() - 10.0).abs() < 1e-4);
+        assert!((at(Quantity::AmpDb).unwrap() + 6.0206).abs() < 1e-3);
+        assert_eq!(at(Quantity::Sigma), None, "a FOF has no sigma");
+    }
+
+    /// A Gaussian answers the quantities that describe it, declines the FOF-only ones, and a
+    /// histogram over a mixed book keeps the declined mass apart instead of dropping or faking it.
+    #[test]
+    fn a_gaussian_has_its_own_quantities_and_the_rest_are_inapplicable() {
+        let mut g = sel(100.0, 0.001, 1000.0, 1.0, 5.0);
+        g.atom.env = GaussianParams::new(0.005).into();
+        let b = book_of(vec![sel(100.0, 0.001, 400.0, 1.0, 1.0), g]);
+        let mut ev = Evaluator::new(&b);
+        let s = &b.selections[1];
+        for q in [Quantity::Alpha, Quantity::Beta, Quantity::AlphaBeta, Quantity::FadeDurMs, Quantity::Rho] {
+            assert_eq!(ev.eval(s, q).unwrap(), None, "{q:?}");
+        }
+        assert!((ev.eval(s, Quantity::Sigma).unwrap().unwrap() - 5.0).abs() < 1e-4);
+        let bw = ev.eval(s, Quantity::Bandwidth).unwrap().unwrap();
+        assert!((bw - 0.2650 / 0.005).abs() < 0.1, "bandwidth {bw}");
+        assert!((ev.eval(s, Quantity::Q).unwrap().unwrap() - 1000.0 / bw).abs() < 1e-3);
+        let support = GaussianParams::new(0.005).support_len(48_000.0) as f64;
+        assert_eq!(ev.eval(s, Quantity::SupportMs).unwrap(), Some(support * 1e3 / 48_000.0));
+
+        for w in [Weight::Count, Weight::Energy] {
+            let h = histogram(&b, &mut ev, Quantity::Alpha, 4, None, None, w).unwrap();
+            let inside: f64 = h.counts.iter().sum();
+            let (want_total, want_other) = if w == Weight::Count { (1.0, 1.0) } else { (1.0, 5.0) };
+            assert_eq!((inside, h.total, h.inapplicable), (want_total, want_total, want_other));
+        }
     }
 
     /// The estimate and the render agree within the bound the engine's own test asserts, so
@@ -756,9 +855,9 @@ mod tests {
         let mut fast = Evaluator::new(&b);
         fast.fast_support = true;
         for s in &b.selections {
-            let e = exact.eval(s, Quantity::SupportMs).unwrap();
-            let f = fast.eval(s, Quantity::SupportMs).unwrap();
-            assert!((0.8..1.6).contains(&(e / f)), "alpha {} {e} vs {f}", s.atom.env.alpha);
+            let e = exact.eval(s, Quantity::SupportMs).unwrap().unwrap();
+            let f = fast.eval(s, Quantity::SupportMs).unwrap().unwrap();
+            assert!((0.8..1.6).contains(&(e / f)), "{} {e} vs {f}", s.atom.env.describe());
         }
     }
 

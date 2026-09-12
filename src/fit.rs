@@ -336,8 +336,14 @@ pub fn score_slice(
 ///
 /// Falls back to the full support if no sample reaches the threshold, which is the safe direction:
 /// an over-long fit region costs accuracy, a truncated one costs correctness.
+///
+/// A Gaussian has no release, so its fit region is its whole support: every sample of it says as
+/// much about `sigma` as any other, and the truncated tails are already at the cutoff level.
 pub fn fit_end(env: &Envelope) -> usize {
-    let theta = env.params.fade_level / env.params.amax();
+    let Some(params) = env.params.as_fof() else {
+        return env.support_len();
+    };
+    let theta = params.fade_level / params.amax();
     let usable = theta > 0.0 && theta.is_finite();
     if !usable {
         return env.support_len();
@@ -355,9 +361,17 @@ mod tests {
     use crate::dict::{Block, BlockConfig, Dictionary};
     use crate::fft::Planner;
     use crate::fof::{AtomParams, EnvelopeParams};
+    use crate::gauss::GaussianParams;
 
     const SR: f32 = 48_000.0;
     const RHO: f64 = 1.0 - 1e-4;
+
+    fn gaussians() -> Dictionary {
+        let mut planner = Planner::new();
+        let shapes: Vec<crate::atom::Shape> =
+            [0.001f32, 0.003, 0.009].iter().map(|&s| GaussianParams::new(s).into()).collect();
+        Dictionary::from_shapes(&shapes, SR, &mut planner, &BlockConfig::default()).unwrap()
+    }
 
     fn xorshift(state: &mut u64) -> f32 {
         *state ^= *state << 13;
@@ -520,6 +534,73 @@ mod tests {
         assert!(got.energy / total > 0.999, "captured {} of {total}", got.energy);
     }
 
+    /// The same gate as `on_grid_score_matches_the_block_gram`, for Gaussian blocks: the off-grid
+    /// path and the block's FFT-derived Gram must agree on the envelope they were both handed.
+    #[test]
+    fn on_grid_gaussian_score_matches_the_block_gram() {
+        let dict = gaussians();
+        let mut planner = Planner::new();
+        let signal = noise(24_000, 0x9a55);
+        let mut checked = 0;
+
+        for (bi, block) in dict.blocks.iter().enumerate() {
+            let mut corr = Correlator::new(block, &mut planner);
+            let frames = block.frame_count(signal.len());
+            for n in [0, 1, frames / 3, frames / 2] {
+                let onset = block.frame_onset(n);
+                if onset + block.support_len() > signal.len() {
+                    continue;
+                }
+                corr.correlate(block, &signal, onset);
+                for k in [block.k_lo, block.k_lo + 7, (block.k_lo + block.k_hi) / 2, block.k_hi] {
+                    let (d_u, d_v) = corr.at(k);
+                    let want = project(block, k, d_u, d_v);
+                    if want.energy <= 0.0 {
+                        continue;
+                    }
+                    let got = score(&signal, &block.env, onset as i64, block.bin_hz(k), RHO)
+                        .unwrap_or_else(|| panic!("block {bi} bin {k} rejected"));
+                    let rel = (got.energy - want.energy).abs() / want.energy;
+                    assert!(rel < 2e-4, "block {bi} bin {k}: energy {got:?} vs {want:?}");
+                    let dphi = (got.phi - want.phi).abs();
+                    let dphi = dphi.min((std::f32::consts::TAU - dphi).abs());
+                    assert!(dphi < 2e-3, "block {bi} bin {k}: phi {} vs {}", got.phi, want.phi);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 20, "only {checked} cells compared");
+    }
+
+    #[test]
+    fn recovers_a_planted_gaussian_off_the_grid() {
+        let dict = gaussians();
+        let block = &dict.blocks[1];
+        let atom = AtomParams {
+            t0: 3_333,
+            f: block.bin_hz(block.k_lo + 40) + 0.37 * block.bin_hz(1),
+            env: block.env.params,
+            phi: 0.9,
+            amp: 0.42,
+        };
+        let mut signal = vec![0.0f32; 20_000];
+        crate::signal::add_at(&mut signal, &atom.render(SR).unwrap(), atom.t0);
+
+        let got = score(&signal, &block.env, atom.t0, atom.f, RHO).unwrap();
+        assert!((got.amp - atom.amp).abs() / atom.amp < 5e-3, "amp {} vs {}", got.amp, atom.amp);
+        assert!((got.phi - atom.phi).abs() < 5e-3, "phi {} vs {}", got.phi, atom.phi);
+        let total = crate::signal::energy_of(&signal);
+        assert!(got.energy / total > 0.999, "captured {} of {total}", got.energy);
+    }
+
+    /// A Gaussian has no release, so its fit region is its whole support.
+    #[test]
+    fn a_gaussian_fits_over_its_whole_support() {
+        for block in &gaussians().blocks {
+            assert_eq!(fit_end(&block.env), block.support_len());
+        }
+    }
+
     #[test]
     fn energy_at_the_least_squares_solution_equals_solve() {
         let dict = voice();
@@ -612,7 +693,7 @@ mod tests {
         let dict = voice();
         for block in &dict.blocks {
             let env = &block.env;
-            let p = env.params;
+            let p = env.params.as_fof().unwrap();
             let got = fit_end(env);
             let analytic = {
                 let natural =
@@ -645,8 +726,8 @@ mod tests {
             let tail: f64 = env.samples[cut..].iter().map(|&e| (e as f64).powi(2)).sum();
             assert!(
                 tail / env.energy < 1e-3,
-                "alpha={}: tail carries {:.2e} of the energy",
-                env.params.alpha,
+                "{}: tail carries {:.2e} of the energy",
+                env.params.describe(),
                 tail / env.energy
             );
         }

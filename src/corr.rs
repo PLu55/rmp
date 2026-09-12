@@ -33,7 +33,7 @@
 
 use crate::dict::Block;
 use crate::fft::RealFft;
-use crate::fof::{AtomParams, EnvelopeParams};
+use crate::fof::AtomParams;
 use realfft::num_complex::Complex32;
 
 /// The best atom in one (frame, bin) cell.
@@ -180,7 +180,7 @@ impl Correlator {
         AtomParams {
             t0: onset as i64,
             f: block.bin_hz(k),
-            env: EnvelopeParams { ..block.env.params },
+            env: block.env.params,
             phi: p.phi,
             amp: p.amp,
         }
@@ -192,6 +192,7 @@ mod tests {
     use super::*;
     use crate::dict::{BlockConfig, Dictionary};
     use crate::fft::Planner;
+    use crate::fof::EnvelopeParams;
     use std::f64::consts::TAU;
 
     const SR: f32 = 48_000.0;

@@ -1,7 +1,8 @@
-//! Matching pursuit decomposition of audio into FOF atoms.
+//! Matching pursuit decomposition of audio into FOF and Gaussian atoms.
 //!
 //! See `CLAUDE.md` for the project overview and the design plan it references.
 
+pub mod atom;
 pub mod audio;
 pub mod book;
 pub mod cand;
@@ -11,6 +12,7 @@ pub mod dict;
 pub mod fft;
 pub mod fit;
 pub mod fof;
+pub mod gauss;
 pub mod hrmp;
 pub mod mp;
 pub mod naive;
@@ -21,7 +23,9 @@ pub mod stats;
 pub mod synth;
 pub mod tfmap;
 
+pub use atom::{AtomKind, Shape};
 pub use book::{Book, Selection};
+pub use gauss::GaussianParams;
 pub use cand::{Candidate, Seed, top_seeds};
 pub use config::Config;
 pub use corr::{Correlator, Projection, project};

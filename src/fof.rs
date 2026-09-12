@@ -41,6 +41,11 @@
 
 use rfofs::fof::{FofParams, FofPhase, FofState};
 
+// The generic atom and envelope live in `atom`, which dispatches to this module for FOFs. Re-exported
+// so the many `crate::fof::{AtomParams, Envelope}` paths written before there was a second kind
+// keep meaning what they meant.
+pub use crate::atom::{AtomParams, Envelope};
+
 /// How the final release is chosen, fixed once when the analyzer is initialized.
 ///
 /// rfofs's release is a linear amplitude ramp to zero, entered where the raw exponential decay
@@ -146,7 +151,7 @@ impl EnvelopeParams {
         rfofs::fof_amax(self.alpha, self.beta)
     }
 
-    fn validate(&self) -> Result<(), FofError> {
+    pub(crate) fn validate(&self) -> Result<(), FofError> {
         if !(self.alpha > 0.0 && self.alpha.is_finite()) {
             return Err(FofError::UnboundedSupport("alpha must be > 0"));
         }
@@ -169,43 +174,25 @@ impl EnvelopeParams {
     }
 }
 
-/// A complete atom: envelope, carrier and placement.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AtomParams {
-    /// Onset in samples, relative to the analysed signal's origin. Signed so an atom may start
-    /// before the excerpt.
-    pub t0: i64,
-    /// Carrier frequency, Hz.
-    pub f: f32,
-    pub env: EnvelopeParams,
-    /// Carrier phase, radians. rfofs convention: `sin(phi + 2*pi*f*t/sr)`.
-    pub phi: f32,
-    /// Linear amplitude. Equals the fitted coefficient against the peak-normalized envelope.
-    pub amp: f32,
-}
-
-impl AtomParams {
-    /// Convert to rfofs parameters for rendering at absolute sample `origin + t0`.
-    ///
-    /// Panics if the resulting onset is negative — rfofs's `start_sample` is unsigned.
-    pub fn to_fof_params(&self, origin: u64) -> FofParams {
-        let start = origin as i64 + self.t0;
-        assert!(start >= 0, "atom onset {start} precedes the sample clock origin");
-        FofParams {
-            id: 0,
-            start_sample: start as u64,
-            f: self.f,
-            gliss: 0.0,
-            phi: self.phi,
-            amp: self.amp,
-            alpha: self.env.alpha,
-            beta: self.env.beta,
-            fade_level: self.env.fade_level,
-            fade_dur: self.env.fade_dur,
-            azm: 0.0,
-            elev: 0.0,
-            distance: 0.0,
-        }
+/// rfofs parameters for one FOF starting at absolute sample `start`.
+///
+/// Carrier phase follows rfofs's convention, `sin(phi + 2*pi*f*t/sr)` with `t` counted from the
+/// onset. Amplitude maps directly: it is the fitted coefficient against the rendered basis.
+pub fn fof_params(env: &EnvelopeParams, start: u64, f: f32, phi: f32, amp: f32) -> FofParams {
+    FofParams {
+        id: 0,
+        start_sample: start,
+        f,
+        gliss: 0.0,
+        phi,
+        amp,
+        alpha: env.alpha,
+        beta: env.beta,
+        fade_level: env.fade_level,
+        fade_dur: env.fade_dur,
+        azm: 0.0,
+        elev: 0.0,
+        distance: 0.0,
     }
 }
 
@@ -232,101 +219,64 @@ impl std::fmt::Display for FofError {
 
 impl std::error::Error for FofError {}
 
-/// A block's envelope, obtained by rendering.
-#[derive(Clone, Debug)]
-pub struct Envelope {
-    pub params: EnvelopeParams,
-    pub sample_rate: f32,
-    /// The envelope, peak-normalized, truncated to its support. `samples.len() == support_len`.
-    pub samples: Vec<f32>,
-    /// `sum(E^2)`, accumulated in f64.
-    pub energy: f64,
+/// Render the probe grain and return the envelope, truncated to its support.
+///
+/// The FOF arm of [`Envelope::render`].
+pub(crate) fn render_probe(params: EnvelopeParams, sample_rate: f32) -> Result<Vec<f32>, FofError> {
+    params.validate()?;
+    if !(sample_rate > 0.0 && sample_rate.is_finite()) {
+        return Err(FofError::Invalid("sample_rate must be > 0"));
+    }
+
+    // carrier == 1 at every sample
+    let probe = fof_params(&params, 0, 0.0, std::f32::consts::FRAC_PI_2, 1.0);
+
+    // Upper bound on the support, plus slack so we can prove the grain died inside the buffer.
+    //
+    // rfofs clamps `decay_end = decay_end_raw.max(attack_end)`, so a grain whose attack
+    // outlasts its decay lives until the attack finishes. Bounding by the decay alone
+    // underestimates the support for large `beta`.
+    let attack = (params.beta * sample_rate).ceil() as usize;
+    // Attack-plus-decay duration in samples, excluding the fade ramp.
+    let natural = probe.natural_duration_samples(sample_rate).ceil() as usize;
+    let fade = (params.fade_dur * sample_rate).ceil() as usize;
+    let capacity = attack.max(natural) + fade + 64;
+
+    let mut buf = vec![0.0f32; capacity];
+    let mut state = FofState::spawn(probe, sample_rate);
+    state.fill_block(sample_rate, 0, &mut buf);
+
+    if state.phase != FofPhase::Dead {
+        return Err(FofError::UnboundedSupport(
+            "grain outlived its computed support bound",
+        ));
+    }
+
+    let support_len = match buf.iter().rposition(|&s| s != 0.0) {
+        Some(last) => last + 1,
+        // amax returned 0.0 (alpha*beta past the cliff) so the whole grain is silent.
+        None => return Err(FofError::SilentGrain { alpha_beta: params.alpha_beta() }),
+    };
+    buf.truncate(support_len);
+    Ok(buf)
 }
 
-impl Envelope {
-    /// Render the probe grain and extract the envelope.
-    pub fn render(params: EnvelopeParams, sample_rate: f32) -> Result<Self, FofError> {
-        params.validate()?;
-        if !(sample_rate > 0.0 && sample_rate.is_finite()) {
-            return Err(FofError::Invalid("sample_rate must be > 0"));
-        }
-
-        let probe = AtomParams {
-            t0: 0,
-            f: 0.0,
-            env: params,
-            phi: std::f32::consts::FRAC_PI_2, // carrier == 1 at every sample
-            amp: 1.0,
-        };
-
-        // Upper bound on the support, plus slack so we can prove the grain died inside the buffer.
-        //
-        // rfofs clamps `decay_end = decay_end_raw.max(attack_end)`, so a grain whose attack
-        // outlasts its decay lives until the attack finishes. Bounding by the decay alone
-        // underestimates the support for large `beta`.
-        let attack = (params.beta * sample_rate).ceil() as usize;
-        let natural = probe.env_natural_samples(sample_rate);
-        let fade = (params.fade_dur * sample_rate).ceil() as usize;
-        let capacity = attack.max(natural) + fade + 64;
-
-        let mut buf = vec![0.0f32; capacity];
-        let mut state = FofState::spawn(probe.to_fof_params(0), sample_rate);
-        state.fill_block(sample_rate, 0, &mut buf);
-
-        if state.phase != FofPhase::Dead {
-            return Err(FofError::UnboundedSupport(
-                "grain outlived its computed support bound",
-            ));
-        }
-
-        let support_len = match buf.iter().rposition(|&s| s != 0.0) {
-            Some(last) => last + 1,
-            // amax returned 0.0 (alpha*beta past the cliff) so the whole grain is silent.
-            None => return Err(FofError::SilentGrain { alpha_beta: params.alpha_beta() }),
-        };
-        buf.truncate(support_len);
-
-        let energy = buf.iter().map(|&s| (s as f64) * (s as f64)).sum();
-        Ok(Self {
-            params,
-            sample_rate,
-            samples: buf,
-            energy,
-        })
-    }
-
-    pub fn support_len(&self) -> usize {
-        self.samples.len()
-    }
-}
-
-impl AtomParams {
-    /// Attack-plus-decay duration in samples, excluding the fade ramp.
-    fn env_natural_samples(&self, sample_rate: f32) -> usize {
-        let fp = self.to_fof_params(0);
-        fp.natural_duration_samples(sample_rate).ceil() as usize
-    }
-
-    /// Render this atom in isolation, starting at index 0 of `buf`.
-    ///
-    /// `buf` is **overwritten** (rfofs's `fill_block` accumulates, so it is zeroed first). The whole
-    /// grain is rendered in a single `fill_block` call: `decay_acc` is a running product carried
-    /// across calls, so splitting the render would not be bit-identical.
-    pub fn render_into(&self, sample_rate: f32, buf: &mut [f32]) {
-        buf.fill(0.0);
-        let mut placed = *self;
-        placed.t0 = 0;
-        let mut state = FofState::spawn(placed.to_fof_params(0), sample_rate);
-        state.fill_block(sample_rate, 0, buf);
-    }
-
-    /// Render this atom into a fresh buffer sized to its support.
-    pub fn render(&self, sample_rate: f32) -> Result<Vec<f32>, FofError> {
-        let env = Envelope::render(self.env, sample_rate)?;
-        let mut buf = vec![0.0f32; env.support_len()];
-        self.render_into(sample_rate, &mut buf);
-        Ok(buf)
-    }
+/// Render one FOF in isolation, starting at index 0 of `buf`.
+///
+/// `buf` is **overwritten** (rfofs's `fill_block` accumulates, so it is zeroed first). The whole
+/// grain is rendered in a single `fill_block` call: `decay_acc` is a running product carried
+/// across calls, so splitting the render would not be bit-identical.
+pub(crate) fn render_atom_into(
+    env: &EnvelopeParams,
+    f: f32,
+    phi: f32,
+    amp: f32,
+    sample_rate: f32,
+    buf: &mut [f32],
+) {
+    buf.fill(0.0);
+    let mut state = FofState::spawn(fof_params(env, 0, f, phi, amp), sample_rate);
+    state.fill_block(sample_rate, 0, buf);
 }
 
 #[cfg(test)]
@@ -480,7 +430,7 @@ mod tests {
         // Rendering at amp = A must give exactly A times the peak-normalized basis, which is the
         // property that makes fof_amax unnecessary.
         let env_p = EnvelopeParams::new(251.0, 0.002);
-        let base = AtomParams { t0: 0, f: 1000.0, env: env_p, phi: 0.3, amp: 1.0 };
+        let base = AtomParams { t0: 0, f: 1000.0, env: env_p.into(), phi: 0.3, amp: 1.0 };
         let unit = base.render(SR).unwrap();
 
         for a in [0.25f32, 2.0, -1.5] {
@@ -499,7 +449,7 @@ mod tests {
         let p = AtomParams {
             t0: 0,
             f: 440.0,
-            env: EnvelopeParams::new(251.0, 0.002),
+            env: EnvelopeParams::new(251.0, 0.002).into(),
             phi: 1.1,
             amp: 0.7,
         };
@@ -512,7 +462,7 @@ mod tests {
         let p = AtomParams {
             t0: 0,
             f: 440.0,
-            env: EnvelopeParams::new(251.0, 0.002),
+            env: EnvelopeParams::new(251.0, 0.002).into(),
             phi: 0.0,
             amp: 1.0,
         };
@@ -598,8 +548,9 @@ mod tests {
     /// exponential decay. It must be `0.5*(1 - cos(pi*t/beta_samples))` up to the attack end and
     /// exactly 1 afterwards.
     fn rise_factor(env: &Envelope, t: usize) -> f64 {
-        let a = (env.params.alpha / env.sample_rate) as f64;
-        env.samples[t] as f64 * env.params.amax() as f64 * (a * t as f64).exp()
+        let p = env.params.as_fof().unwrap();
+        let a = (p.alpha / env.sample_rate) as f64;
+        env.samples[t] as f64 * p.amax() as f64 * (a * t as f64).exp()
     }
 
     #[test]
@@ -716,7 +667,7 @@ mod tests {
         // an atom at f=0, phi=PI/2 must reproduce Envelope::render bit for bit.
         let p = EnvelopeParams::new(251.0, 0.002);
         let env = Envelope::render(p, SR).unwrap();
-        let atom = AtomParams { t0: 0, f: 0.0, env: p, phi: std::f32::consts::FRAC_PI_2, amp: 1.0 };
+        let atom = AtomParams { t0: 0, f: 0.0, env: p.into(), phi: std::f32::consts::FRAC_PI_2, amp: 1.0 };
         assert_eq!(atom.render(SR).unwrap(), env.samples);
     }
 }

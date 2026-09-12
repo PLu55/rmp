@@ -51,8 +51,9 @@ enum Cmd {
     /// Distributions of atom parameters.
     Hist {
         book: PathBuf,
-        /// Comma-separated quantities: alpha, bandwidth, beta, alpha-beta, f, amp, energy, t0,
-        /// support, fade-dur, q, rho, periods, block.
+        /// Comma-separated quantities: alpha, bandwidth, beta, alpha-beta, sigma, f, amp, energy,
+        /// t0, support, fade-dur, q, rho, periods, block. alpha, beta, alpha-beta, fade-dur and rho
+        /// describe FOF atoms only, sigma Gaussian atoms only.
         #[arg(long, value_name = "LIST", default_value = "alpha,beta,f,amp")]
         of: String,
         #[arg(long, default_value_t = 24)]
@@ -241,8 +242,9 @@ fn dictionary_at(sr: f32, config: Option<&Path>) -> Result<(Dictionary, Config, 
     };
     cfg.validate()?;
     let mut planner = Planner::new();
-    let dict = Dictionary::from_grid(&cfg.dictionary.grid(), sr, &mut planner, &cfg.block_config())
-        .map_err(|e| format!("building the dictionary: {e}"))?;
+    let dict =
+        Dictionary::from_shapes(&cfg.dictionary_shapes(), sr, &mut planner, &cfg.block_config())
+            .map_err(|e| format!("building the dictionary: {e}"))?;
     Ok((dict, cfg, note))
 }
 
@@ -350,18 +352,32 @@ fn cmd_summary(book: &Book, config: Option<&Path>) -> Result<(), String> {
 
     // The two pictures of the same book: the grid it searched, and where it ended up.
     println!("\nparameters");
+    // Per-kind quantities print only when some atom has them, so a FOF-only book reads as it did.
+    let kinds: Vec<String> = rmp::atom::AtomKind::ALL
+        .iter()
+        .map(|&k| (k, book.selections.iter().filter(|s| s.atom.kind() == k).count()))
+        .filter(|&(_, n)| n > 0)
+        .map(|(k, n)| format!("{n} {k}"))
+        .collect();
+    if kinds.len() > 1 {
+        println!("  kinds               {}", kinds.join(", "));
+    }
     for q in [
         Quantity::Alpha,
         Quantity::Bandwidth,
         Quantity::Beta,
         Quantity::AlphaBeta,
+        Quantity::Sigma,
         Quantity::Freq,
         Quantity::AmpDb,
     ] {
         let col = ev.column(book, q).map_err(|e| e.to_string())?;
         let st = stats::Summary::of(
-            &col.iter().copied().filter(|v| v.is_finite()).collect::<Vec<_>>(),
+            &col.iter().flatten().copied().filter(|v| v.is_finite()).collect::<Vec<_>>(),
         );
+        if st.n == 0 && col.iter().all(Option::is_none) {
+            continue;
+        }
         println!("  {:<22}{}", q.label(), summary_line(&st).trim_start());
     }
 
@@ -371,10 +387,15 @@ fn cmd_summary(book: &Book, config: Option<&Path>) -> Result<(), String> {
         if let Some(w) = &d.edge_pileup {
             println!("  WARNING: {w}");
         }
-        println!(
-            "  refinement moved    |ln a/a0| median {:.3}, |ln b/b0| median {:.3}",
-            d.d_ln_alpha.median, d.d_ln_beta.median
-        );
+        if d.d_ln_alpha.n > 0 || d.d_ln_sigma.n == 0 {
+            println!(
+                "  refinement moved    |ln a/a0| median {:.3}, |ln b/b0| median {:.3}",
+                d.d_ln_alpha.median, d.d_ln_beta.median
+            );
+        }
+        if d.d_ln_sigma.n > 0 {
+            println!("  refinement moved    |ln s/s0| median {:.3}", d.d_ln_sigma.median);
+        }
     }
     Ok(())
 }
@@ -390,14 +411,18 @@ fn cmd_diag(book: &Book, config: Option<&Path>) -> Result<(), String> {
 
     println!("blocks");
     let mut t = Table::new(&[
-        "block", "alpha", "beta_ms", "support", "seeds", "%", "energy %",
+        "block", "kind", "alpha", "beta_ms", "sigma_ms", "support", "seeds", "%", "energy %",
     ]);
     let total: usize = d.blocks.iter().map(|b| b.count).sum();
+    let dash = || "-".to_string();
     for b in &d.blocks {
+        let (fof, gauss) = (b.shape.as_fof(), b.shape.as_gaussian());
         t.row(vec![
             b.index.to_string(),
-            format!("{:.0}", b.alpha),
-            format!("{:.2}", b.beta_ms),
+            b.shape.kind().to_string(),
+            fof.map_or_else(dash, |p| format!("{:.0}", p.alpha)),
+            fof.map_or_else(dash, |p| format!("{:.2}", p.beta * 1e3)),
+            gauss.map_or_else(dash, |g| format!("{:.2}", g.sigma * 1e3)),
             b.support_len.to_string(),
             b.count.to_string(),
             format!(
@@ -418,6 +443,9 @@ fn cmd_diag(book: &Book, config: Option<&Path>) -> Result<(), String> {
     println!("\nrefinement drift from the seed");
     println!("  |ln alpha/alpha_0|  {}", summary_line(&d.d_ln_alpha).trim_start());
     println!("  |ln beta/beta_0|    {}", summary_line(&d.d_ln_beta).trim_start());
+    if d.d_ln_sigma.n > 0 {
+        println!("  |ln sigma/sigma_0|  {}", summary_line(&d.d_ln_sigma).trim_start());
+    }
     println!("  |f - bin| Hz        {}", summary_line(&d.d_f_hz).trim_start());
     println!("  |t0 - onset| samp   {}", summary_line(&d.d_t0).trim_start());
     println!(
@@ -740,6 +768,7 @@ fn slug(q: Quantity) -> String {
         Quantity::Alpha => "alpha",
         Quantity::Bandwidth => "bandwidth",
         Quantity::Beta => "beta",
+        Quantity::Sigma => "sigma",
         Quantity::AlphaBeta => "alpha-beta",
         Quantity::Freq => "f",
         Quantity::AmpDb => "amp",

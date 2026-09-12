@@ -21,7 +21,7 @@
 use criterion::{Criterion, criterion_group};
 use rmp::dict::{BlockConfig, Dictionary};
 use rmp::fft::Planner;
-use rmp::fof::{AtomParams, EnvelopeParams};
+use rmp::fof::AtomParams;
 use rmp::hrmp::HrmpConfig;
 use rmp::mp::{Mp, MpConfig};
 use rmp::refine::RefineConfig;
@@ -49,7 +49,7 @@ fn planted(dict: &Dictionary, len: usize) -> Signal {
             AtomParams {
                 t0: ((rnd() * len as f32) as usize + b.hop / 2 + 1) as i64,
                 f: b.bin_hz(k) + 0.5 * SR / b.fft_len as f32,
-                env: EnvelopeParams::new(b.env.params.alpha, b.env.params.beta),
+                env: b.env.params,
                 phi: rnd() * std::f32::consts::TAU,
                 amp: 0.3 + 0.7 * rnd(),
             }

@@ -1,4 +1,4 @@
-//! Bounded local refinement of `(t0, f, alpha, beta)`.
+//! Bounded local refinement of `(t0, f, alpha, beta)` for a FOF and `(t0, f, sigma)` for a Gaussian.
 //!
 //! The dictionary is a grid, and a real formant almost never sits on it. Off-grid input needs about
 //! twelve times as many atoms to reach the same SNR as on-grid input, because each miss is patched
@@ -34,11 +34,21 @@
 //! through [`crate::fit::score`] — the same function, so the same Gram clipping — and the refined
 //! atom is adopted only if it strictly wins. Without that gate the pursuit stops being greedy and
 //! `mp`'s "residual energy rose" guard would report it as a parameter-mapping bug.
+//!
+//! # A Gaussian's width is searched about its centre
+//!
+//! `t0` is the first sample of the support for both kinds, but a Gaussian's support is symmetric
+//! about a peak `half_len(sigma)` samples later. Changing `sigma` at a fixed `t0` would move that
+//! peak by about 3.7 samples per sample of `sigma`, so the width search would really be a coupled
+//! width-and-onset search, badly conditioned in both. The `sigma` stage therefore holds the *centre*
+//! fixed and moves `t0` with it; the onset stage that follows is then a pure shift again.
 
+use crate::atom::Shape;
 use crate::cand::Candidate;
 use crate::dict::Block;
 use crate::fit;
 use crate::fof::{Envelope, EnvelopeParams, ReleasePolicy};
+use crate::gauss::GaussianParams;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug)]
@@ -59,6 +69,9 @@ pub struct RefineConfig {
     pub beta_max: f32,
     /// Past this rfofs renders silence, and its `amax` fit is ill-conditioned well before it.
     pub alpha_beta_max: f32,
+    /// Bounds on a refined Gaussian's `sigma`, seconds.
+    pub sigma_min: f32,
+    pub sigma_max: f32,
     /// Reject any envelope longer than this, whatever the bounds imply.
     pub max_atom_samples: usize,
 
@@ -68,6 +81,8 @@ pub struct RefineConfig {
     pub alpha_bracket: f32,
     /// Search `beta` within this multiplicative factor of the seed.
     pub beta_bracket: f32,
+    /// Search `sigma` within this multiplicative factor of the seed.
+    pub sigma_bracket: f32,
     /// Search `t0` within this many samples. 0 derives it from the block's hop.
     pub t0_radius: usize,
 
@@ -91,13 +106,17 @@ impl Default for RefineConfig {
             beta_min: 1e-4,
             beta_max: 1e-2,
             alpha_beta_max: 4.0,
+            sigma_min: 0.5e-3,
+            sigma_max: 0.2,
             max_atom_samples: 1 << 16,
 
             // The alpha ladder steps by 1.6 and the beta ladder by about 3.3, so these brackets
-            // reach the neighbouring rung in each direction: no true value is out of reach.
+            // reach the neighbouring rung in each direction: no true value is out of reach. A
+            // sigma ladder of about 2.5 is what the manual suggests, so its bracket matches.
             f_bracket_bins: 1.0,
             alpha_bracket: 1.6,
             beta_bracket: 3.5,
+            sigma_bracket: 2.5,
             t0_radius: 0,
 
             rho_sq_max: 1.0 - 1e-4,
@@ -127,7 +146,7 @@ impl Default for RefineConfig {
 #[derive(Default)]
 pub struct EnvelopeCache {
     /// Value is the envelope and its fit-region length, so `fit_end`'s scan is paid once.
-    entries: HashMap<(u32, u32), Option<(Envelope, usize)>>,
+    entries: HashMap<(u8, u32, u32), Option<(Envelope, usize)>>,
     /// Envelope samples currently held, and the ceiling on them.
     samples: usize,
     budget: usize,
@@ -170,33 +189,39 @@ impl EnvelopeCache {
         self.samples = 0;
     }
 
-    /// Render `(alpha, beta)` under `policy`, or return `None` if it is out of bounds or unusable.
+    /// Render `shape`, or return `None` if it is out of bounds or unusable.
     ///
     /// Bounds are enforced here rather than in the optimizers so that every path to an envelope —
     /// including the seed's — is screened by the same rules.
+    ///
+    /// Keyed on [`Shape::cache_key`], which for a FOF is `(alpha, beta)` alone. That is the key
+    /// this cache always had, and keeping it exactly is what keeps a FOF decomposition bit-identical:
+    /// a hit serves whatever release the first request rendered.
     fn get(
         &mut self,
-        alpha: f32,
-        beta: f32,
+        shape: Shape,
         sample_rate: f32,
-        policy: &ReleasePolicy,
         cfg: &RefineConfig,
     ) -> Option<&(Envelope, usize)> {
-        let in_bounds = alpha >= cfg.alpha_min
-            && alpha <= cfg.alpha_max
-            && beta >= cfg.beta_min
-            && beta <= cfg.beta_max
-            && alpha * beta <= cfg.alpha_beta_max;
+        let in_bounds = match shape {
+            Shape::Fof(p) => {
+                p.alpha >= cfg.alpha_min
+                    && p.alpha <= cfg.alpha_max
+                    && p.beta >= cfg.beta_min
+                    && p.beta <= cfg.beta_max
+                    && p.alpha * p.beta <= cfg.alpha_beta_max
+            }
+            Shape::Gaussian(g) => g.sigma >= cfg.sigma_min && g.sigma <= cfg.sigma_max,
+        };
         if !in_bounds {
             return None;
         }
 
         let max_len = cfg.max_atom_samples;
-        let key = (alpha.to_bits(), beta.to_bits());
+        let key = shape.cache_key();
         if !self.entries.contains_key(&key) {
             let value = (|| {
-                let params = EnvelopeParams::with_policy(alpha, beta, policy);
-                let env = Envelope::render(params, sample_rate).ok()?;
+                let env = Envelope::render(shape, sample_rate).ok()?;
                 if env.support_len() > max_len {
                     return None;
                 }
@@ -217,13 +242,41 @@ impl EnvelopeCache {
     }
 }
 
+/// The shape parameters being searched, per kind.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Form {
+    Fof { alpha: f32, beta: f32 },
+    Gaussian { sigma: f32 },
+}
+
 /// The parameters being refined. Amplitude and phase are solved, never searched.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Params {
-    alpha: f32,
-    beta: f32,
+    form: Form,
     f: f32,
     t0: i64,
+}
+
+/// What a refined shape inherits from its seed rather than searching: a FOF's release policy, a
+/// Gaussian's cutoff. A refined atom never changes kind.
+#[derive(Clone, Copy, Debug)]
+enum Family {
+    Fof(ReleasePolicy),
+    Gaussian { cutoff_level: f32 },
+}
+
+impl Family {
+    fn shape(&self, form: Form) -> Shape {
+        match (self, form) {
+            (Self::Fof(policy), Form::Fof { alpha, beta }) => {
+                EnvelopeParams::with_policy(alpha, beta, policy).into()
+            }
+            (Self::Gaussian { cutoff_level }, Form::Gaussian { sigma }) => {
+                GaussianParams { sigma, cutoff_level: *cutoff_level }.into()
+            }
+            _ => unreachable!("refinement never changes an atom's kind"),
+        }
+    }
 }
 
 /// Refine `cand` in place. Returns whether the parameters actually moved.
@@ -235,32 +288,39 @@ pub fn refine(
     cache: &mut EnvelopeCache,
 ) -> bool {
     let sr = block.sample_rate();
-    let policy = ReleasePolicy {
-        fade_level: cand.atom.env.fade_level,
-        // Recovered from the seed so a refined alpha re-derives its release the same way the
-        // dictionary did, rather than inheriting the seed's absolute duration.
-        fade_dur_scale: cand.atom.env.fade_dur * cand.atom.env.alpha,
-        fade_dur_min: cand.atom.env.fade_dur,
-        fade_dur_max: cand.atom.env.fade_dur,
+    let (family, form) = match cand.atom.env {
+        Shape::Fof(env) => {
+            let policy = ReleasePolicy {
+                fade_level: env.fade_level,
+                // Recovered from the seed so a refined alpha re-derives its release the same way
+                // the dictionary did, rather than inheriting the seed's absolute duration.
+                fade_dur_scale: env.fade_dur * env.alpha,
+                fade_dur_min: env.fade_dur,
+                fade_dur_max: env.fade_dur,
+            };
+            (
+                Family::Fof(relax_clamps(policy, cfg)),
+                Form::Fof { alpha: env.alpha, beta: env.beta },
+            )
+        }
+        Shape::Gaussian(g) => (
+            Family::Gaussian { cutoff_level: g.cutoff_level },
+            Form::Gaussian { sigma: g.sigma },
+        ),
     };
-    let policy = relax_clamps(policy, cfg);
+    let family = &family;
 
-    let seed = Params {
-        alpha: cand.atom.env.alpha,
-        beta: cand.atom.env.beta,
-        f: cand.atom.f,
-        t0: cand.atom.t0,
-    };
+    let seed = Params { form, f: cand.atom.f, t0: cand.atom.t0 };
 
     // Always re-score the seed through `fit`, even when refinement declines: the incoming score
     // came from the block's whole-support Gram, and mixing the two footings across candidates is
     // exactly what would make selection unfair.
-    let Some(seed_fit) = full_score(seed, residual, sr, &policy, cfg, cache) else {
+    let Some(seed_fit) = full_score(seed, residual, sr, family, cfg, cache) else {
         return false;
     };
 
     let mut cur = seed;
-    let mut cur_score = fit_score(cur, residual, sr, &policy, cfg, cache);
+    let mut cur_score = fit_score(cur, residual, sr, family, cfg, cache);
     let t0_radius = if cfg.t0_radius > 0 {
         cfg.t0_radius
     } else {
@@ -278,28 +338,64 @@ pub fn refine(
             (cur.f + half).min(cfg.f_max) as f64,
         );
         golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, |p, x| p.f = x as f32, |p| {
-            fit_score(*p, residual, sr, &policy, cfg, cache)
+            fit_score(*p, residual, sr, family, cfg, cache)
         });
 
-        // Alpha and beta in log space: both are positive scale parameters, so a multiplicative
-        // bracket is the natural one and keeps the search away from zero.
-        let b = cfg.alpha_bracket.max(1.0) as f64;
-        let (lo, hi) = (
-            (cur.alpha as f64 / b).max(cfg.alpha_min as f64).ln(),
-            (cur.alpha as f64 * b).min(cfg.alpha_max as f64).ln(),
-        );
-        golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, |p, x| p.alpha = x.exp() as f32, |p| {
-            fit_score(*p, residual, sr, &policy, cfg, cache)
-        });
+        // The shape. Every scale parameter is searched in log space: they are all positive, so a
+        // multiplicative bracket is the natural one and keeps the search away from zero.
+        match *family {
+            Family::Fof(_) => {
+                let Form::Fof { alpha, .. } = cur.form else { unreachable!() };
+                let b = cfg.alpha_bracket.max(1.0) as f64;
+                let (lo, hi) = (
+                    (alpha as f64 / b).max(cfg.alpha_min as f64).ln(),
+                    (alpha as f64 * b).min(cfg.alpha_max as f64).ln(),
+                );
+                let set = |p: &mut Params, x: f64| {
+                    if let Form::Fof { alpha, .. } = &mut p.form {
+                        *alpha = x.exp() as f32;
+                    }
+                };
+                golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, set, |p| {
+                    fit_score(*p, residual, sr, family, cfg, cache)
+                });
 
-        let b = cfg.beta_bracket.max(1.0) as f64;
-        let (lo, hi) = (
-            (cur.beta as f64 / b).max(cfg.beta_min as f64).ln(),
-            (cur.beta as f64 * b).min(cfg.beta_max as f64).ln(),
-        );
-        golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, |p, x| p.beta = x.exp() as f32, |p| {
-            fit_score(*p, residual, sr, &policy, cfg, cache)
-        });
+                let Form::Fof { beta, .. } = cur.form else { unreachable!() };
+                let b = cfg.beta_bracket.max(1.0) as f64;
+                let (lo, hi) = (
+                    (beta as f64 / b).max(cfg.beta_min as f64).ln(),
+                    (beta as f64 * b).min(cfg.beta_max as f64).ln(),
+                );
+                let set = |p: &mut Params, x: f64| {
+                    if let Form::Fof { beta, .. } = &mut p.form {
+                        *beta = x.exp() as f32;
+                    }
+                };
+                golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, set, |p| {
+                    fit_score(*p, residual, sr, family, cfg, cache)
+                });
+            }
+            Family::Gaussian { cutoff_level } => {
+                let Form::Gaussian { sigma } = cur.form else { unreachable!() };
+                let half = |s: f32| GaussianParams { sigma: s, cutoff_level }.half_len(sr) as i64;
+                let b = cfg.sigma_bracket.max(1.0) as f64;
+                let (lo, hi) = (
+                    (sigma as f64 / b).max(cfg.sigma_min as f64).ln(),
+                    (sigma as f64 * b).min(cfg.sigma_max as f64).ln(),
+                );
+                // Centre held fixed: see the module docs.
+                let set = |p: &mut Params, x: f64| {
+                    if let Form::Gaussian { sigma } = &mut p.form {
+                        let centre = p.t0 + half(*sigma);
+                        *sigma = x.exp() as f32;
+                        p.t0 = centre - half(*sigma);
+                    }
+                };
+                golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, set, |p| {
+                    fit_score(*p, residual, sr, family, cfg, cache)
+                });
+            }
+        }
 
         // Onset. Amplitude and phase are re-solved at every trial, so the objective varies on the
         // envelope's scale rather than the carrier's and a bracketed search is well posed.
@@ -310,7 +406,7 @@ pub fn refine(
         let t0_gram = {
             let omega = std::f64::consts::TAU * cur.f as f64 / sr as f64;
             cache
-                .get(cur.alpha, cur.beta, sr, &policy, cfg)
+                .get(family.shape(cur.form), sr, cfg)
                 .map(|(env, cut)| fit::gram(&env.samples[..*cut], omega))
         };
         let (lo, hi) = (
@@ -318,12 +414,12 @@ pub fn refine(
             (cur.t0 + t0_radius as i64) as f64,
         );
         golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, |p, x| p.t0 = x.round() as i64, |p| {
-            fit_score_with(*p, residual, sr, &policy, cfg, cache, t0_gram)
+            fit_score_with(*p, residual, sr, family, cfg, cache, t0_gram)
         });
         // Golden section works on a real line; polish the integer it landed between.
         for d in [-1i64, 1] {
             let trial = Params { t0: cur.t0 + d, ..cur };
-            let s = fit_score_with(trial, residual, sr, &policy, cfg, cache, t0_gram);
+            let s = fit_score_with(trial, residual, sr, family, cfg, cache, t0_gram);
             if s > cur_score {
                 cur = trial;
                 cur_score = s;
@@ -341,7 +437,7 @@ pub fn refine(
     }
 
     // The acceptance gate. Both sides go through `full_score`, so the comparison is like for like.
-    match full_score(cur, residual, sr, &policy, cfg, cache) {
+    match full_score(cur, residual, sr, family, cfg, cache) {
         Some(refined) if refined.energy > seed_fit.energy => {
             adopt(cand, cur, refined, true);
             true
@@ -366,9 +462,20 @@ fn relax_clamps(mut policy: ReleasePolicy, cfg: &RefineConfig) -> ReleasePolicy 
     policy
 }
 
+/// Write `p` back into the candidate.
+///
+/// Only the searched parameters are written. A FOF keeps its seed's `fade_dur` rather than the one
+/// the policy derives for the refined `alpha` — that is what this has always done, and changing it
+/// would move every refined book.
 fn adopt(cand: &mut Candidate, p: Params, fit: crate::corr::Projection, refined: bool) {
-    cand.atom.env.alpha = p.alpha;
-    cand.atom.env.beta = p.beta;
+    match (&mut cand.atom.env, p.form) {
+        (Shape::Fof(env), Form::Fof { alpha, beta }) => {
+            env.alpha = alpha;
+            env.beta = beta;
+        }
+        (Shape::Gaussian(g), Form::Gaussian { sigma }) => g.sigma = sigma,
+        _ => unreachable!("refinement never changes an atom's kind"),
+    }
     cand.atom.f = p.f;
     cand.atom.t0 = p.t0;
     cand.atom.amp = fit.amp;
@@ -382,11 +489,11 @@ fn fit_score(
     p: Params,
     residual: &[f32],
     sr: f32,
-    policy: &ReleasePolicy,
+    family: &Family,
     cfg: &RefineConfig,
     cache: &mut EnvelopeCache,
 ) -> f64 {
-    fit_score_with(p, residual, sr, policy, cfg, cache, None)
+    fit_score_with(p, residual, sr, family, cfg, cache, None)
 }
 
 /// [`fit_score`] reusing a Gram already computed for this envelope and carrier.
@@ -397,12 +504,12 @@ fn fit_score_with(
     p: Params,
     residual: &[f32],
     sr: f32,
-    policy: &ReleasePolicy,
+    family: &Family,
     cfg: &RefineConfig,
     cache: &mut EnvelopeCache,
     gram: Option<fit::Gram>,
 ) -> f64 {
-    let Some((env, cut)) = cache.get(p.alpha, p.beta, sr, policy, cfg) else {
+    let Some((env, cut)) = cache.get(family.shape(p.form), sr, cfg) else {
         return 0.0;
     };
     let omega = std::f64::consts::TAU * p.f as f64 / sr as f64;
@@ -416,11 +523,11 @@ fn full_score(
     p: Params,
     residual: &[f32],
     sr: f32,
-    policy: &ReleasePolicy,
+    family: &Family,
     cfg: &RefineConfig,
     cache: &mut EnvelopeCache,
 ) -> Option<crate::corr::Projection> {
-    let (env, _) = cache.get(p.alpha, p.beta, sr, policy, cfg)?;
+    let (env, _) = cache.get(family.shape(p.form), sr, cfg)?;
     fit::score(residual, env, p.t0, p.f, cfg.rho_sq_max)
 }
 
@@ -528,10 +635,11 @@ mod tests {
     fn recovers_an_off_grid_atom_from_an_imperfect_seed() {
         let dict = voice();
         // Between the alpha=328 and alpha=524 rungs, between beta rungs, off the bin and hop grids.
+        let truth_env = EnvelopeParams::new(410.0, 0.0017);
         let truth = AtomParams {
             t0: 6_211,
             f: 1_337.0,
-            env: EnvelopeParams::new(410.0, 0.0017),
+            env: truth_env.into(),
             phi: 0.83,
             amp: 0.7,
         };
@@ -541,7 +649,7 @@ mod tests {
         let bi = dict
             .blocks
             .iter()
-            .position(|b| b.env.params.alpha == 328.0 && b.env.params.beta == 0.001)
+            .position(|b| b.env.params == EnvelopeParams::new(328.0, 0.001).into())
             .unwrap();
         let mut cand = seed_at(&dict, bi, &truth, &sig);
         let before = cand.mp_score;
@@ -553,6 +661,7 @@ mod tests {
 
         let total = crate::signal::energy_of(&sig);
         let g = &cand.atom;
+        let (ge, te) = (g.env.as_fof().unwrap(), truth_env);
         println!(
             "seed {:.4} -> refined {:.4} of {total:.4}\n  \
              t0 {} (d {}), f {:.2} (d {:.2}), alpha {:.1} (d {:.1}%), beta {:.5} (d {:.1}%)",
@@ -562,10 +671,10 @@ mod tests {
             g.t0 - truth.t0,
             g.f,
             g.f - truth.f,
-            g.env.alpha,
-            100.0 * (g.env.alpha - truth.env.alpha) / truth.env.alpha,
-            g.env.beta,
-            100.0 * (g.env.beta - truth.env.beta) / truth.env.beta,
+            ge.alpha,
+            100.0 * (ge.alpha - te.alpha) / te.alpha,
+            ge.beta,
+            100.0 * (ge.beta - te.beta) / te.beta,
         );
 
         assert!(cand.mp_score > before, "refinement lost energy");
@@ -587,16 +696,8 @@ mod tests {
         // cost of the one-dimensional method the spec asks for in version 1, and it is bounded by
         // what actually matters -- the fit above captures 99.9% of the atom.
         assert!((g.t0 - truth.t0).abs() <= 8, "t0 off by {}", g.t0 - truth.t0);
-        assert!(
-            (g.env.alpha - truth.env.alpha).abs() / truth.env.alpha < 0.25,
-            "alpha {}",
-            g.env.alpha
-        );
-        assert!(
-            (g.env.beta - truth.env.beta).abs() / truth.env.beta < 0.35,
-            "beta {}",
-            g.env.beta
-        );
+        assert!((ge.alpha - te.alpha).abs() / te.alpha < 0.25, "alpha {}", ge.alpha);
+        assert!((ge.beta - te.beta).abs() / te.beta < 0.35, "beta {}", ge.beta);
     }
 
     /// Refinement must never make a candidate worse — the gate that keeps the pursuit greedy.
@@ -645,7 +746,7 @@ mod tests {
         let truth = AtomParams {
             t0: 4_000,
             f: 900.0,
-            env: EnvelopeParams::new(300.0, 0.002),
+            env: EnvelopeParams::new(300.0, 0.002).into(),
             phi: 0.0,
             amp: 1.0,
         };
@@ -662,7 +763,11 @@ mod tests {
         };
         let mut cache = EnvelopeCache::new();
 
-        let bi = dict.blocks.iter().position(|b| b.env.params.alpha == 524.0).unwrap();
+        let bi = dict
+            .blocks
+            .iter()
+            .position(|b| b.env.params.as_fof().unwrap().alpha == 524.0)
+            .unwrap();
         let block = &dict.blocks[bi];
         let onset = block.frame_onset(4_000 / block.hop);
         let bin = ((1_100.0 / block.bin_hz(1)).round() as usize).clamp(block.k_lo, block.k_hi);
@@ -677,7 +782,7 @@ mod tests {
         );
         // The seed's own alpha is outside the test bounds, so refinement can only decline.
         refine(&mut cand, block, &sig, &cfg, &mut cache);
-        let e = cand.atom.env;
+        let e = cand.atom.env.as_fof().unwrap();
         if cand.refined {
             assert!(e.alpha >= cfg.alpha_min && e.alpha <= cfg.alpha_max, "alpha {}", e.alpha);
             assert!(e.beta >= cfg.beta_min && e.beta <= cfg.beta_max, "beta {}", e.beta);
@@ -686,24 +791,129 @@ mod tests {
         }
     }
 
+    // ── gaussian atoms ──────────────────────────────────────────────────────────────────────────
+
+    /// A 2.5-ratio sigma ladder, matching the default `sigma_bracket`.
+    fn gaussians() -> Dictionary {
+        let mut planner = Planner::new();
+        let shapes: Vec<Shape> =
+            [0.0025f32, 0.006, 0.015].iter().map(|&s| GaussianParams::new(s).into()).collect();
+        Dictionary::from_shapes(&shapes, SR, &mut planner, &BlockConfig::default()).unwrap()
+    }
+
+    /// The parameter-recovery test for a Gaussian: seed from the wrong width, and get back the
+    /// width, the frequency and — because the sigma stage holds it fixed — the centre.
+    #[test]
+    fn recovers_an_off_grid_gaussian_about_its_centre() {
+        let dict = gaussians();
+        let truth_env = GaussianParams::new(0.0041);
+        let truth = AtomParams { t0: 6_211, f: 1_337.0, env: truth_env.into(), phi: 0.83, amp: 0.7 };
+        let sig = plant(&truth, 30_000);
+        let centre = truth.t0 + truth_env.half_len(SR) as i64;
+
+        // Seed from the 2.5 ms rung, centred on the nearest frame — where the coarse search's argmax
+        // puts a symmetric atom, rather than where its support would have to start.
+        let bi = 0;
+        let block = &dict.blocks[bi];
+        let h_seed = block.env.params.as_gaussian().unwrap().half_len(SR) as i64;
+        let frame = ((centre - h_seed) as usize).div_ceil(block.hop);
+        let onset = block.frame_onset(frame);
+        let bin = ((truth.f / block.bin_hz(1)).round() as usize).clamp(block.k_lo, block.k_hi);
+        let p = fit::score(&sig, &block.env, onset as i64, block.bin_hz(bin), 1.0 - 1e-4).unwrap();
+        let mut cand = Candidate::from_seed(
+            Seed { block: bi, frame, bin, onset, energy: p.energy },
+            block,
+            p.amp,
+            p.phi,
+            p.energy,
+        );
+        let before = cand.mp_score;
+
+        let moved = refine(&mut cand, block, &sig, &RefineConfig::default(), &mut EnvelopeCache::new());
+        assert!(moved, "refinement declined to move");
+
+        let g = cand.atom.env.as_gaussian().expect("refinement changed the atom's kind");
+        let got_centre = cand.atom.t0 + g.half_len(SR) as i64;
+        let total = crate::signal::energy_of(&sig);
+        println!(
+            "seed {before:.4} -> refined {:.4} of {total:.4}: sigma {:.3} ms, f {:.2}, centre d {}",
+            cand.mp_score,
+            g.sigma * 1e3,
+            cand.atom.f,
+            got_centre - centre
+        );
+        assert!(cand.mp_score > before, "refinement lost energy");
+        assert!(cand.mp_score / total > 0.99, "captured only {:.4} of {total:.4}", cand.mp_score);
+        assert!((cand.atom.f - truth.f).abs() / truth.f < 1e-3, "f {}", cand.atom.f);
+        assert!((g.sigma - truth_env.sigma).abs() / truth_env.sigma < 0.05, "sigma {}", g.sigma);
+        assert!((got_centre - centre).abs() <= 4, "centre off by {}", got_centre - centre);
+        assert!((cand.atom.amp - truth.amp).abs() / truth.amp < 0.05, "amp {}", cand.atom.amp);
+        assert_eq!(g.cutoff_level, truth_env.cutoff_level, "the cutoff is inherited, not searched");
+    }
+
+    /// The acceptance gate and the bounds, for the Gaussian arm.
+    #[test]
+    fn gaussian_refinement_never_lowers_the_score_and_stays_in_bounds() {
+        let dict = gaussians();
+        let mut cache = EnvelopeCache::new();
+        // The widest rung is outside these bounds, so that seed can only decline.
+        let cfg = RefineConfig { sigma_min: 0.002, sigma_max: 0.009, ..RefineConfig::default() };
+
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let sig: Vec<f32> = (0..20_000)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / 8_388_608.0 - 1.0
+            })
+            .collect();
+
+        for (bi, block) in dict.blocks.iter().enumerate() {
+            let frame = 7.min(block.frame_count(sig.len()) - 1);
+            let onset = block.frame_onset(frame);
+            let bin = (block.k_lo + block.k_hi) / 2;
+            let p = fit::score(&sig, &block.env, onset as i64, block.bin_hz(bin), cfg.rho_sq_max)
+                .unwrap();
+            let mut cand = Candidate::from_seed(
+                Seed { block: bi, frame, bin, onset, energy: p.energy },
+                block,
+                p.amp,
+                p.phi,
+                p.energy,
+            );
+            refine(&mut cand, block, &sig, &cfg, &mut cache);
+            assert!(cand.mp_score >= p.energy, "block {bi}: {} < seed {}", cand.mp_score, p.energy);
+            if cand.refined {
+                let sigma = cand.atom.env.as_gaussian().unwrap().sigma;
+                assert!((cfg.sigma_min..=cfg.sigma_max).contains(&sigma), "block {bi}: sigma {sigma}");
+            }
+        }
+    }
+
     #[test]
     fn the_cache_serves_repeats_rather_than_re_rendering() {
         let mut cache = EnvelopeCache::new();
         let cfg = RefineConfig::default();
         let policy = ReleasePolicy::default();
+        let fof = |a, b| EnvelopeParams::with_policy(a, b, &policy).into();
         for _ in 0..5 {
-            assert!(cache.get(251.0, 0.001, SR, &policy, &cfg).is_some());
+            assert!(cache.get(fof(251.0, 0.001), SR, &cfg).is_some());
         }
         assert_eq!(cache.len(), 1);
         // Out-of-bounds shapes are refused, and the refusal is remembered too.
-        assert!(cache.get(1e6, 0.001, SR, &policy, &cfg).is_none());
-        assert!(cache.get(251.0, 1.0, SR, &policy, &cfg).is_none());
+        assert!(cache.get(fof(1e6, 0.001), SR, &cfg).is_none());
+        assert!(cache.get(fof(251.0, 1.0), SR, &cfg).is_none());
+        // A Gaussian is bounded by sigma, and never collides with a FOF's key.
+        assert!(cache.get(GaussianParams::new(0.004).into(), SR, &cfg).is_some());
+        assert!(cache.get(GaussianParams::new(10.0).into(), SR, &cfg).is_none());
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]
     fn golden_section_finds_a_smooth_maximum_and_never_regresses() {
         // A quadratic peaking at 3.0, with the incumbent already at a worse point.
-        let mut p = Params { alpha: 0.0, beta: 0.0, f: 0.0, t0: 0 };
+        let mut p = Params { form: Form::Fof { alpha: 0.0, beta: 0.0 }, f: 0.0, t0: 0 };
         let mut s = f64::NEG_INFINITY;
         golden(0.0, 10.0, 40, &mut p, &mut s, |p, x| p.f = x as f32, |p| {
             -((p.f as f64 - 3.0).powi(2))
@@ -711,7 +921,7 @@ mod tests {
         assert!((p.f - 3.0).abs() < 1e-3, "found {}", p.f);
 
         // An incumbent better than anything in the bracket must survive untouched.
-        let mut p = Params { alpha: 1.0, beta: 2.0, f: 42.0, t0: 7 };
+        let mut p = Params { form: Form::Fof { alpha: 1.0, beta: 2.0 }, f: 42.0, t0: 7 };
         let keep = p;
         let mut s = 1e9;
         golden(0.0, 10.0, 20, &mut p, &mut s, |p, x| p.f = x as f32, |p| {

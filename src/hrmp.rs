@@ -58,9 +58,11 @@
 //! never be negative. It could only go so in a robust mode that replaces the minimum with a
 //! quantile, which is why that path must clamp to `A_main` too.
 
+use crate::atom::Shape;
 use crate::corr::Projection;
 use crate::fit::Quad;
 use crate::fof::{Envelope, EnvelopeParams};
+use crate::gauss::GaussianParams;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -385,6 +387,10 @@ fn masked_probes(
 ///
 /// Unlike Mode B the probe basis is a different atom, so `H_i` is genuinely asymmetric and the
 /// `q_i = H_i^-1 d_i` inversion is doing real work rather than reducing to a masked projection.
+///
+/// A Gaussian has one scale parameter, so its probe is the same Gaussian at `sigma / 2^depth` — the
+/// same `2^-depth` shrinking of the support. Its onset sits on the quantile boundary exactly as a
+/// FOF probe's does, so it is centred half its own (short) support after it.
 fn scaled_probes(
     residual: &[f32],
     env: &Envelope,
@@ -394,13 +400,7 @@ fn scaled_probes(
     depth: u32,
     omega: f64,
 ) -> Vec<Probe> {
-    let parent = env.params;
-    let scale = (1u32 << depth.max(1)) as f32;
-    let small = EnvelopeParams {
-        alpha: parent.alpha * scale,
-        beta: parent.beta / scale,
-        ..parent
-    };
+    let small = probe_shape(env.params, depth);
     let Ok(probe_env) = Envelope::render(small, env.sample_rate) else {
         return Vec::new();
     };
@@ -419,6 +419,15 @@ fn scaled_probes(
         ));
     }
     out
+}
+
+/// The legacy probe for `parent`: the same kind of atom at `2^-depth` of its scale.
+fn probe_shape(parent: Shape, depth: u32) -> Shape {
+    let scale = (1u32 << depth.max(1)) as f32;
+    match parent {
+        Shape::Fof(p) => EnvelopeParams { alpha: p.alpha * scale, beta: p.beta / scale, ..p }.into(),
+        Shape::Gaussian(g) => GaussianParams { sigma: g.sigma / scale, ..g }.into(),
+    }
 }
 
 /// Where the atom's samples sit against the residual's, from one `signal::overlap` call.
@@ -650,7 +659,7 @@ mod tests {
 
         let mut sig = vec![0.0f32; 40_000];
         for t0 in [t1, t2] {
-            let a = AtomParams { t0, f, env: short, phi: 0.4, amp: 1.0 };
+            let a = AtomParams { t0, f, env: short.into(), phi: 0.4, amp: 1.0 };
             add_at(&mut sig, &a.render(SR).unwrap(), t0);
         }
 
@@ -679,7 +688,7 @@ mod tests {
         // Both bursts inside the long candidate's support, or there is no conflict to detect.
         let (t1, t2) = (500i64, 500 + (long.support_len() / 6) as i64);
         let mut sig = vec![0.0f32; 40_000];
-        add_at(&mut sig, &AtomParams { t0: t1, f, env: short, phi: 0.0, amp: 1.0 }.render(SR).unwrap(), t1);
+        add_at(&mut sig, &AtomParams { t0: t1, f, env: short.into(), phi: 0.0, amp: 1.0 }.render(SR).unwrap(), t1);
 
         // Anti-phase means anti-phase *in the main atom's frame*, not in the second atom's own.
         // Each FOF references its phase to its own onset, so a bare `phi = PI` here would be
@@ -688,7 +697,7 @@ mod tests {
         // fixture has to apply it by hand.
         let omega = std::f32::consts::TAU * f / SR;
         let phi2 = std::f32::consts::PI + omega * (t2 - t1) as f32;
-        add_at(&mut sig, &AtomParams { t0: t2, f, env: short, phi: phi2, amp: 1.0 }.render(SR).unwrap(), t2);
+        add_at(&mut sig, &AtomParams { t0: t2, f, env: short.into(), phi: phi2, amp: 1.0 }.render(SR).unwrap(), t2);
 
         let v = verdict(&sig, &long, t1, f, &HrmpConfig { depth: 3, ..cfg() });
         assert_eq!(v.outcome, Outcome::Rejected, "{v:?}");
@@ -813,7 +822,7 @@ mod tests {
 
         let mut bridged = vec![0.0f32; 40_000];
         for t0 in [t1, t2] {
-            let a = AtomParams { t0, f, env: short, phi: 0.4, amp: 1.0 };
+            let a = AtomParams { t0, f, env: short.into(), phi: 0.4, amp: 1.0 };
             add_at(&mut bridged, &a.render(SR).unwrap(), t0);
         }
         let mp = {
@@ -871,6 +880,63 @@ mod tests {
             scaled.iter().any(|p| p.h01 != p.h10),
             "a scaled probe is a different atom, so H must not be symmetric"
         );
+    }
+
+    // ── gaussian candidates ─────────────────────────────────────────────────────────────────────
+
+    /// A Gaussian's legacy probe is the same Gaussian at `2^-depth` of the width, and its support
+    /// shrinks by the same factor — the scale coupling the FOF probe follows.
+    #[test]
+    fn a_legacy_gaussian_probe_is_the_same_gaussian_at_a_smaller_scale() {
+        let parent = GaussianParams::new(0.02);
+        for depth in [1u32, 2, 3] {
+            let Shape::Gaussian(small) = probe_shape(parent.into(), depth) else {
+                panic!("the probe changed kind");
+            };
+            assert_eq!(small.cutoff_level, parent.cutoff_level);
+            assert!((small.sigma * (1 << depth) as f32 - parent.sigma).abs() < 1e-9);
+            let ratio = small.support_len(SR) as f64 / parent.support_len(SR) as f64;
+            let want = 1.0 / (1u32 << depth) as f64;
+            assert!((ratio / want - 1.0).abs() < 0.01, "depth {depth}: support ratio {ratio:.4}");
+        }
+    }
+
+    /// The bridging case for a symmetric atom, in both probe modes: a long Gaussian spanning two
+    /// short bursts with silence at its own centre must not be passed whole, while a genuine
+    /// Gaussian of the same shape must survive untouched.
+    #[test]
+    fn a_long_gaussian_bridging_a_gap_is_caught_in_both_modes() {
+        let f = 700.0;
+        let short = EnvelopeParams::new(2000.0, 0.0003);
+        let long = Envelope::render(GaussianParams::new(0.02), SR).unwrap();
+        let n = long.support_len() as i64;
+        let start = 500i64;
+        let (t1, t2) = (start + n / 4, start + 7 * n / 10);
+
+        let mut bridged = vec![0.0f32; 40_000];
+        for t0 in [t1, t2] {
+            let a = AtomParams { t0, f, env: short.into(), phi: 0.4, amp: 1.0 };
+            add_at(&mut bridged, &a.render(SR).unwrap(), t0);
+        }
+        let omega = std::f64::consts::TAU * f as f64 / SR as f64;
+        let mp = fit::accumulate(&bridged, &long.samples, start, omega).unwrap().solve(RHO).unwrap();
+
+        let atom = AtomParams { t0: start, f, env: long.params, phi: 0.4, amp: 0.8 };
+        let mut real = vec![0.0f32; 40_000];
+        add_at(&mut real, &atom.render(SR).unwrap(), start);
+
+        for c in [cfg(), HrmpConfig { depth: 4, ..legacy() }] {
+            let v = verdict(&bridged, &long, start, f, &c);
+            assert!(
+                !v.accepted() || v.energy < 0.5 * mp.energy,
+                "{:?} passed a bridging gaussian: {v:?} against {:.3}",
+                c.mode,
+                mp.energy
+            );
+            let v = verdict(&real, &long, start, f, &c);
+            assert!(v.accepted(), "{:?} rejected a real gaussian: {v:?}", c.mode);
+            assert!(v.amp > 0.9 * atom.amp, "{:?} clamped a real gaussian: {v:?}", c.mode);
+        }
     }
 
     #[test]

@@ -1,15 +1,18 @@
-//! Stochastic resynthesis of the residual an ERB analysis measured.
+//! All synthesis: a book's atoms, and the stochastic residual an ERB analysis measured.
 //!
-//! The inverse of [`crate::residual`], and the second half of a replayable decomposition: the atoms
-//! render through rfofs, and this renders what they left behind.
+//! `rmp` only analyses; everything that turns a book back into audio lives here and is driven by
+//! `rmpsynth`. The atoms render through [`atoms`] — rfofs for a FOF, [`crate::gauss`] for a
+//! Gaussian, the same renders the pursuit subtracted — and the residual through the inverse of
+//! [`crate::residual`]:
 //!
 //! ```text
-//! ResidualBook -> ERB power trajectories -> smoothed band gains
-//!              -> independent white-noise sources -> power-complementary ERB bank
-//!              -> stochastic residual  [+ pre-rendered FOF audio] -> WAV
+//! Book atoms   -> AtomParams::render (rfofs / gauss) ----------------------------+
+//! ResidualBook -> ERB power trajectories -> smoothed band gains                  |
+//!              -> independent white-noise sources -> power-complementary ERB bank |
+//!              -> stochastic residual  -------------------------------------------+-> mix -> WAV
 //! ```
 //!
-//! Four things shape the design:
+//! Four things shape the residual half of the design:
 //!
 //! **The book describes its own bank, and this rebuilds it rather than guessing.** Centres,
 //! bandwidths, filter order and the measured normalisation gains all come out of the descriptor,
@@ -26,10 +29,10 @@
 //! one, and each band's noise stream is derived from `(seed, band, channel)` rather than from the
 //! order the bands were built in. Nothing is parallel, because nothing needs to be.
 //!
-//! **It is mono, because a residual book is.** [`crate::audio::read`] downmixes a multi-channel FOF
-//! file the way the rest of the crate does, and says so. §19's per-channel model waits on a book
-//! format that can express more than one channel.
+//! **It is mono, because a book is.** §19's per-channel model waits on a book format that can
+//! express more than one channel.
 
+pub mod atoms;
 pub mod bank;
 pub mod config;
 pub mod error;
@@ -81,6 +84,26 @@ pub(crate) mod testing {
 
     pub(crate) fn a_book(sample_rate: f64, bands: usize, source_samples: usize) -> ResidualBook {
         book_with_power(sample_rate, bands, source_samples, |_, _| 0.0)
+    }
+
+    /// A full book holding exactly these atoms, and no residual section.
+    pub(crate) fn atom_book(sample_rate: f32, atoms: &[crate::fof::AtomParams]) -> crate::book::Book {
+        let mut book = crate::book::Book::new(1.0, sample_rate);
+        book.selections = atoms
+            .iter()
+            .map(|&atom| crate::book::Selection {
+                atom,
+                block: 0,
+                onset: 0,
+                bin: 0,
+                projected_energy: 1.0,
+                energy_removed: 1.0,
+                residual_energy: 0.0,
+                hr_score: None,
+                refined: false,
+            })
+            .collect();
+        book
     }
 }
 

@@ -1,21 +1,26 @@
-//! What can go wrong rendering a residual book.
+//! What can go wrong rendering a book.
 //!
 //! The messages name the CLI flag the user typed, the way [`crate::residual::error`] names the
 //! settings-document path: a renderer that says "sample rate mismatch" is telling the user a fact
 //! about their files, and it should say which two files and which flag brought the second one in.
 
 use crate::audio::AudioError;
+use crate::fof::FofError;
 use crate::residual::book::ErbFilterKind;
 use crate::residual::error::ResidualAnalysisError;
 
 #[derive(Debug)]
 pub enum RenderError {
-    /// Reading the FOF audio or writing the output.
+    /// Writing the output.
     Audio(AudioError),
     /// Reading or parsing the book. Carries the message `book::read_doc` produced.
     Book(String),
-    /// A full book was given, but it carries no residual section.
+    /// Only the residual was left to render, and there is none.
     NoResidualBook,
+    /// The flags and the book together leave nothing at all to render.
+    NothingToRender(&'static str),
+    /// An atom the book records cannot be rendered.
+    Atoms(FofError),
     UnsupportedResidualBookVersion(u32),
     /// A book describing a bank this build does not know how to rebuild.
     UnsupportedFilterKind(ErbFilterKind),
@@ -24,7 +29,10 @@ pub enum RenderError {
     /// The rebuilt bank disagrees with what the book says was analysed — a filter design or an ERB
     /// formula has moved since the book was written.
     BankMismatch(String),
-    SampleRateMismatch { book: f64, fof_audio: f32 },
+    /// The atoms and the residual were analysed at different rates.
+    SampleRateMismatch { book: f32, residual_book: f64 },
+    /// The atoms and the residual describe excerpts starting at different source samples.
+    TimelineMismatch { book: u64, residual_book: u64 },
     /// Reserved for the multi-channel residual book of §19, which the format cannot express yet.
     ChannelMismatch { channels: usize },
     InvalidConfig(String),
@@ -41,6 +49,8 @@ impl std::fmt::Display for RenderError {
                 "the book carries no residual section — analyse with --residual-analysis, \
                  or pass the standalone book written by --residual-book"
             ),
+            Self::NothingToRender(why) => write!(f, "nothing to render: {why}"),
+            Self::Atoms(e) => write!(f, "rendering the atoms: {e}"),
             Self::UnsupportedResidualBookVersion(v) => write!(
                 f,
                 "residual book version {v} is newer than this build understands"
@@ -54,10 +64,15 @@ impl std::fmt::Display for RenderError {
                 f,
                 "the rebuilt bank does not match the one the book was analysed with: {m}"
             ),
-            Self::SampleRateMismatch { book, fof_audio } => write!(
+            Self::SampleRateMismatch { book, residual_book } => write!(
                 f,
-                "--fof-audio is at {fof_audio} Hz but the book was analysed at {book} Hz; \
-                 resample it yourself rather than have this do it silently"
+                "the book's atoms were analysed at {book} Hz but its residual at {residual_book} \
+                 Hz; they come from different analyses and cannot share a timeline"
+            ),
+            Self::TimelineMismatch { book, residual_book } => write!(
+                f,
+                "the book's excerpt starts at source sample {book} but the residual's at \
+                 {residual_book}; they come from different analyses"
             ),
             Self::ChannelMismatch { channels } => {
                 write!(f, "cannot render {channels} channels: the book is mono")
@@ -77,6 +92,12 @@ impl std::error::Error for RenderError {}
 impl From<AudioError> for RenderError {
     fn from(e: AudioError) -> Self {
         Self::Audio(e)
+    }
+}
+
+impl From<FofError> for RenderError {
+    fn from(e: FofError) -> Self {
+        Self::Atoms(e)
     }
 }
 

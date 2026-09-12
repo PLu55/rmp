@@ -1,11 +1,17 @@
 //! The renderer: book in, sound file out.
 //!
 //! ```text
-//! ResidualBook -> band gains sqrt(P_b[k]) -> one-pole smoothing -> independent white noise
-//!              -> power-complementary ERB bank -> stochastic residual [+ FOF audio] -> WAV
+//! Book         -> atoms rendered one by one (synth::atoms) -----------------------+
+//! ResidualBook -> band gains sqrt(P_b[k]) -> one-pole smoothing -> white noise     |
+//!              -> power-complementary ERB bank -> stochastic residual -------------+-> mix -> WAV
 //! ```
 //!
-//! Three things fix the shape of the loop:
+//! **One timeline.** Atom onsets are relative to the analysed excerpt and the residual book records
+//! where that excerpt began, so both are placed at the same source sample — or both at zero, when
+//! the timeline is trimmed. A book written before it recorded its own `start_sample` reads it as
+//! zero, and the residual written by the same analysis then says where the excerpt really began.
+//!
+//! Three things fix the shape of the residual loop:
 //!
 //! **Block-structured, band-major** (§29, §30). The DSP core walks fixed 256-sample blocks and, for
 //! each, every band in turn. That is the cache-friendly order, and it is the order an online engine
@@ -23,10 +29,12 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::atom::AtomKind;
 use crate::audio;
 use crate::book::Book;
 use crate::residual::book::{ResidualBook, RESIDUAL_BOOK_VERSION};
 use crate::signal::Signal;
+use crate::synth::atoms;
 use crate::synth::bank::{BankCalibration, SynthesisBand, SynthesisBank};
 use crate::synth::config::{ClippingPolicy, OutputEncoding, RenderConfig};
 use crate::synth::error::RenderError;
@@ -78,16 +86,109 @@ impl BookInput {
             Self::Full(b) => b.residual.as_ref().ok_or(RenderError::NoResidualBook),
         }
     }
+
+    /// The atom book, when this is a full book.
+    pub fn atom_book(&self) -> Option<&Book> {
+        match self {
+            Self::Full(b) => Some(b),
+            Self::Residual(_) => None,
+        }
+    }
 }
 
 /// A whole render, as a file-oriented request (§5).
 pub struct RenderRequest {
     pub book: BookInput,
-    /// Pre-rendered FOF synthesis to mix the residual into (§17). Never resampled, never
-    /// time-stretched.
-    pub fof_audio: Option<PathBuf>,
+    /// A standalone residual book to render in place of the full book's own section — the file
+    /// `rmp --residual-book` writes beside an atom book.
+    pub residual_book: Option<ResidualBook>,
+    /// Render the book's atoms. A residual book has none, so this is moot for one.
+    pub atoms: bool,
+    /// Render the stochastic residual.
+    pub residual: bool,
     pub output: PathBuf,
     pub config: RenderConfig,
+}
+
+impl RenderRequest {
+    /// Everything the book holds, at the default settings.
+    pub fn new(book: BookInput, output: PathBuf) -> Self {
+        Self {
+            book,
+            residual_book: None,
+            atoms: true,
+            residual: true,
+            output,
+            config: RenderConfig::default(),
+        }
+    }
+
+    /// The atoms this request renders: `None` for a residual book, with `atoms` off, or when the
+    /// book selected nothing.
+    pub fn atom_source(&self) -> Option<&Book> {
+        self.book.atom_book().filter(|b| self.atoms && !b.is_empty())
+    }
+
+    /// The residual this request renders, if any: the standalone book when one was given, the
+    /// book's own section otherwise.
+    pub fn residual_source(&self) -> Option<&ResidualBook> {
+        if !self.residual {
+            return None;
+        }
+        self.residual_book.as_ref().or(match &self.book {
+            BookInput::Residual(r) => Some(r),
+            BookInput::Full(b) => b.residual.as_ref(),
+        })
+    }
+
+    /// Why this request renders nothing, when it does not.
+    fn nothing_to_render(&self) -> RenderError {
+        let is_residual_book = matches!(self.book, BookInput::Residual(_));
+        match (self.atoms, self.residual) {
+            (false, false) => RenderError::NothingToRender("both the atoms and the residual are off"),
+            (_, false) if is_residual_book => RenderError::NothingToRender(
+                "a residual book has no atoms, and the residual is off",
+            ),
+            (_, false) => {
+                RenderError::NothingToRender("the book selected no atoms, and the residual is off")
+            }
+            (true, true) if !is_residual_book => RenderError::NothingToRender(
+                "the book selected no atoms and carries no residual section",
+            ),
+            _ => RenderError::NoResidualBook,
+        }
+    }
+}
+
+/// The sample rate and source-timeline origin the atoms and the residual share.
+///
+/// A book records its excerpt origin only when it is nonzero, and a book written before the field
+/// existed reads as zero; the residual, written by the same analysis, always records it. So a zero
+/// origin on the book defers to the residual, and only two nonzero, different origins are an error.
+fn resolve_timeline(
+    atoms: Option<&Book>,
+    residual: Option<&ResidualBook>,
+) -> Result<(f64, u64), RenderError> {
+    Ok(match (atoms, residual) {
+        (Some(b), None) => (b.sample_rate as f64, b.start_sample),
+        (None, Some(r)) => (r.sample_rate, r.start_sample),
+        (Some(b), Some(r)) => {
+            if (b.sample_rate as f64 - r.sample_rate).abs() > 1e-6 {
+                return Err(RenderError::SampleRateMismatch {
+                    book: b.sample_rate,
+                    residual_book: r.sample_rate,
+                });
+            }
+            if b.start_sample != 0 && b.start_sample != r.start_sample {
+                return Err(RenderError::TimelineMismatch {
+                    book: b.start_sample,
+                    residual_book: r.start_sample,
+                });
+            }
+            (r.sample_rate, r.start_sample)
+        }
+        (None, None) => unreachable!("checked by the caller"),
+    })
 }
 
 /// One band, as the render resolved it — the `RMP_RESIDUAL_DETAIL` table.
@@ -107,6 +208,17 @@ pub struct RenderReport {
     pub sample_rate: f64,
     pub channels: u16,
     pub samples_written: u64,
+    /// The source sample the analysed excerpt began at. Output sample 0 is source sample 0 unless
+    /// the timeline was trimmed.
+    pub timeline_origin: u64,
+    /// Atoms rendered, per kind. Empty when no atoms were rendered.
+    pub atoms: Vec<(AtomKind, usize)>,
+    /// Length of the atom render, from the excerpt origin to the last atom's death.
+    pub atom_samples: Option<u64>,
+    /// Peak of the atoms alone, before mixing and before the output gain. Zero when none rendered.
+    pub atom_peak: f32,
+    /// Length of the residual render, including any leading timeline silence.
+    pub residual_samples: Option<u64>,
     /// Peak of the stochastic residual alone, before mixing and before the output gain.
     pub residual_peak: f32,
     /// Peak of what was actually written.
@@ -114,12 +226,9 @@ pub struct RenderReport {
     pub clipped_samples: u64,
     pub seed: u64,
     pub book_type: RenderBookType,
-    pub calibration: BankCalibration,
+    /// The synthesis bank's complementarity, when a residual was rendered.
+    pub calibration: Option<BankCalibration>,
     pub bands: Vec<BandReport>,
-    /// Length of the FOF audio in samples, when one was mixed in.
-    pub fof_samples: Option<u64>,
-    /// Channel count of the FOF file on disk, before the downmix.
-    pub fof_channels: Option<usize>,
 }
 
 /// Read a book of either kind, deciding from the document itself (§27).
@@ -171,86 +280,110 @@ pub fn render_full_book(book: &Book, config: &RenderConfig) -> Result<Signal, Re
     render_residual_book(residual, config)
 }
 
-/// The whole file-oriented pipeline: render, optionally mix, gain, measure, write (§39).
+/// The whole file-oriented pipeline: render the atoms and the residual, mix, gain, measure, write
+/// (§39).
 pub fn render_to_file(request: &RenderRequest) -> Result<RenderReport, RenderError> {
     let cfg = &request.config;
     cfg.validate()?;
 
-    let book = request.book.residual()?;
-    let mut renderer = StochasticRenderer::new(book, cfg)?;
-    let residual = renderer.render(book, cfg, BLOCK)?;
-    let residual_peak = residual.peak();
+    let atom_book = request.atom_source();
+    let residual_book = request.residual_source();
+    if atom_book.is_none() && residual_book.is_none() {
+        return Err(request.nothing_to_render());
+    }
+    let (sample_rate, origin) = resolve_timeline(atom_book, residual_book)?;
+    // §16: output sample 0 is source sample 0 unless the timeline is explicitly trimmed away. The
+    // residual renderer places itself by the same rule from the same origin.
+    let place = if cfg.preserve_timeline { origin as usize } else { 0 };
 
-    // The FOF file is taken as already sitting at the right place on the timeline (§17).
-    let fof = match &request.fof_audio {
-        Some(path) => {
-            let input = audio::read(path)?;
-            let want = book.sample_rate as f32;
-            if input.signal.sample_rate != want {
-                return Err(RenderError::SampleRateMismatch {
-                    book: book.sample_rate,
-                    fof_audio: input.signal.sample_rate,
-                });
-            }
-            Some(input)
+    let mut renderer = None;
+    let residual = match residual_book {
+        Some(r) => {
+            let mut stochastic = StochasticRenderer::new(r, cfg)?;
+            let out = stochastic.render(r, cfg, BLOCK)?;
+            renderer = Some(stochastic);
+            Some(out)
         }
         None => None,
     };
+    // In the book's own frame; `place` puts it on the timeline below.
+    let atoms = match atom_book {
+        Some(b) => Some(atoms::render_atoms(b, atoms::natural_len(b)?)?),
+        None => None,
+    };
 
-    // §18: a short FOF file is padded with zeros, a long one extends the output.
-    let n_fof = fof.as_ref().map_or(0, |f| f.signal.len());
-    let n_out = residual.len().max(n_fof);
+    // §18: whichever ends later sets the length, and the other is padded with zeros. The atoms
+    // usually do — their tails outlive the analysed excerpt the residual stops at.
+    let n_res = residual.as_ref().map_or(0, Signal::len);
+    let n_atoms = atoms.as_ref().map_or(0, |s| place + s.len());
+    let n_out = n_res.max(n_atoms);
 
     let gain = cfg.output_gain() as f32;
     let mut out = vec![0.0f32; n_out];
     for (n, y) in out.iter_mut().enumerate() {
-        let r = residual.samples.get(n).copied().unwrap_or(0.0);
-        let x = fof
+        let r = residual.as_ref().and_then(|s| s.samples.get(n)).copied().unwrap_or(0.0);
+        let x = atoms
             .as_ref()
-            .and_then(|f| f.signal.samples.get(n))
+            .and_then(|s| n.checked_sub(place).and_then(|i| s.samples.get(i)))
             .copied()
             .unwrap_or(0.0);
         *y = (x + r) * gain;
     }
 
-    let mut clipped = 0u64;
-    let mut peak = 0.0f32;
-    for y in &mut out {
-        let a = y.abs();
-        if a > peak {
-            peak = a;
-        }
-        if a > 1.0 {
-            clipped += 1;
-            if cfg.clipping == ClippingPolicy::Clip {
-                *y = y.clamp(-1.0, 1.0);
-            }
-        }
-    }
+    let (peak, clipped) = apply_clipping(&mut out, cfg.clipping);
     if clipped > 0 && cfg.clipping == ClippingPolicy::Error {
         return Err(RenderError::ClippingDetected { count: clipped, peak });
     }
 
-    let signal = Signal::new(out, book.sample_rate as f32);
+    let signal = Signal::new(out, sample_rate as f32);
     match cfg.output_encoding {
         OutputEncoding::Float32 => audio::write(&request.output, &signal)?,
         OutputEncoding::Pcm24 => audio::write_pcm24(&request.output, &signal)?,
     }
 
     Ok(RenderReport {
-        sample_rate: book.sample_rate,
+        sample_rate,
         channels: 1,
         samples_written: signal.len() as u64,
-        residual_peak,
+        timeline_origin: origin,
+        atoms: atom_book.map(atoms::count_by_kind).unwrap_or_default(),
+        atom_samples: atoms.as_ref().map(|s| s.len() as u64),
+        atom_peak: atoms.as_ref().map_or(0.0, Signal::peak),
+        residual_samples: residual.as_ref().map(|s| s.len() as u64),
+        residual_peak: residual.as_ref().map_or(0.0, Signal::peak),
         mixed_peak: peak,
         clipped_samples: clipped,
         seed: cfg.seed,
         book_type: request.book.book_type(),
-        calibration: renderer.bank().calibration(),
-        bands: renderer.band_reports(book),
-        fof_samples: fof.as_ref().map(|f| f.signal.len() as u64),
-        fof_channels: fof.as_ref().map(|f| f.channels),
+        calibration: renderer.as_ref().map(|r| r.bank().calibration()),
+        bands: match (&renderer, residual_book) {
+            (Some(r), Some(b)) => r.band_reports(b),
+            _ => Vec::new(),
+        },
     })
+}
+
+/// Measure the finished mix and apply the clipping policy to it (§21, §22).
+///
+/// Returns the peak — before any clipping, so the report says how far over it was — and the number
+/// of samples past full scale. Under [`ClippingPolicy::Clip`] those samples are clamped in place;
+/// under the other two they are left alone, and it is the caller's business to refuse the file.
+fn apply_clipping(out: &mut [f32], policy: ClippingPolicy) -> (f32, u64) {
+    let mut clipped = 0u64;
+    let mut peak = 0.0f32;
+    for y in out {
+        let a = y.abs();
+        if a > peak {
+            peak = a;
+        }
+        if a > 1.0 {
+            clipped += 1;
+            if policy == ClippingPolicy::Clip {
+                *y = y.clamp(-1.0, 1.0);
+            }
+        }
+    }
+    (peak, clipped)
 }
 
 /// The DSP core. Everything it needs is allocated here; the render loop allocates nothing (§37).
@@ -434,7 +567,7 @@ fn split_at_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::synth::testing::{a_book, book_with_power};
+    use crate::synth::testing::{a_book, atom_book, book_with_power};
 
     /// §44.1: an all-zero book renders exact zeros, not merely quiet ones.
     #[test]
@@ -598,12 +731,7 @@ mod tests {
     #[test]
     fn a_full_book_renders_its_embedded_residual_identically() {
         let residual = book_with_power(48_000.0, 16, 4800, |_, b| 0.001 * b as f32);
-        let full = Book {
-            selections: vec![],
-            initial_energy: 1.0,
-            sample_rate: 48_000.0,
-            residual: Some(residual.clone()),
-        };
+        let full = Book { residual: Some(residual.clone()), ..Book::new(1.0, 48_000.0) };
         let cfg = RenderConfig::default();
         assert_eq!(
             render_full_book(&full, &cfg).unwrap().samples,
@@ -614,12 +742,7 @@ mod tests {
     /// §44.8.
     #[test]
     fn a_full_book_without_a_residual_section_is_refused() {
-        let full = Book {
-            selections: vec![],
-            initial_energy: 1.0,
-            sample_rate: 48_000.0,
-            residual: None,
-        };
+        let full = Book::new(1.0, 48_000.0);
         let err = render_full_book(&full, &RenderConfig::default()).unwrap_err();
         assert!(matches!(err, RenderError::NoResidualBook));
         assert!(err.to_string().contains("--residual-analysis"));
@@ -678,16 +801,33 @@ mod tests {
         }
 
         fn request(book: BookInput, out: &Path) -> RenderRequest {
-            RenderRequest {
-                book,
-                fof_audio: None,
-                output: out.to_path_buf(),
-                config: RenderConfig::default(),
+            RenderRequest::new(book, out.to_path_buf())
+        }
+
+        fn fof(t0: i64, f: f32, amp: f32) -> crate::fof::AtomParams {
+            crate::fof::AtomParams {
+                t0,
+                f,
+                env: crate::fof::EnvelopeParams::new(800.0, 0.001).into(),
+                phi: 0.2,
+                amp,
             }
         }
 
-        fn write_wav(path: &Path, samples: Vec<f32>, sample_rate: f32) {
-            audio::write(path, &Signal::new(samples, sample_rate)).unwrap();
+        fn gauss(t0: i64, f: f32, amp: f32) -> crate::fof::AtomParams {
+            crate::fof::AtomParams {
+                t0,
+                f,
+                env: crate::gauss::GaussianParams::new(0.002).into(),
+                phi: -0.4,
+                amp,
+            }
+        }
+
+        fn read_back(path: &Path) -> Vec<f32> {
+            let s = audio::read(path).unwrap().signal.samples;
+            let _ = std::fs::remove_file(path);
+            s
         }
 
         /// §27: both kinds of book are recognised from the document, in both wire formats, with and
@@ -695,12 +835,7 @@ mod tests {
         #[test]
         fn a_book_of_either_kind_is_recognised_from_the_document() {
             let residual = book_with_power(48_000.0, 8, 480, |_, b| b as f32);
-            let full = Book {
-                selections: vec![],
-                initial_energy: 1.0,
-                sample_rate: 48_000.0,
-                residual: Some(residual.clone()),
-            };
+            let full = Book { residual: Some(residual.clone()), ..Book::new(1.0, 48_000.0) };
 
             for ext in ["toml", "json", "json.gz"] {
                 let p = tmp(&format!("detect.{ext}"));
@@ -729,111 +864,193 @@ mod tests {
             let _ = std::fs::remove_file(&p);
         }
 
-        /// §44.9: with a zero residual the output is the FOF file, sample for sample.
+        /// §44.9: with a zero residual the output is the atoms, sample for sample — the same render
+        /// `synth::atoms` produces, of every kind.
         #[test]
-        fn a_zero_residual_mixes_to_exactly_the_fof_audio() {
-            let fof = tmp("mix_fof.wav");
+        fn a_zero_residual_mixes_to_exactly_the_atoms() {
             let out = tmp("mix_out.wav");
-            let want: Vec<f32> = (0..2000).map(|i| (i as f32 * 0.05).sin() * 0.4).collect();
-            write_wav(&fof, want.clone(), 48_000.0);
+            let atoms = [fof(100, 700.0, 0.5), gauss(900, 1300.0, 0.3)];
+            let full = Book {
+                residual: Some(book_with_power(48_000.0, 8, 2000, |_, _| 0.0)),
+                ..atom_book(48_000.0, &atoms)
+            };
+            let want = atoms::render_atoms(&full, atoms::natural_len(&full).unwrap()).unwrap();
 
-            let book = book_with_power(48_000.0, 8, 2000, |_, _| 0.0);
-            let mut req = request(BookInput::Residual(book), &out);
-            req.fof_audio = Some(fof.clone());
-            let report = render_to_file(&req).unwrap();
-
+            let report = render_to_file(&request(BookInput::Full(full), &out)).unwrap();
             assert_eq!(report.residual_peak, 0.0);
-            assert_eq!(report.fof_samples, Some(2000));
-            assert_eq!(report.fof_channels, Some(1));
-            let got = audio::read(&out).unwrap().signal;
-            assert_eq!(got.samples, want);
-            for p in [&fof, &out] {
-                let _ = std::fs::remove_file(p);
+            assert_eq!(report.atoms, vec![(AtomKind::Fof, 1), (AtomKind::Gaussian, 1)]);
+            assert_eq!(report.atom_samples, Some(want.len() as u64));
+            let got = read_back(&out);
+            assert_eq!(&got[..want.len()], &want.samples[..]);
+            assert!(got[want.len()..].iter().all(|&s| s == 0.0), "only residual length past the atoms");
+        }
+
+        /// Atoms plus residual is exactly the sum of the two rendered alone: the mix adds nothing
+        /// and loses nothing.
+        #[test]
+        fn the_mix_is_the_sum_of_its_parts() {
+            let full = Book {
+                residual: Some(book_with_power(48_000.0, 8, 6000, |_, _| 0.001)),
+                ..atom_book(48_000.0, &[fof(0, 500.0, 0.2), gauss(3000, 900.0, 0.2)])
+            };
+            let render = |atoms: bool, residual: bool, name: &str| {
+                let out = tmp(name);
+                let mut req = request(BookInput::Full(full.clone()), &out);
+                req.atoms = atoms;
+                req.residual = residual;
+                render_to_file(&req).unwrap();
+                read_back(&out)
+            };
+            let (both, a, r) = (render(true, true, "sum_both.wav"), render(true, false, "sum_a.wav"), render(false, true, "sum_r.wav"));
+            assert_eq!(both.len(), a.len().max(r.len()));
+            for (n, &y) in both.iter().enumerate() {
+                let want = a.get(n).copied().unwrap_or(0.0) + r.get(n).copied().unwrap_or(0.0);
+                assert_eq!(y, want, "sample {n}");
             }
+        }
+
+        /// §16: a book analysed from an offset puts its atoms and its residual at the same source
+        /// sample, and trimming moves both to zero together.
+        #[test]
+        fn atoms_and_residual_share_one_timeline() {
+            // Silent power: the noise streams run through the lead-in too, so a trimmed render's
+            // noise is a different stretch of the same stream and could not be compared sample for
+            // sample. `the_timeline_is_preserved_by_default` places the residual itself.
+            let mut residual = book_with_power(48_000.0, 8, 4800, |_, _| 0.0);
+            residual.start_sample = 1000;
+            let mut full = Book {
+                residual: Some(residual),
+                ..atom_book(48_000.0, &[fof(0, 600.0, 0.5)])
+            };
+            full.start_sample = 1000;
+
+            let out = tmp("timeline.wav");
+            let report = render_to_file(&request(BookInput::Full(full.clone()), &out)).unwrap();
+            assert_eq!(report.timeline_origin, 1000);
+            let placed = read_back(&out);
+            assert!(placed[..1000].iter().all(|&s| s == 0.0), "sound before the excerpt");
+
+            let mut req = request(BookInput::Full(full.clone()), &out);
+            req.config.preserve_timeline = false;
+            render_to_file(&req).unwrap();
+            let trimmed = read_back(&out);
+            assert_eq!(&placed[1000..], &trimmed[..placed.len() - 1000]);
+
+            // The atoms land on the excerpt origin, not the file's.
+            let mut atoms_only = request(BookInput::Full(full), &out);
+            atoms_only.residual = false;
+            render_to_file(&atoms_only).unwrap();
+            let got = read_back(&out);
+            let first = got.iter().position(|&s| s != 0.0).unwrap();
+            assert!((1000..1010).contains(&first), "first atom sample at {first}");
+        }
+
+        /// A book written before it recorded its own origin reads as zero; the residual written by
+        /// the same analysis knows better. Two different nonzero origins are refused.
+        #[test]
+        fn an_old_books_origin_comes_from_its_residual_and_a_conflict_is_refused() {
+            let mut residual = book_with_power(48_000.0, 8, 2000, |_, _| 0.0);
+            residual.start_sample = 5000;
+            let old = atom_book(48_000.0, &[fof(0, 600.0, 0.5)]);
+
+            let out = tmp("origin.wav");
+            let mut req = request(BookInput::Full(old.clone()), &out);
+            req.residual_book = Some(residual.clone());
+            assert_eq!(render_to_file(&req).unwrap().timeline_origin, 5000);
+            let _ = std::fs::remove_file(&out);
+
+            let mut other = old;
+            other.start_sample = 7000;
+            let mut req = request(BookInput::Full(other), &out);
+            req.residual_book = Some(residual);
+            assert!(matches!(
+                render_to_file(&req),
+                Err(RenderError::TimelineMismatch { book: 7000, residual_book: 5000 })
+            ));
         }
 
         /// §44.10, §18: no silent resampling.
         #[test]
         fn a_sample_rate_mismatch_is_refused() {
-            let fof = tmp("rate_fof.wav");
             let out = tmp("rate_out.wav");
-            write_wav(&fof, vec![0.1; 1000], 44_100.0);
-
-            let book = book_with_power(48_000.0, 8, 1000, |_, _| 0.0);
-            let mut req = request(BookInput::Residual(book), &out);
-            req.fof_audio = Some(fof.clone());
-
+            let mut req = request(BookInput::Full(atom_book(44_100.0, &[fof(0, 600.0, 0.5)])), &out);
+            req.residual_book = Some(book_with_power(48_000.0, 8, 1000, |_, _| 0.0));
             match render_to_file(&req) {
-                Err(RenderError::SampleRateMismatch { book, fof_audio }) => {
-                    assert_eq!((book, fof_audio), (48_000.0, 44_100.0));
+                Err(RenderError::SampleRateMismatch { book, residual_book }) => {
+                    assert_eq!((book, residual_book), (44_100.0, 48_000.0));
                 }
                 other => panic!("expected a rate mismatch, got {:?}", other.map(|r| r.samples_written)),
             }
-            let _ = std::fs::remove_file(&fof);
+            assert!(!out.exists());
         }
 
-        /// §44.11, §18: the output is as long as the longer of the two, and a short FOF file is
-        /// padded rather than truncating the residual.
+        /// §44.11, §18: the output is as long as the longer of the two.
         #[test]
-        fn the_output_is_as_long_as_the_longer_input() {
-            let book = book_with_power(48_000.0, 8, 4800, |_, _| 0.001);
-            for (fof_len, want) in [(1000usize, 4800usize), (4800, 4800), (9600, 9600)] {
-                let fof = tmp(&format!("len_fof_{fof_len}.wav"));
-                let out = tmp(&format!("len_out_{fof_len}.wav"));
-                write_wav(&fof, vec![0.01; fof_len], 48_000.0);
-
-                let mut req = request(BookInput::Residual(book.clone()), &out);
-                req.fof_audio = Some(fof.clone());
-                let report = render_to_file(&req).unwrap();
-                assert_eq!(report.samples_written, want as u64, "fof of {fof_len}");
-                assert_eq!(audio::read(&out).unwrap().signal.len(), want);
-                for p in [&fof, &out] {
-                    let _ = std::fs::remove_file(p);
-                }
+        fn the_output_is_as_long_as_the_longer_part() {
+            let residual = book_with_power(48_000.0, 8, 4800, |_, _| 0.001);
+            for t0 in [0i64, 4000, 9000] {
+                let full = Book {
+                    residual: Some(residual.clone()),
+                    ..atom_book(48_000.0, &[fof(t0, 600.0, 0.1)])
+                };
+                let atoms_end = atoms::natural_len(&full).unwrap();
+                let out = tmp(&format!("len_{t0}.wav"));
+                let report = render_to_file(&request(BookInput::Full(full), &out)).unwrap();
+                assert_eq!(report.samples_written, atoms_end.max(4800) as u64, "t0 {t0}");
+                assert_eq!(read_back(&out).len(), atoms_end.max(4800));
             }
         }
 
-        /// §44.12, §21, §22: gain is applied, overs are counted, and each policy does its own thing.
-        /// Nothing is ever normalised.
+        /// The flags decide what renders, and a request that renders nothing says why instead of
+        /// writing an empty file.
+        #[test]
+        fn the_components_can_be_switched_off_and_nothing_is_an_error() {
+            let out = tmp("flags.wav");
+            let full = atom_book(48_000.0, &[fof(0, 600.0, 0.5)]);
+
+            let mut req = request(BookInput::Full(full.clone()), &out);
+            req.atoms = false;
+            assert!(matches!(render_to_file(&req), Err(RenderError::NoResidualBook)));
+
+            req.residual = false;
+            assert!(matches!(render_to_file(&req), Err(RenderError::NothingToRender(_))));
+
+            let residual_only = book_with_power(48_000.0, 8, 480, |_, _| 0.0);
+            let mut req = request(BookInput::Residual(residual_only), &out);
+            req.residual = false;
+            assert!(matches!(render_to_file(&req), Err(RenderError::NothingToRender(_))));
+
+            let empty = request(BookInput::Full(Book::new(1.0, 48_000.0)), &out);
+            assert!(matches!(render_to_file(&empty), Err(RenderError::NothingToRender(_))));
+            assert!(!out.exists());
+
+            // A full book with atoms and no residual section is no longer an error: it is atoms.
+            let report = render_to_file(&request(BookInput::Full(full), &out)).unwrap();
+            assert!(report.calibration.is_none() && report.residual_samples.is_none());
+            let _ = std::fs::remove_file(&out);
+        }
+
+        /// §21, §22: overs are counted, and each policy does its own thing. Nothing is ever
+        /// normalised.
         #[test]
         fn overs_are_counted_and_the_policy_is_honoured() {
-            let fof = tmp("clip_fof.wav");
-            let book = book_with_power(48_000.0, 8, 1000, |_, _| 0.0);
-            // Half the samples are past full scale once the gain is applied.
-            let x: Vec<f32> = (0..1000).map(|i| if i % 2 == 0 { 0.9 } else { 0.1 }).collect();
-            write_wav(&fof, x, 48_000.0);
+            // Half the samples are past full scale.
+            let x: Vec<f32> = (0..1000).map(|i| if i % 2 == 0 { 1.8 } else { -0.2 }).collect();
 
-            let render = |policy: ClippingPolicy, name: &str| {
-                let out = tmp(name);
-                let mut req = request(BookInput::Residual(book.clone()), &out);
-                req.fof_audio = Some(fof.clone());
-                req.config.output_gain_db = 6.0206; // exactly 2x
-                req.config.clipping = policy;
-                (render_to_file(&req), out)
-            };
+            let mut report = x.clone();
+            assert_eq!(apply_clipping(&mut report, ClippingPolicy::Report), (1.8, 500));
+            assert_eq!(report, x, "report must write the samples through untouched");
 
-            // Report: written through untouched, and counted.
-            let (report, out) = render(ClippingPolicy::Report, "clip_report.wav");
-            let report = report.unwrap();
-            assert_eq!(report.clipped_samples, 500);
-            assert!((report.mixed_peak - 1.8).abs() < 1e-5, "peak {}", report.mixed_peak);
-            assert!((audio::read(&out).unwrap().signal.peak() - 1.8).abs() < 1e-5);
-            let _ = std::fs::remove_file(&out);
+            let mut clip = x.clone();
+            assert_eq!(apply_clipping(&mut clip, ClippingPolicy::Clip), (1.8, 500));
+            assert!(clip.iter().all(|s| s.abs() <= 1.0));
 
-            // Clip: bounded, still counted, and the file is written.
-            let (report, out) = render(ClippingPolicy::Clip, "clip_clip.wav");
-            assert_eq!(report.unwrap().clipped_samples, 500);
-            assert!(audio::read(&out).unwrap().signal.peak() <= 1.0);
-            let _ = std::fs::remove_file(&out);
-
-            // Error: refused, and nothing is written.
-            let (report, out) = render(ClippingPolicy::Error, "clip_error.wav");
-            match report {
-                Err(RenderError::ClippingDetected { count, .. }) => assert_eq!(count, 500),
-                other => panic!("expected a clipping error, got {}", other.is_ok()),
-            }
+            // And end to end: a refused render writes nothing.
+            let out = tmp("clip_error.wav");
+            let mut req = request(BookInput::Full(atom_book(48_000.0, &[fof(0, 600.0, 4.0)])), &out);
+            req.config.clipping = ClippingPolicy::Error;
+            assert!(matches!(render_to_file(&req), Err(RenderError::ClippingDetected { .. })));
             assert!(!out.exists());
-            let _ = std::fs::remove_file(&fof);
         }
 
         /// §20: both encodings write a readable file at the book's own rate.
@@ -879,12 +1096,7 @@ mod tests {
         #[test]
         fn the_report_names_the_source_kind() {
             let residual: ResidualBook = book_with_power(48_000.0, 8, 480, |_, b| 0.01 * b as f32);
-            let full = Book {
-                selections: vec![],
-                initial_energy: 1.0,
-                sample_rate: 48_000.0,
-                residual: Some(residual.clone()),
-            };
+            let full = Book { residual: Some(residual.clone()), ..Book::new(1.0, 48_000.0) };
 
             let a = tmp("kind_r.wav");
             let b = tmp("kind_f.wav");

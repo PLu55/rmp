@@ -1,20 +1,22 @@
-//! `rmpsynth` — reconstruct the stochastic residual an RMP analysis measured.
+//! `rmpsynth` — render an rmp book to a soundfile: its atoms, its stochastic residual, or both.
 //!
 //! ```text
-//! rmpsynth -b book.json.gz -o residual.wav
-//! rmpsynth -b book.json.gz --fof-audio fof.wav -o mixed.wav
+//! rmpsynth -b book.json.gz -o resynth.wav                        # atoms + embedded residual
+//! rmpsynth -b book.json.gz --no-residual -o atoms.wav            # the atoms alone
+//! rmpsynth -b book.json --residual-book bank.json.gz -o mix.wav  # atoms + a standalone residual
+//! rmpsynth -b bank.json.gz -o stochastic.wav                     # a residual book: noise only
 //! ```
 //!
-//! A front end and nothing else: every decision about the audio lives in [`rmp::synth`], so `rmp`
-//! itself can call the same renderer without going through a process (§28).
+//! All synthesis lives here; `rmp` only analyses. A front end and nothing else: every decision about
+//! the audio lives in [`rmp::synth`].
 //!
-//! `--book` takes either kind of book and works out which it is from the document (§27). A full
-//! book's residual section is used; its atoms are not synthesised here — render those with `rmp -b
-//! book -o fof.wav` and pass the result as `--fof-audio`.
+//! `--book` takes either kind of book and works out which it is from the document (§27). FOF atoms
+//! render through rfofs and Gaussian atoms through rmp's own definition, each exactly as the pursuit
+//! subtracted it.
 
 use clap::{Parser, ValueEnum};
 use rmp::synth::{
-    load_book, render_to_file, ClippingPolicy, GainSmoothingConfig, GainSmoothingMode,
+    load_book, render_to_file, BookInput, ClippingPolicy, GainSmoothingConfig, GainSmoothingMode,
     OutputEncoding, RenderConfig, RenderRequest,
 };
 use std::path::PathBuf;
@@ -23,12 +25,12 @@ use std::process::ExitCode;
 #[derive(Parser, Debug)]
 #[command(
     name = "rmpsynth",
-    about = "Stochastic resynthesis of an RMP residual book",
+    about = "Render an rmp book: its atoms, its stochastic residual, or both",
     version
 )]
 struct Args {
-    /// The book to render: a standalone residual book, or a full rmp book carrying one. Format
-    /// follows the extension — .toml or .json, either optionally with a trailing .gz.
+    /// The book to render: a full rmp book, or a standalone residual book. Format follows the
+    /// extension — .toml or .json, either optionally with a trailing .gz.
     #[arg(short, long)]
     book: PathBuf,
 
@@ -36,10 +38,18 @@ struct Args {
     #[arg(short, long)]
     output: PathBuf,
 
-    /// Pre-rendered FOF synthesis to mix the residual into. Must already sit at the right place on
-    /// the timeline and be at the book's sample rate; nothing is resampled or stretched.
+    /// A standalone residual book, as written by `rmp --residual-book`, to render with the book's
+    /// atoms. Replaces the book's own residual section if it has one.
     #[arg(long, value_name = "PATH")]
-    fof_audio: Option<PathBuf>,
+    residual_book: Option<PathBuf>,
+
+    /// Leave the atoms out.
+    #[arg(long)]
+    no_atoms: bool,
+
+    /// Leave the stochastic residual out.
+    #[arg(long)]
+    no_residual: bool,
 
     /// Seed for the per-band noise. The same seed renders the same samples, every time.
     #[arg(long, default_value_t = RenderConfig::default().seed)]
@@ -72,9 +82,9 @@ struct Args {
     #[arg(long, conflicts_with = "clip")]
     error_on_clip: bool,
 
-    /// Trim the output to the analysed excerpt instead of preserving the source timeline.
-    #[arg(long)]
-    trim_to_residual: bool,
+    /// Start the output at the analysed excerpt instead of preserving the source timeline.
+    #[arg(long, alias = "trim-to-residual")]
+    trim_to_excerpt: bool,
 
     /// Print the per-band table. The RMP_RESIDUAL_DETAIL environment variable does the same.
     #[arg(short, long)]
@@ -121,7 +131,7 @@ impl Args {
                 (_, true) => ClippingPolicy::Error,
                 _ => ClippingPolicy::Report,
             },
-            preserve_timeline: !self.trim_to_residual,
+            preserve_timeline: !self.trim_to_excerpt,
         }
     }
 }
@@ -146,102 +156,132 @@ fn run(args: &Args) -> Result<(), String> {
     };
 
     let book = load_book(&args.book).map_err(|e| e.to_string())?;
-    let book_type = book.book_type();
-    let residual = book.residual().map_err(|e| e.to_string())?;
-    let cfg = args.config();
-
-    say("Residual synthesis:");
-    say(&format!("  book:                 {}", args.book.display()));
-    say(&format!("  source type:          {book_type}"));
-    say(&format!("  sample rate:          {} Hz", residual.sample_rate));
-    say(&format!(
-        "  ERB bands:            {} over {:.1} .. {:.1} Hz, order {} {}",
-        residual.band_count,
-        residual.bank.min_freq_hz,
-        residual.bank.max_freq_hz,
-        residual.bank.filter_order,
-        residual.bank.filter_kind
-    ));
-    say(&format!("  residual frames:      {}", residual.frame_count));
-    say(&format!(
-        "  update interval:      {} samples / {:.3} ms",
-        residual.update_samples,
-        residual.update_samples as f64 / residual.sample_rate * 1e3
-    ));
-    say(&format!("  seed:                 {}", cfg.seed));
-    say(&format!(
-        "  gain smoothing:       {:.2} ms, {}",
-        args.gain_smoothing_ms, cfg.gain_smoothing.mode
-    ));
-
-    // §17 takes the FOF file as already sitting at the right place on the timeline, and nothing
-    // here can check that it does. The one case where it is predictably wrong is worth saying out
-    // loud: `rmp -s 2.0 -o fof.wav` writes the excerpt starting at sample 0, while the book it
-    // wrote alongside records where the excerpt came from.
-    if args.fof_audio.is_some() && residual.start_sample > 0 && !args.trim_to_residual {
-        say(&format!(
-            "  note:                 the book was analysed from sample {} ({:.3} s), so the \
-             residual is placed there. If --fof-audio was rendered from the excerpt alone, pass \
-             --trim-to-residual to line the two up.",
-            residual.start_sample,
-            residual.start_sample as f64 / residual.sample_rate
-        ));
-    }
+    let residual_book = match &args.residual_book {
+        None => None,
+        Some(path) => match load_book(path).map_err(|e| e.to_string())? {
+            BookInput::Residual(r) => Some(r),
+            BookInput::Full(b) => Some(b.residual.ok_or_else(|| {
+                format!("--residual-book {} carries no residual section", path.display())
+            })?),
+        },
+    };
+    let embedded = matches!(&book, BookInput::Full(b) if b.residual.is_some());
 
     let request = RenderRequest {
         book,
-        fof_audio: args.fof_audio.clone(),
+        residual_book,
+        atoms: !args.no_atoms,
+        residual: !args.no_residual,
         output: args.output.clone(),
-        config: cfg,
+        config: args.config(),
     };
-    let report = render_to_file(&request).map_err(|e| e.to_string())?;
+    let cfg = &request.config;
 
-    let cal = report.calibration;
-    say(&format!(
-        "  bank complementarity: {:+.2} dB worst, rms {:.3}, over {:.0} .. {:.0} Hz",
-        cal.worst_db(),
-        cal.rms_deviation,
-        cal.range_hz.0,
-        cal.range_hz.1
-    ));
-    if cal.worst_db().abs() > 1.0 {
+    say("Book:");
+    say(&format!("  file:                 {}", args.book.display()));
+    say(&format!("  source type:          {}", request.book.book_type()));
+
+    if let Some(b) = request.atom_source() {
+        say("");
+        say("Atoms:");
+        let kinds = rmp::synth::atoms::count_by_kind(b);
         say(&format!(
-            "  warning:              the bank cannot be made power-complementary to better than \
-             {:.1} dB — the reconstruction will comb. More residual.erb.bands is the fix.",
-            cal.worst_db().abs()
+            "  count:                {}",
+            kinds.iter().map(|(k, n)| format!("{n} {k}")).collect::<Vec<_>>().join(", ")
         ));
-    }
-
-    if args.verbose || std::env::var_os("RMP_RESIDUAL_DETAIL").is_some() {
-        say("    band   center_hz  bandwidth_hz  tau_ms       scale");
-        for (b, r) in report.bands.iter().enumerate() {
+        say(&format!("  sample rate:          {} Hz", b.sample_rate));
+        if b.start_sample > 0 {
             say(&format!(
-                "    {b:>4}  {:>10.2}  {:>12.2}  {:>6.2}  {:>10.3e}",
-                r.center_hz,
-                r.bandwidth_hz,
-                r.tau_seconds * 1e3,
-                r.scale
+                "  excerpt starts at:    source sample {} ({:.3} s)",
+                b.start_sample,
+                b.start_sample as f64 / b.sample_rate as f64
             ));
         }
     }
 
-    if let (Some(n), Some(ch)) = (report.fof_samples, report.fof_channels) {
+    if let Some(residual) = request.residual_source() {
         say("");
-        say("FOF audio:");
+        say("Residual synthesis:");
+        if request.residual_book.is_some() && embedded {
+            say("  note:                 --residual-book replaces the book's own residual section");
+        }
+        say(&format!("  sample rate:          {} Hz", residual.sample_rate));
         say(&format!(
-            "  input:                {}",
-            args.fof_audio.as_ref().map_or_else(String::new, |p| p.display().to_string())
+            "  ERB bands:            {} over {:.1} .. {:.1} Hz, order {} {}",
+            residual.band_count,
+            residual.bank.min_freq_hz,
+            residual.bank.max_freq_hz,
+            residual.bank.filter_order,
+            residual.bank.filter_kind
         ));
-        say(&format!("  channels:             {ch}{}", if ch > 1 { " (downmixed to mono)" } else { "" }));
-        say(&format!("  samples:              {n}"));
+        say(&format!("  residual frames:      {}", residual.frame_count));
+        say(&format!(
+            "  update interval:      {} samples / {:.3} ms",
+            residual.update_samples,
+            residual.update_samples as f64 / residual.sample_rate * 1e3
+        ));
+        say(&format!("  seed:                 {}", cfg.seed));
+        say(&format!(
+            "  gain smoothing:       {:.2} ms, {}",
+            args.gain_smoothing_ms, cfg.gain_smoothing.mode
+        ));
+    }
+
+    let report = render_to_file(&request).map_err(|e| e.to_string())?;
+
+    if let Some(cal) = report.calibration {
+        say(&format!(
+            "  bank complementarity: {:+.2} dB worst, rms {:.3}, over {:.0} .. {:.0} Hz",
+            cal.worst_db(),
+            cal.rms_deviation,
+            cal.range_hz.0,
+            cal.range_hz.1
+        ));
+        if cal.worst_db().abs() > 1.0 {
+            say(&format!(
+                "  warning:              the bank cannot be made power-complementary to better \
+                 than {:.1} dB — the reconstruction will comb. More residual.erb.bands is the fix.",
+                cal.worst_db().abs()
+            ));
+        }
+        if args.verbose || std::env::var_os("RMP_RESIDUAL_DETAIL").is_some() {
+            say("    band   center_hz  bandwidth_hz  tau_ms       scale");
+            for (b, r) in report.bands.iter().enumerate() {
+                say(&format!(
+                    "    {b:>4}  {:>10.2}  {:>12.2}  {:>6.2}  {:>10.3e}",
+                    r.center_hz,
+                    r.bandwidth_hz,
+                    r.tau_seconds * 1e3,
+                    r.scale
+                ));
+            }
+        }
     }
 
     say("");
     say("Output:");
     say(&format!("  file:                 {}", args.output.display()));
-    say(&format!("  encoding:             {}", request.config.output_encoding));
+    say(&format!("  encoding:             {}", cfg.output_encoding));
     say(&format!("  samples written:      {}", report.samples_written));
-    say(&format!("  residual peak:        {:.4}", report.residual_peak));
+    if report.timeline_origin > 0 {
+        say(&format!(
+            "  timeline:             {}",
+            if cfg.preserve_timeline {
+                format!(
+                    "source sample 0; the excerpt starts at {} (--trim-to-excerpt drops the lead-in)",
+                    report.timeline_origin
+                )
+            } else {
+                "trimmed to the excerpt".to_string()
+            }
+        ));
+    }
+    if report.atom_samples.is_some() {
+        say(&format!("  atom peak:            {:.4}", report.atom_peak));
+    }
+    if report.residual_samples.is_some() {
+        say(&format!("  residual peak:        {:.4}", report.residual_peak));
+    }
     say(&format!("  peak:                 {:.4}", report.mixed_peak));
     say(&format!("  samples > 1.0:        {}", report.clipped_samples));
     Ok(())

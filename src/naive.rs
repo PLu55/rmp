@@ -60,7 +60,7 @@ struct Basis {
 
 struct NaiveBlock {
     env: Vec<f32>,
-    params: crate::fof::EnvelopeParams,
+    params: crate::atom::Shape,
     fft_len: usize,
     k_lo: usize,
     bases: Vec<Basis>,

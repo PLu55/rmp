@@ -149,11 +149,11 @@ impl MapGrid {
             return Ok(g);
         }
 
-        let mut cache: HashMap<(u32, u32), usize> = HashMap::new();
+        let mut cache: HashMap<(u8, u32, u32), usize> = HashMap::new();
         let (mut t_lo, mut t_hi) = (i64::MAX, i64::MIN);
         let (mut f_lo, mut f_hi) = (f32::INFINITY, 0.0f32);
         for s in &book.selections {
-            let key = (s.atom.env.alpha.to_bits(), s.atom.env.beta.to_bits());
+            let key = s.atom.env.cache_key();
             let support = match cache.get(&key) {
                 Some(&n) => n,
                 None => {
@@ -165,7 +165,7 @@ impl MapGrid {
             t_lo = t_lo.min(s.atom.t0);
             t_hi = t_hi.max(s.atom.t0 + support as i64);
             f_lo = f_lo.min(s.atom.f);
-            f_hi = f_hi.max(s.atom.f + s.atom.env.alpha / std::f32::consts::PI);
+            f_hi = f_hi.max(s.atom.f + s.atom.env.bandwidth_hz());
         }
         // A single atom, or several sharing an onset, would give a zero-width axis.
         if t_hi <= t_lo {
@@ -674,7 +674,7 @@ mod tests {
         let atom = AtomParams {
             t0,
             f,
-            env: EnvelopeParams::new(alpha, beta),
+            env: EnvelopeParams::new(alpha, beta).into(),
             phi: 0.3,
             amp,
         };
@@ -1127,8 +1127,7 @@ mod tests {
             sel(6_000, 1000.0, 400.0, 0.001, 1.0),
         ]);
         // alpha*beta = 20, past rfofs's cliff at 10.
-        b.selections[1].atom.env.alpha = 20_000.0;
-        b.selections[1].atom.env.beta = 0.001;
+        b.selections[1].atom.env = EnvelopeParams::new(20_000.0, 0.001).into();
         let grid = MapGrid::linear(0.0..24_000.0, 32, 0.0..SR / 2.0, 64, SR);
         let map = compute(&b, grid, &MapOptions::default()).unwrap();
         assert_eq!((map.atoms, map.skipped), (1, 1));
