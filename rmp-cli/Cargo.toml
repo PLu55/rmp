@@ -1,0 +1,15 @@
+[package]
+name = "rmp-cli"
+version.workspace = true
+edition.workspace = true
+description = "The rmp command-line tools: rmp, rmpsynth and rmpstat"
+
+# `src/bin/<name>/main.rs` is auto-discovered, so the three binaries need no [[bin]] sections.
+
+[dependencies]
+rmp-core.workspace = true
+rmp-synthesis.workspace = true
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+plotters.workspace = true

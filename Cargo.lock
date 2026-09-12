@@ -911,21 +911,50 @@ dependencies = [
 ]
 
 [[package]]
-name = "rmp"
+name = "rmp-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "plotters",
+ "rmp-core",
+ "rmp-synthesis",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "rmp-core"
+version = "0.1.0"
+dependencies = [
  "criterion",
  "fftw",
  "fftw-sys",
  "flate2",
- "plotters",
  "rayon",
  "realfft",
  "rfofs",
  "serde",
  "serde_json",
  "sndfile",
+ "toml",
+]
+
+[[package]]
+name = "rmp-gui"
+version = "0.1.0"
+dependencies = [
+ "rmp-core",
+ "rmp-synthesis",
+]
+
+[[package]]
+name = "rmp-synthesis"
+version = "0.1.0"
+dependencies = [
+ "rfofs",
+ "rmp-core",
+ "serde",
+ "serde_json",
  "toml",
 ]
 

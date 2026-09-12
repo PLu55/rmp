@@ -1,0 +1,12 @@
+[package]
+name = "rmp-synthesis"
+version.workspace = true
+edition.workspace = true
+description = "Render an rmp book: its atoms, and the stochastic residual an ERB analysis measured"
+
+[dependencies]
+rmp-core.workspace = true
+rfofs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

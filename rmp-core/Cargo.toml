@@ -1,0 +1,28 @@
+[package]
+name = "rmp-core"
+version.workspace = true
+edition.workspace = true
+description = "Matching-pursuit decomposition of audio into FOF and Gaussian atoms"
+
+[dependencies]
+rfofs.workspace = true
+realfft.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+flate2.workspace = true
+sndfile.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+fftw.workspace = true
+fftw-sys.workspace = true
+
+[[bench]]
+name = "fft"
+harness = false
+
+[[bench]]
+name = "pursuit"
+harness = false

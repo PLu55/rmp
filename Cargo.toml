@@ -1,15 +1,26 @@
-[package]
-name = "rmp"
+[workspace]
+resolver = "3"
+members = ["rmp-core", "rmp-synthesis", "rmp-cli", "rmp-gui"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+# One version list for the whole workspace. Members write `dep.workspace = true`, so a bump happens
+# in one place and two crates cannot end up on different minor versions of the same library.
+#
+# Path dependencies here resolve against the *workspace root*, not against the member that uses
+# them, which is why rfofs is still `../rfofs`.
+[workspace.dependencies]
+rmp-core = { path = "rmp-core" }
+rmp-synthesis = { path = "rmp-synthesis" }
+
+# The FOF definition itself. Analysis atoms are rendered by the same code that synthesizes them, so
+# the two cannot drift apart.
+rfofs = { path = "../rfofs" }
+
 realfft = "3.5"
 rayon = "1"
-
-# The FOF definition itself. Analysis atoms are rendered by the same code that
-# synthesizes them, so the two cannot drift apart.
-rfofs = { path = "../rfofs" }
 
 # CLI, settings document, book serialisation, and soundfile I/O.
 clap = { version = "4", features = ["derive"] }
@@ -17,23 +28,25 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 # `float_roundtrip` is not optional. serde_json's default parser is a fast path that is not
 # correctly rounded: it reads 1842.6232639284315 back as ...17. Every f64 in a book goes through it
-# — the energies, and now the residual bank's centre frequencies — so without this a book does not
+# — the energies, and the residual bank's centre frequencies — so without this a book does not
 # survive its own write/read cycle, and two books that should be identical differ in the last bit.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 flate2 = "1"
 sndfile = "0.1"
-#rustfft = "6.4"
+
+# Diagnostics rendering, for `rmpstat` alone.
+plotters = { version = "0.3.7", default-features = false, features = [
+    "bitmap_backend",
+    "bitmap_encoder",
+    "svg_backend",
+    "all_series",
+    "all_elements",
+    "ab_glyph",
+] }
+
+# `benches/fft.rs` only. Keep `features = ["system"]`: the crate's default `source` feature vendors
+# FFTW 3.3.8 with no SIMD flags at all, producing scalar code ~3x slower. Requires libfftw3-dev.
 fftw = { version = "0.8", default-features = false, features = ["system"] }
 fftw-sys = { version = "0.8", default-features = false, features = ["system"] }
-plotters = { version = "0.3.7", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "svg_backend", "all_series", "all_elements", "ab_glyph"] }
 
-[dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bench]]
-name = "fft"
-harness = false
-
-[[bench]]
-name = "pursuit"
-harness = false

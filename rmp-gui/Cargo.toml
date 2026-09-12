@@ -1,0 +1,9 @@
+[package]
+name = "rmp-gui"
+version.workspace = true
+edition.workspace = true
+description = "A graphical front end over rmp: analyse, inspect and resynthesise"
+
+[dependencies]
+rmp-core.workspace = true
+rmp-synthesis.workspace = true
