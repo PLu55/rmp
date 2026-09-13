@@ -14,18 +14,14 @@
 //! here rather than in the function that opened it, which is the one thing about this API that
 //! bites if you do not know it.
 
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
 
 pub struct Audio {
     /// Held, not used directly: dropping it silences everything.
     _device: rodio::MixerDeviceSink,
     player: rodio::Player,
-    /// What was last handed to `play`. Kept so a tab can ask whether *its* render is the one
-    /// sounding — with one device and several tabs, "something is playing" is not the same
-    /// question as "this tab is playing".
-    current: Option<std::path::PathBuf>,
+    /// Whether a sound was started and not yet stopped. See [`Audio::playing`] for why this is
+    /// tracked here rather than asked of the player.
+    active: bool,
 }
 
 impl Audio {
@@ -34,28 +30,39 @@ impl Audio {
         let device = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|e| format!("no audio output: {e}"))?;
         let player = rodio::Player::connect_new(device.mixer());
-        Ok(Self { _device: device, player, current: None })
+        Ok(Self { _device: device, player, active: false })
     }
 
-    /// Play `path` from the start, replacing whatever was playing.
+    /// Play samples already in memory.
     ///
-    /// Replacing rather than mixing: two renders of the same excerpt on top of each other is not a
-    /// comparison, it is a mess. Pressing play again restarts, which is also how you listen to the
-    /// same passage twice.
-    pub fn play(&mut self, path: &Path) -> Result<(), String> {
+    /// What Play uses: the mix it wants exists only as a buffer, and writing it to a file first
+    /// would mean naming and saving something before you could hear it. Which *tab* the samples
+    /// came from is the window's business, not this module's — one device serves all of them.
+    pub fn play_samples(&mut self, signal: &rmp_core::signal::Signal) {
+        let rate = std::num::NonZero::new(signal.sample_rate as u32)
+            .unwrap_or(std::num::NonZero::new(48_000).expect("48000 is not zero"));
+        let mono = std::num::NonZero::new(1u16).expect("1 is not zero");
+        let buffer = rodio::buffer::SamplesBuffer::new(mono, rate, signal.samples.clone());
+        self.start(buffer);
+    }
+
+    fn start<S>(&mut self, source: S)
+    where
+        S: rodio::Source + Send + 'static,
+    {
         self.player.stop();
-        let file = File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
-        let source = rodio::Decoder::try_from(BufReader::new(file))
-            .map_err(|e| format!("decoding {}: {e}", path.display()))?;
+        // A stopped player will not take a new source: `stop` latches a flag that the audio thread
+        // clears when it drains. A fresh one is the reliable way to start again, and the old one is
+        // dropped here.
+        self.player = rodio::Player::connect_new(self._device.mixer());
         self.player.append(source);
         self.player.play();
-        self.current = Some(path.to_path_buf());
-        Ok(())
+        self.active = true;
     }
 
     pub fn stop(&mut self) {
         self.player.stop();
-        self.current = None;
+        self.active = false;
     }
 
     /// Whether a sound is going.
@@ -64,15 +71,10 @@ impl Audio {
     /// track that reached its end on its own, which nothing else would notice. But rodio's `stop()`
     /// only *sets a flag* — `sound_count` is decremented later by the audio thread — so `empty()`
     /// stays false for a moment after a stop, and a Stop button that lingers after the sound was
-    /// told to stop is a button that appears not to work. `current`, cleared synchronously, is what
+    /// told to stop is a button that appears not to work. `active`, cleared synchronously, is what
     /// makes the answer immediate in that direction.
     pub fn playing(&self) -> bool {
-        self.current.is_some() && !self.player.empty()
-    }
-
-    /// The file sounding right now, or `None` when nothing is.
-    pub fn playing_path(&self) -> Option<&std::path::Path> {
-        self.playing().then_some(self.current.as_deref()).flatten()
+        self.active && !self.player.empty()
     }
 }
 
@@ -80,47 +82,44 @@ impl Audio {
 mod tests {
     use super::*;
 
-    /// A second of quiet noise as a real WAV, written through the same code the renders go through.
-    fn a_wav(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("rmp-gui-audio-{}-{name}.wav", std::process::id()));
-        let samples = rmp_core::residual::pseudo_noise(48_000);
-        let quiet: Vec<f32> = samples.iter().map(|s| s * 0.05).collect();
-        rmp_core::audio::write_samples(&path, &quiet, 48_000.0).expect("writing the fixture");
-        path
+    /// A second of quiet noise, as a `Signal` — which is the form Play hands over.
+    fn a_signal() -> rmp_core::signal::Signal {
+        let samples: Vec<f32> =
+            rmp_core::residual::pseudo_noise(48_000).iter().map(|s| s * 0.05).collect();
+        rmp_core::signal::Signal::new(samples, 48_000.0)
     }
 
     /// Needs a sound device, which a headless machine has not got, so a failure to *open* is not a
-    /// failure of this test — what is under test is everything after that: decoding a real render
-    /// and reporting honestly which file is sounding.
+    /// failure of this test — what is under test is everything after that.
     #[test]
-    fn a_rendered_file_decodes_and_reports_itself_as_playing() {
+    fn samples_play_and_stopping_is_noticed_at_once() {
         let Ok(mut audio) = Audio::open() else {
             eprintln!("no audio device here; skipping the playback test");
             return;
         };
         assert!(!audio.playing(), "nothing plays before anything is asked for");
-        assert!(audio.playing_path().is_none());
 
-        let path = a_wav("play");
-        audio.play(&path).expect("a wav rmp itself wrote must decode");
+        audio.play_samples(&a_signal());
         assert!(audio.playing());
-        assert_eq!(audio.playing_path(), Some(path.as_path()), "and says which file");
 
+        // The point of tracking `active` ourselves: rodio's `stop` only latches a flag, and
+        // `player.empty()` stays false until the audio thread drains. A Stop button that lingers
+        // after the sound was told to stop looks broken.
         audio.stop();
-        assert!(!audio.playing());
-        assert!(audio.playing_path().is_none(), "stopping clears the file too");
-        std::fs::remove_file(&path).ok();
+        assert!(!audio.playing(), "stopping is visible immediately, not eventually");
     }
 
-    /// A missing or unreadable file is a line in the log, not a panic — the render it names can
-    /// have been moved or deleted since.
+    /// Starting a second sound after a stop must work. rodio will not take a new source on a
+    /// stopped player, which is why `start` connects a fresh one.
     #[test]
-    fn playing_a_file_that_is_not_there_is_an_error_not_a_panic() {
-        let Ok(mut audio) = Audio::open() else { return };
-        let err = audio
-            .play(std::path::Path::new("/nonexistent/never-rendered.wav"))
-            .expect_err("that file does not exist");
-        assert!(err.contains("never-rendered.wav"), "the message should name it: {err}");
-        assert!(!audio.playing());
+    fn a_second_sound_plays_after_the_first_was_stopped() {
+        let Ok(mut audio) = Audio::open() else {
+            eprintln!("no audio device here; skipping the playback test");
+            return;
+        };
+        audio.play_samples(&a_signal());
+        audio.stop();
+        audio.play_samples(&a_signal());
+        assert!(audio.playing(), "the player was stopped and never came back");
     }
 }

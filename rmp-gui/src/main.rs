@@ -11,6 +11,7 @@
 mod app;
 mod audio;
 mod help;
+mod playback;
 mod settings;
 mod task;
 

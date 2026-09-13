@@ -334,31 +334,32 @@ window that freezes for a second reads as a window that has crashed. The residua
 the book carries one, decided in `task` rather than left to `RenderRequest::residual_source` — both
 skip it, but only one can say in the log that it did.
 
-**What a render holds is a per-tab choice, and not an analysis setting** — it changes nothing about
-a book, so it sits beside Synthesize rather than in the settings document. `task::RenderMode` has
-four: atoms alone; the **measured** residual; the **synthesised** residual; and the two mixed. The
-distinction between the residuals is the one worth understanding — measured is the pursuit's own
-leftover buffer, sample for sample, and synthesised is the ERB band-power model of it rebuilt, and
-the invariant above records the model peaking ~10 dB lower at matched rms because a noise model
-does not carry an impulsive residue. Hearing them together is how you judge whether that matters
-for given material, so the file name carries the mode and the four never overwrite each other.
+**The three verbs each have their own panel, and "residual" means something different in each.**
+That is why they are grouped rather than laid out as one row: a flat row of checkboxes would leave
+the word ambiguous.
 
-The measured residual does not go through `render_to_file` at all: it is a buffer the analysis
-already holds, written with `audio::write_samples` exactly as `rmp -r` does. Routing it through the
-synthesiser would mean inventing a book to carry samples that are neither atoms nor a band-power
-model. `RenderMode::available` gates the other three against the book, because `[residual] enabled`
-is off by default and two of them need it — a greyed-out entry that says why beats a render that
-fails after the save dialog.
+- **Analyse** — `residual` keeps the pursuit's leftover buffer (it is produced either way; this
+  decides whether to hold on to it), and `residual analysis` measures that residue into ERB band
+  powers. The second overrides `[residual] enabled` in the settings document, the same precedence
+  the CLI's `--residual-analysis` flag has and for the same reason: the control you just touched
+  should win. Together they decide what Play can offer afterwards.
+- **Synthesize** — `atoms` and `residual (synthesised)`, the two halves `rmpsynth` exposes, written
+  to a file. The name carries which, so renders of different parts never overwrite each other.
+- **Play** — `origin`, `atoms`, `residual (measured)`, `residual (synthesised)`, summed and sounded
+  at their own levels. Not normalised: the levels *are* the result, and scaling the mix would hide
+  how much energy the atoms took. Two combinations are worth naming — atoms + measured residual
+  reconstructs the origin exactly by construction, and atoms + synthesised residual is the
+  resynthesis.
 
-**Play** sounds what Synthesize last wrote, through rodio, and turns into Stop while it does. Three
-things about it. The output device is opened on the *first* Play, so a machine with no sound card
-fails at a line in the log rather than at launch, over a feature analysis never needs. It is one
-device for the window rather than one per tab, and the tab offers Stop only when the file sounding
-is *its own* render — otherwise every tab with a render would offer to stop another tab's playback.
-And `Audio::playing` consults both `player.empty()` and its own `current`: the first catches a
-track that ended by itself, but rodio's `stop()` only sets a flag and `sound_count` is decremented
-later by the audio thread, so without the second a Stop button lingers after the sound was told to
-stop.
+**Play mixes from memory; it does not replay what Synthesize wrote.** Going through a file would
+mean naming and saving something before you could hear it, and the comparisons worth making are
+between *sources*. `playback::mix` builds the sum and `Audio::play_samples` sounds it from a
+`SamplesBuffer`.
+
+**What Play offers is a fact about the finished run, not about what is ticked now.**
+`Session::available` is recorded when a run completes, so turning on "residual analysis" afterwards
+cannot make a synthesised residual appear that no decomposition ever measured; any source already
+ticked that the run did not produce is cleared rather than left ticked and silently ignored.
 
 Save as proposes `<audio file, less its extension>-<tab number>.toml`, derived every time rather
 than only for a document with no file yet. The tab number in it is the point: duplicating a tab

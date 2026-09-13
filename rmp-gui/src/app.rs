@@ -12,10 +12,11 @@
 
 use crate::audio::Audio;
 use crate::help::Help;
+use crate::playback::{self, Available, Sources, Which};
 use crate::settings::SettingsDoc;
 use crate::task::{self, Outcome, Progress, Running, Update};
 use rmp_core::signal::{db_fs, rms_of};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// What a tab's results area is showing.
 ///
@@ -66,12 +67,18 @@ struct Session {
     /// A render in flight. Independent of `running`: a tab can be analysing the next excerpt while
     /// the previous book is still being written out.
     synthesising: Option<task::Synthesising>,
-    /// What a render should contain. Not an analysis setting — it changes nothing about the book —
-    /// so it lives here rather than in the settings document.
-    mode: task::RenderMode,
-    /// What Synthesize last wrote, and so what Play plays. Set only on a render that succeeded, so
-    /// a failed one leaves the previous file playable rather than pointing at nothing.
-    rendered: Option<PathBuf>,
+    /// The Analyse panel's own switches. Not analysis *settings* — they decide which by-products
+    /// to keep, not how the pursuit runs — so they are not in the settings document. What they do
+    /// decide is which sources Play can offer afterwards.
+    keep_residual: bool,
+    run_residual_analysis: bool,
+    /// The Synthesize panel: which halves of the book to write.
+    parts: task::RenderParts,
+    /// The Play panel: which sources to hear together.
+    sources: Sources,
+    /// What the *finished* run kept, as against what is ticked now. A switch changed after a run
+    /// must not make a source look available that the run did not produce.
+    available: Available,
     /// The last finished run, if any.
     outcome: Option<Box<Outcome>>,
     log: Vec<String>,
@@ -89,8 +96,11 @@ impl Session {
             ran_with: None,
             running: None,
             synthesising: None,
-            mode: task::RenderMode::default(),
-            rendered: None,
+            keep_residual: true,
+            run_residual_analysis: false,
+            parts: task::RenderParts::default(),
+            sources: Sources::default(),
+            available: Available::default(),
             outcome: None,
             log: Vec::new(),
             view: View::Summary,
@@ -112,8 +122,11 @@ impl Session {
             ran_with: None,
             running: None,
             synthesising: None,
-            mode: self.mode,
-            rendered: None,
+            keep_residual: self.keep_residual,
+            run_residual_analysis: self.run_residual_analysis,
+            parts: self.parts,
+            sources: self.sources,
+            available: Available::default(),
             outcome: None,
             log: Vec::new(),
             view: self.view,
@@ -146,10 +159,7 @@ impl Session {
         if let Some(synth) = &mut self.synthesising {
             for update in synth.drain() {
                 self.log.push(match update {
-                    task::SynthUpdate::Done { path, summary } => {
-                        self.rendered = Some(path);
-                        summary
-                    }
+                    task::SynthUpdate::Done(summary) => summary,
                     task::SynthUpdate::Failed(e) => format!("synthesis failed: {e}"),
                 });
             }
@@ -164,6 +174,16 @@ impl Session {
                 Update::Progress(p) => self.log.push(describe(&p)),
                 Update::Done(outcome) => {
                     let a = &outcome.analysis;
+                    // Recorded from the *finished* run, so a switch flipped afterwards cannot make
+                    // Play offer a source this decomposition never produced.
+                    self.available = Available::of(a, self.keep_residual);
+                    // And anything already ticked that the run did not make is dropped, rather than
+                    // left ticked and silently ignored.
+                    for w in Which::ALL {
+                        if !self.available.has(w) {
+                            w.set(&mut self.sources, false);
+                        }
+                    }
                     self.log.push(format!(
                         "{} atoms, {:.1} dB{}",
                         a.book.len(),
@@ -180,119 +200,140 @@ impl Session {
         }
     }
 
-    fn input_bar(&mut self, ui: &mut egui::Ui, out: &mut SettingsOut, playing: bool) {
-        ui.horizontal(|ui| {
-            // Reported, not chosen: a tab's file is what the tab is.
-            ui.label(self.input.display().to_string())
-                .on_hover_text("a tab's file cannot be changed; Open… puts another file in its own tab");
+    /// The three things a tab does, each with the switches that belong to it.
+    ///
+    /// Grouped rather than laid out as one row of buttons because the switches only make sense
+    /// beside their verb: "residual" means a different thing to each of the three, and a flat row
+    /// of six checkboxes would leave that ambiguous.
+    fn controls(&mut self, ui: &mut egui::Ui, out: &mut SettingsOut, playing: bool) {
+        ui.label(self.input.display().to_string())
+            .on_hover_text("a tab's file cannot be changed; Open… puts another file in its own tab");
 
-            ui.separator();
-            ui.label("start");
-            ui.add(egui::TextEdit::singleline(&mut self.start).desired_width(56.0));
-            ui.label("duration");
-            ui.add(egui::TextEdit::singleline(&mut self.duration).desired_width(56.0));
-            ui.label("s");
-
-            ui.separator();
-            match &self.running {
-                Some(run) => {
-                    let stopping = run.cancel_requested();
-                    if ui
-                        .add_enabled(!stopping, egui::Button::new("Stop"))
-                        .on_hover_text("takes effect within about one atom")
-                        .clicked()
-                    {
-                        run.cancel();
-                    }
-                    ui.spinner();
-                    ui.label(if stopping { "stopping…" } else { "analysing…" });
-                }
-                None => {
-                    if ui.button("Analyse").clicked() {
-                        self.start_run();
-                    }
-                }
-            }
-
-            // What a render should hold. Offered whether or not a book exists yet, so the choice
-            // can be made before pressing Analyse; which entries are *selectable* depends on the
-            // book, and before there is one they all are.
-            let book = self.outcome.as_ref().map(|o| &o.analysis.book);
-            egui::ComboBox::from_id_salt("render-mode")
-                .selected_text(self.mode.label())
-                .show_ui(ui, |ui| {
-                    for m in task::RenderMode::ALL {
-                        let can = book.is_none_or(|b| m.available(b));
-                        ui.add_enabled_ui(can, |ui| {
-                            ui.selectable_value(&mut self.mode, m, m.label())
-                                .on_disabled_hover_text(m.why_not());
-                        });
-                    }
-                });
-
-            match &self.synthesising {
-                Some(_) => {
-                    ui.spinner();
-                    ui.label("rendering…");
-                }
-                None => {
-                    // Checked against the chosen mode rather than "is there a book": a book with no
-                    // residual analysis cannot produce three of the four, and finding that out
-                    // after the save dialog would be worse than a greyed-out button.
-                    let ready = book.is_some_and(|b| self.mode.available(b));
-                    if ui
-                        .add_enabled(ready, egui::Button::new("Synthesize"))
-                        .on_disabled_hover_text(if book.is_none() {
-                            "analyse something first"
-                        } else {
-                            self.mode.why_not()
-                        })
-                        .on_hover_text("render this book back to a soundfile")
-                        .clicked()
-                    {
-                        self.start_synthesis();
-                    }
-                }
-            }
-
-            // Playing is the window's job, not the tab's: there is one output device. The tab only
-            // says which file and when.
-            match (&self.rendered, playing) {
-                (Some(_), true) => {
-                    if ui.button("Stop").clicked() {
-                        out.stop = true;
-                    }
-                }
-                (rendered, _) => {
-                    let path = rendered.clone();
-                    if ui
-                        .add_enabled(path.is_some(), egui::Button::new("Play"))
-                        .on_disabled_hover_text("synthesize something first")
-                        .on_hover_text(
-                            path.as_deref()
-                                .map_or_else(String::new, |p| p.display().to_string()),
-                        )
-                        .clicked()
-                    {
-                        out.play = path;
-                    }
-                }
-            }
+        ui.horizontal_top(|ui| {
+            self.analyse_panel(ui);
+            self.synthesise_panel(ui);
+            self.play_panel(ui, out, playing);
         });
     }
 
-    fn start_synthesis(&mut self) {
-        let Some(outcome) = &self.outcome else { return };
-        let Some(output) = pick_audio_save(&self.default_render_name()) else { return };
-        // Cloned rather than borrowed: the render outlives this frame on a thread of its own, and
-        // the tab stays live meanwhile — you can edit its settings, or start the next analysis.
-        self.synthesising = Some(task::spawn_synthesis(task::SynthJob {
-            book: outcome.analysis.book.clone(),
-            residual: outcome.analysis.residual.clone(),
-            sample_rate: outcome.signal.sample_rate,
-            mode: self.mode,
-            output,
-        }));
+    fn analyse_panel(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    match &self.running {
+                        Some(run) => {
+                            let stopping = run.cancel_requested();
+                            if ui
+                                .add_enabled(!stopping, egui::Button::new("Stop"))
+                                .on_hover_text("takes effect within about one atom")
+                                .clicked()
+                            {
+                                run.cancel();
+                            }
+                            ui.spinner();
+                            ui.label(if stopping { "stopping…" } else { "analysing…" });
+                        }
+                        None => {
+                            if ui
+                                .add_enabled(
+                                    self.settings.status().is_ok(),
+                                    egui::Button::new("Analyse"),
+                                )
+                                .on_disabled_hover_text("the settings document does not parse")
+                                .clicked()
+                            {
+                                self.start_run();
+                            }
+                        }
+                    }
+                    ui.label("start");
+                    ui.add(egui::TextEdit::singleline(&mut self.start).desired_width(48.0));
+                    ui.label("duration");
+                    ui.add(egui::TextEdit::singleline(&mut self.duration).desired_width(48.0));
+                    ui.label("s");
+                });
+                ui.checkbox(&mut self.keep_residual, "residual")
+                    .on_hover_text("keep what the atoms could not explain, to play or compare");
+                ui.checkbox(&mut self.run_residual_analysis, "residual analysis")
+                    .on_hover_text(
+                        "measure the residue into ERB band powers, which is what a synthesised \
+                         residual is rebuilt from",
+                    );
+            });
+        });
+    }
+
+    fn synthesise_panel(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.vertical(|ui| {
+                match &self.synthesising {
+                    Some(_) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("rendering…");
+                        });
+                    }
+                    None => {
+                        // Checked against what is actually ticked, not merely "is there a book":
+                        // finding out after the save dialog would be worse than a disabled button.
+                        let can = self
+                            .outcome
+                            .as_ref()
+                            .map_or(Err("analyse something first"), |o| {
+                                self.parts.available(&o.analysis.book)
+                            });
+                        if ui
+                            .add_enabled(can.is_ok(), egui::Button::new("Synthesize"))
+                            .on_disabled_hover_text(can.err().unwrap_or_default())
+                            .on_hover_text("write this book back out as a soundfile")
+                            .clicked()
+                        {
+                            self.start_synthesis();
+                        }
+                    }
+                }
+                ui.checkbox(&mut self.parts.atoms, "atoms");
+                ui.checkbox(&mut self.parts.residual, "residual (synthesised)")
+                    .on_hover_text("the stochastic model, not the measured residue");
+            });
+        });
+    }
+
+    fn play_panel(&mut self, ui: &mut egui::Ui, out: &mut SettingsOut, playing: bool) {
+        ui.group(|ui| {
+            ui.vertical(|ui| {
+                if playing {
+                    if ui.button("Stop").clicked() {
+                        out.stop = true;
+                    }
+                } else {
+                    let ready = self.outcome.is_some() && self.sources.any();
+                    if ui
+                        .add_enabled(ready, egui::Button::new("Play"))
+                        .on_disabled_hover_text(if self.outcome.is_none() {
+                            "analyse something first"
+                        } else {
+                            "nothing selected to play"
+                        })
+                        .on_hover_text("sound the ticked sources together, at their own levels")
+                        .clicked()
+                    {
+                        out.play = true;
+                    }
+                }
+                // Ticked against what the *finished run* produced, not what is ticked in Analyse
+                // now: changing a switch after a run must not offer a source that run never made.
+                for w in Which::ALL {
+                    let has = self.outcome.is_some() && self.available.has(w);
+                    let mut on = w.get(&self.sources) && has;
+                    ui.add_enabled_ui(has, |ui| {
+                        if ui.checkbox(&mut on, w.label()).on_disabled_hover_text(w.why_not()).changed() {
+                            w.set(&mut self.sources, on);
+                        }
+                    });
+                }
+            });
+        });
     }
 
     fn start_run(&mut self) {
@@ -308,6 +349,8 @@ impl Session {
             config,
             start: self.start.trim().parse().ok(),
             duration: self.duration.trim().parse().ok(),
+            keep_residual: self.keep_residual,
+            residual_analysis: self.run_residual_analysis,
         }));
     }
 
@@ -321,6 +364,18 @@ impl Session {
     ///
     /// The directory still comes from wherever the document was last saved — see
     /// `pick_settings_save` — so this changes what is proposed, not where.
+    fn start_synthesis(&mut self) {
+        let Some(outcome) = &self.outcome else { return };
+        let Some(output) = pick_audio_save(&self.default_render_name()) else { return };
+        // Cloned rather than borrowed: the render outlives this frame on a thread of its own, and
+        // the tab stays live meanwhile — you can edit its settings, or start the next analysis.
+        self.synthesising = Some(task::spawn_synthesis(task::SynthJob {
+            book: outcome.analysis.book.clone(),
+            parts: self.parts,
+            output,
+        }));
+    }
+
     fn default_settings_name(&self) -> String {
         let stem = self
             .input
@@ -340,7 +395,7 @@ impl Session {
             .input
             .file_stem()
             .map_or_else(|| "render".to_string(), |s| s.to_string_lossy().into_owned());
-        format!("{stem}-{:02}-{}.wav", self.number, self.mode.suffix())
+        format!("{stem}-{:02}-{}.wav", self.number, self.parts.suffix())
     }
 
     /// Whether the settings panel has moved on from what the displayed results came from.
@@ -523,9 +578,9 @@ impl Session {
 struct SettingsOut {
     error: Option<String>,
     open_help: bool,
-    /// A file to play, or `None`. The device lives on `RmpApp` — one output for the whole window,
-    /// since one pair of speakers is what the machine has.
-    play: Option<PathBuf>,
+    /// Sound the active tab's chosen sources. The device lives on `RmpApp` — one output for the
+    /// whole window, since one pair of speakers is what the machine has.
+    play: bool,
     stop: bool,
 }
 
@@ -552,8 +607,11 @@ pub struct RmpApp {
     help: Help,
     /// The output device, opened on the first Play and kept for the life of the window. One for the
     /// app rather than one per tab, because one pair of speakers is what the machine has — and
-    /// playing two tabs' renders at once would be a mix, not a comparison.
+    /// playing two tabs at once would be a mix, not a comparison.
     audio: Option<Audio>,
+    /// Which tab's sound is going, by its number. Only that tab offers Stop; the others keep
+    /// offering Play, since stopping from a tab that is not sounding would be a surprise.
+    playing_tab: Option<u32>,
     /// Index into `sessions`. Meaningless while that is empty, which is the one time nothing
     /// indexes it.
     active: usize,
@@ -601,13 +659,16 @@ impl eframe::App for RmpApp {
         // session borrow; it is carried out and pushed afterwards.
         let mut out = SettingsOut::default();
         // Read before the session borrow begins; the device is the window's, not the tab's. It is
-        // *this tab's* render that decides whether to offer Stop, not merely that something is
-        // sounding — otherwise every tab with a render would offer to stop another tab's playback.
-        let sounding = self.audio.as_ref().and_then(Audio::playing_path).map(Path::to_path_buf);
+        // *this tab* sounding that decides whether to offer Stop, not merely that something is —
+        // otherwise every tab would offer to stop another tab's playback.
+        let sounding = self.audio.as_ref().is_some_and(Audio::playing);
+        if !sounding {
+            self.playing_tab = None;
+        }
         let session = &mut self.sessions[self.active];
-        let playing = sounding.is_some() && sounding == session.rendered;
+        let playing = sounding && self.playing_tab == Some(session.number);
         egui::Panel::top("input").show(ui, |ui| {
-            ui.push_id(salt, |ui| session.input_bar(ui, &mut out, playing));
+            ui.push_id(salt, |ui| session.controls(ui, &mut out, playing));
         });
         egui::Panel::left("settings").default_size(440.0).show(ui, |ui| {
             ui.push_id(salt, |ui| session.settings(ui, &mut out));
@@ -627,7 +688,7 @@ impl eframe::App for RmpApp {
         if out.stop && let Some(a) = &mut self.audio {
             a.stop();
         }
-        if let Some(path) = out.play {
+        if out.play {
             // Opened on first use, so a machine with no sound card fails here rather than at
             // launch, over a feature it may never be asked for.
             if self.audio.is_none() {
@@ -637,9 +698,24 @@ impl eframe::App for RmpApp {
                 }
             }
             if let Some(a) = &mut self.audio
-                && let Err(e) = a.play(&path)
+                && let Some(o) = &session.outcome
             {
-                session.log.push(e);
+                // Mixed here rather than on a thread: rendering the atoms of a large book is the
+                // one slow part, and it is the same render the pursuit already did per atom. If it
+                // ever bites, this is the call to move, not the playback.
+                match playback::mix(&o.analysis, &o.signal, session.sources) {
+                    Ok(mix) => {
+                        session.log.push(format!(
+                            "playing {} — {:.2} s, peak {:.1} dBFS",
+                            describe_sources(session.sources),
+                            mix.len() as f32 / mix.sample_rate,
+                            rmp_core::signal::db_fs(mix.peak() as f64),
+                        ));
+                        a.play_samples(&mix);
+                        self.playing_tab = Some(session.number);
+                    }
+                    Err(e) => session.log.push(e),
+                }
             }
         }
         // Outside every panel: it is a window of its own, not part of this one's layout.
@@ -786,6 +862,12 @@ fn pick_settings_save(current: Option<&std::path::Path>, name: &str) -> Option<P
         d = d.set_directory(dir);
     }
     d.save_file()
+}
+
+/// The ticked sources, as a name for the log and for the transport.
+fn describe_sources(s: Sources) -> String {
+    let on: Vec<&str> = Which::ALL.iter().filter(|w| w.get(&s)).map(|w| w.label()).collect();
+    if on.is_empty() { "nothing".into() } else { on.join(" + ") }
 }
 
 /// One line of log for a progress message.
@@ -1053,9 +1135,7 @@ mod tests {
 
         s.synthesising = Some(task::spawn_synthesis(task::SynthJob {
             book: rmp_core::book::Book::new(1.0, 48_000.0),
-            residual: vec![0.0; 480],
-            sample_rate: 48_000.0,
-            mode: task::RenderMode::Atoms,
+            parts: task::RenderParts::default(),
             output: std::env::temp_dir().join("rmp-gui-busy-test.wav"),
         }));
         assert!(s.busy(), "a render in flight counts");
@@ -1073,65 +1153,76 @@ mod tests {
         std::fs::remove_file(std::env::temp_dir().join("rmp-gui-busy-test.wav")).ok();
     }
 
-    /// A duplicate has rendered nothing of its own, so it must not offer to play the original's
-    /// file — the two tabs exist to be compared, and one playing the other's audio defeats that.
-    /// It does carry the *mode*, which is a preference rather than a result.
+    /// A duplicate carries the *switches*, which are preferences, but nothing a run produced —
+    /// and crucially not `available`, which is a fact about a decomposition this copy has not made.
     #[test]
-    fn a_duplicate_has_nothing_to_play_but_keeps_the_mode() {
+    fn a_duplicate_keeps_the_switches_but_not_what_a_run_produced() {
         let mut app = with(&["a.wav"]);
-        app.sessions[0].rendered = Some(PathBuf::from("/tmp/a-01-atoms.wav"));
-        app.sessions[0].mode = task::RenderMode::Mixed;
+        let s = &mut app.sessions[0];
+        s.parts = task::RenderParts { atoms: false, residual: true };
+        s.sources = Sources { atoms: true, ..Sources::default() };
+        s.keep_residual = false;
+        s.available = Available { atoms: true, ..Available::default() };
 
-        let copy = app.sessions[0].duplicate(2);
-        assert!(copy.rendered.is_none());
-        assert_eq!(copy.mode, task::RenderMode::Mixed);
+        let copy = s.duplicate(2);
+        assert_eq!(copy.parts, task::RenderParts { atoms: false, residual: true });
+        assert_eq!(copy.sources, Sources { atoms: true, ..Sources::default() });
+        assert!(!copy.keep_residual);
+        assert_eq!(copy.available, Available::default(), "a copy has run nothing");
+        assert!(copy.outcome.is_none());
     }
 
-    /// The four renders must not overwrite each other: hearing them together is the point of
-    /// having them.
+    /// The combinations of atoms and residual must not overwrite each other's files: hearing them
+    /// together is the point of being able to choose.
     #[test]
-    fn each_render_mode_proposes_its_own_file_name() {
+    fn each_combination_of_parts_proposes_its_own_file_name() {
         let mut app = with(&["/a/piano.wav"]);
-        let mut names: Vec<String> = Vec::new();
-        for m in task::RenderMode::ALL {
-            app.sessions[0].mode = m;
+        let mut names = Vec::new();
+        for (atoms, residual) in [(true, false), (false, true), (true, true)] {
+            app.sessions[0].parts = task::RenderParts { atoms, residual };
             names.push(app.sessions[0].default_render_name());
         }
         assert_eq!(
             names,
-            [
-                "piano-01-atoms.wav",
-                "piano-01-residual.wav",
-                "piano-01-residual-synth.wav",
-                "piano-01-mixed.wav",
-            ]
+            ["piano-01-atoms.wav", "piano-01-residual-synth.wav", "piano-01-mixed.wav"]
         );
-
-        let mut unique = names.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(unique.len(), names.len(), "two modes share a file name");
     }
 
-    /// What each mode needs of a book. The two that want a residual analysis are the ones a default
-    /// config cannot produce, since `[residual] enabled` is off by default — so they have to be
-    /// unavailable rather than fail after the save dialog.
+    /// What Synthesize needs of a book. The residual half is the one a default run cannot produce,
+    /// since the Analyse panel starts with residual analysis off.
     #[test]
-    fn a_mode_is_available_only_when_the_book_can_produce_it() {
-        use task::RenderMode as M;
-
+    fn synthesis_is_offered_only_when_the_book_can_produce_what_is_ticked() {
+        use task::RenderParts as P;
         let empty = rmp_core::book::Book::new(1.0, 48_000.0);
-        assert!(!M::Atoms.available(&empty), "no atoms to render");
-        assert!(M::ResidualMeasured.available(&empty), "the residue exists regardless");
-        assert!(!M::ResidualSynthesised.available(&empty), "no residual book");
-        assert!(!M::Mixed.available(&empty));
 
-        // Every mode that is unavailable has something to say about why.
-        for m in M::ALL {
-            if !m.available(&empty) {
-                assert!(!m.why_not().is_empty(), "{m:?} is unavailable and says nothing");
-            }
+        for p in [
+            P { atoms: false, residual: false },
+            P { atoms: true, residual: false },
+            P { atoms: false, residual: true },
+        ] {
+            let refusal = p.available(&empty).expect_err("an empty book can produce nothing");
+            assert!(!refusal.is_empty(), "{p:?} refuses silently");
         }
+    }
+
+    /// Play offers only what the *finished* run produced. Ticking "residual analysis" after the
+    /// fact must not make a synthesised residual appear that no run ever measured.
+    #[test]
+    fn play_offers_what_the_run_made_not_what_is_ticked_now() {
+        let mut app = with(&["a.wav"]);
+        let s = &mut app.sessions[0];
+
+        // As `pump` records it: a run that kept nothing.
+        s.available = Available { origin: true, ..Available::default() };
+        assert!(s.available.has(Which::Origin));
+        assert!(!s.available.has(Which::ResidualMeasured));
+        assert!(!s.available.has(Which::ResidualSynthesised));
+
+        // Flipping the Analyse switches now changes nothing about that run.
+        s.keep_residual = true;
+        s.run_residual_analysis = true;
+        assert!(!s.available.has(Which::ResidualMeasured), "the run did not keep it");
+        assert!(!s.available.has(Which::ResidualSynthesised), "the run did not measure it");
     }
 
     /// The tab you were looking at is the tab you are still looking at.
