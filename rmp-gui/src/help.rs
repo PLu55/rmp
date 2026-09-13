@@ -50,18 +50,45 @@ impl Default for Help {
 }
 
 impl Help {
-    pub fn show(&mut self, ctx: &egui::Context) {
+    /// Open the manual in a window of its own.
+    ///
+    /// A real OS window rather than an `egui::Window`, because the point of it is to be read
+    /// *beside* the settings it explains — and an in-app window is trapped inside the main one,
+    /// covering the very panel you opened it to understand. As its own window it can be moved
+    /// aside, put on a second screen, and alt-tabbed to.
+    ///
+    /// Immediate rather than deferred: a deferred viewport's callback must be `Send + Sync +
+    /// 'static`, so it cannot borrow the filter, the selection or the markdown cache that live
+    /// here. An immediate one is `FnMut` and runs inside this frame, which is what lets the window
+    /// simply read the state it is about.
+    ///
+    /// Where the backend cannot open a second window, egui says so through
+    /// [`egui::ViewportClass::EmbeddedWindow`] and falls back to an in-app one on its own. Nothing
+    /// here has to handle that case differently; it is just less good.
+    pub fn show(&mut self, ui: &mut egui::Ui) {
         if !self.open {
             return;
         }
-        let mut open = self.open;
-        egui::Window::new("rmp settings — the manual")
-            .open(&mut open)
-            .default_size([980.0, 720.0])
-            .min_width(560.0)
-            .vscroll(false)
-            .show(ctx, |ui| self.contents(ui));
-        self.open = open;
+        let ctx = ui.ctx().clone();
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("rmp-help"),
+            egui::ViewportBuilder::default()
+                .with_title("rmp settings — the manual")
+                .with_inner_size([980.0, 720.0])
+                .with_min_inner_size([560.0, 360.0]),
+            |ui, _class| {
+                egui::CentralPanel::default().show(ui, |ui| self.contents(ui));
+                // The OS close button. Without this the window shuts and the `?` cannot reopen it,
+                // because `open` would still say it is up.
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+            },
+        );
+        if close {
+            self.open = false;
+        }
     }
 
     fn contents(&mut self, ui: &mut egui::Ui) {

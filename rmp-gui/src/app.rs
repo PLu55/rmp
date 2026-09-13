@@ -467,8 +467,8 @@ impl eframe::App for RmpApp {
         if out.open_help {
             self.help.open = true;
         }
-        // Outside every panel, so it floats over the window rather than inside one of them.
-        self.help.show(ui.ctx());
+        // Outside every panel: it is a window of its own, not part of this one's layout.
+        self.help.show(ui);
     }
 }
 

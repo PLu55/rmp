@@ -160,9 +160,9 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   is that a tab's results, log and title all describe one file, and swapping it underneath would
   leave a book describing a file the tab no longer names. With no tabs the window shows an Open
   button and nothing else. A tab's settings are a **document**, loaded, edited and saved as a TOML
-  file — `settings::SettingsDoc` — with a `?` beside them opening `MANUAL.md` itself in a window
-  (`help`). `task` runs a decomposition off the UI thread; the result panels inside a tab are stubs
-  naming the `rmp-core` call each is a view of.
+  file — `settings::SettingsDoc` — with a `?` beside them opening `MANUAL.md` itself in a window of
+  its own (`help`). `task` runs a decomposition off the UI thread; the result panels inside a tab
+  are stubs naming the `rmp-core` call each is a view of.
 
 ### Invariants that are not locally obvious
 
@@ -294,6 +294,14 @@ settings and is derived rather than written out. A setting documented in the man
 window with no code change, which is the only arrangement that cannot drift. Two things the parse
 has to get right: `#` inside a fenced block is a shell comment and not a heading (the manual has
 such a fence), and a `##` runs past its own `###` children so selecting a section shows it whole.
+
+The help is a real OS window, not an `egui::Window`, because the point of it is to be read *beside*
+the settings it explains — an in-app window is trapped inside the main one, covering the panel you
+opened it to understand. `show_viewport_immediate`, not `_deferred`: a deferred viewport's callback
+must be `Send + Sync + 'static` and so cannot borrow the filter, the selection or the markdown
+cache. The price is that parent and child repaint together, which is the right trade for a window
+that is usually idle. A backend that cannot open a second window falls back to an embedded one on
+its own, and nothing in `help` treats that case differently.
 
 `rmp-gui` installs a system font as a *fallback* behind egui's built-ins, from the same candidate
 list `rmpstat` uses. eframe's own fonts have no `→ ≈ √ ∝ Σ σ π`, which is most of how `MANUAL.md`
