@@ -232,6 +232,83 @@ impl Reporter for Forward<'_> {
     }
 }
 
+/// What a render should contain.
+///
+/// A decomposition has three separable parts and this is which of them to hear. They are *not*
+/// analysis settings — nothing here changes a book — which is why they live in the window rather
+/// than in the settings document.
+///
+/// The distinction that matters is between the two residuals. **Measured** is the pursuit's own
+/// leftover buffer: literally what the atoms failed to explain, sample for sample. **Synthesised**
+/// is the stochastic model of it rebuilt from the residual book's ERB band powers. They sound
+/// different on purpose — CLAUDE.md records the model's reconstruction peaking ~10 dB below the
+/// residue at matched rms, because the impulsive part of a residue is exactly what a noise model
+/// does not carry — and hearing them side by side is how you judge whether that matters for a
+/// given piece of material.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum RenderMode {
+    /// The book's atoms alone. Always available once anything was selected.
+    #[default]
+    Atoms,
+    /// The analysis residue itself, as `rmp -r` writes it.
+    ResidualMeasured,
+    /// The residue's stochastic reconstruction. Needs a residual book, so it needs
+    /// `[residual] enabled` at analysis time.
+    ResidualSynthesised,
+    /// Atoms and the synthesised residual on one timeline — what `rmpsynth` produces by default.
+    Mixed,
+}
+
+impl RenderMode {
+    pub const ALL: [RenderMode; 4] = [
+        RenderMode::Atoms,
+        RenderMode::ResidualMeasured,
+        RenderMode::ResidualSynthesised,
+        RenderMode::Mixed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RenderMode::Atoms => "Atoms",
+            RenderMode::ResidualMeasured => "Residual (measured)",
+            RenderMode::ResidualSynthesised => "Residual (synthesised)",
+            RenderMode::Mixed => "Atoms + residual",
+        }
+    }
+
+    /// The word that goes in the output file name, so the four do not overwrite each other.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            RenderMode::Atoms => "atoms",
+            RenderMode::ResidualMeasured => "residual",
+            RenderMode::ResidualSynthesised => "residual-synth",
+            RenderMode::Mixed => "mixed",
+        }
+    }
+
+    /// Whether this book can produce this. Checked rather than attempted, so an unavailable mode is
+    /// a greyed-out entry that says why instead of a render that fails after the save dialog.
+    pub fn available(self, book: &rmp_core::book::Book) -> bool {
+        match self {
+            RenderMode::Atoms => !book.is_empty(),
+            RenderMode::ResidualMeasured => true,
+            RenderMode::ResidualSynthesised => book.residual.is_some(),
+            RenderMode::Mixed => !book.is_empty() && book.residual.is_some(),
+        }
+    }
+
+    /// Why it is unavailable, for the tooltip.
+    pub fn why_not(self) -> &'static str {
+        match self {
+            RenderMode::Atoms => "no atoms were selected",
+            RenderMode::ResidualMeasured => "",
+            RenderMode::ResidualSynthesised | RenderMode::Mixed => {
+                "this book has no residual analysis — set [residual] enabled and analyse again"
+            }
+        }
+    }
+}
+
 /// Rendering a finished book back to a soundfile.
 ///
 /// A far smaller thing than [`spawn`]: synthesis has no stages worth reporting and no meaningful
@@ -241,11 +318,18 @@ impl Reporter for Forward<'_> {
 /// window that has crashed.
 pub struct SynthJob {
     pub book: rmp_core::book::Book,
+    /// The pursuit's own residue, for [`RenderMode::ResidualMeasured`]. Carried even when the mode
+    /// does not need it, because a job is built once and the cost is one excerpt of f32.
+    pub residual: Vec<f32>,
+    pub sample_rate: f32,
+    pub mode: RenderMode,
     pub output: PathBuf,
 }
 
 pub enum SynthUpdate {
-    Done(Box<rmp_synthesis::RenderReport>),
+    /// The path is carried back rather than remembered by the caller: a render that failed then
+    /// cannot leave anything pointing at a file that was never written.
+    Done { path: PathBuf, summary: String },
     Failed(String),
 }
 
@@ -275,28 +359,69 @@ pub fn spawn_synthesis(job: SynthJob) -> Synthesising {
     std::thread::Builder::new()
         .name("rmp-synthesis".into())
         .spawn(move || {
-            // The residual is rendered when the book carries one. Asking for it unconditionally is
-            // safe — `RenderRequest::residual_source` finds nothing and renders nothing — but then
-            // a book analysed without `[residual] enabled` would silently produce atoms only, with
-            // the report giving no hint that anything was skipped. Saying so is the point.
-            let has_residual = job.book.residual.is_some();
-            let request = rmp_synthesis::RenderRequest {
-                book: rmp_synthesis::BookInput::Full(job.book),
-                residual_book: None,
-                atoms: true,
-                residual: has_residual,
-                output: job.output,
-                config: rmp_synthesis::RenderConfig::default(),
-            };
-            let msg = match rmp_synthesis::render_to_file(&request) {
-                Ok(r) => SynthUpdate::Done(Box::new(r)),
-                Err(e) => SynthUpdate::Failed(e.to_string()),
+            let path = job.output.clone();
+            let msg = match render(job) {
+                Ok(summary) => SynthUpdate::Done { path, summary },
+                Err(e) => SynthUpdate::Failed(e),
             };
             tx.send(msg).ok();
         })
         .expect("spawning the synthesis thread");
 
     Synthesising { updates, finished: false }
+}
+
+/// The render itself, and the one line it gets to say about what it did.
+fn render(job: SynthJob) -> Result<String, String> {
+    // The measured residue is not a synthesis at all: it is a buffer the analysis already has, and
+    // writing it is what `rmp -r` does. Routing it through `render_to_file` would mean inventing a
+    // book to carry samples that are not atoms and not a band-power model.
+    if job.mode == RenderMode::ResidualMeasured {
+        rmp_core::audio::write_samples(&job.output, &job.residual, job.sample_rate)
+            .map_err(|e| e.to_string())?;
+        let rms = rmp_core::signal::db_fs(rmp_core::signal::rms_of(&job.residual));
+        let peak = rmp_core::signal::db_fs(rmp_core::signal::peak_of(&job.residual) as f64);
+        return Ok(format!(
+            "wrote the measured residual: {:.2} s, {rms:.1} dBFS rms, {peak:.1} dBFS peak",
+            job.residual.len() as f32 / job.sample_rate,
+        ));
+    }
+
+    let atoms = matches!(job.mode, RenderMode::Atoms | RenderMode::Mixed);
+    let residual = matches!(job.mode, RenderMode::ResidualSynthesised | RenderMode::Mixed);
+    let request = rmp_synthesis::RenderRequest {
+        book: rmp_synthesis::BookInput::Full(job.book),
+        residual_book: None,
+        atoms,
+        residual,
+        output: job.output,
+        config: rmp_synthesis::RenderConfig::default(),
+    };
+    let r = rmp_synthesis::render_to_file(&request).map_err(|e| e.to_string())?;
+    Ok(describe_render(&r, job.mode))
+}
+
+/// What a finished render did. The peaks are the part worth reading: the residual's is where a
+/// stochastic model is weakest, and `clipped` is the only thing here that is a fault.
+fn describe_render(r: &rmp_synthesis::RenderReport, mode: RenderMode) -> String {
+    let kinds: Vec<String> = r.atoms.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    let what = if kinds.is_empty() { mode.label().to_string() } else { kinds.join(", ") };
+    let mut line = format!(
+        "wrote {} — {:.2} s, peak {:.1} dBFS",
+        what,
+        r.samples_written as f64 / r.sample_rate,
+        rmp_core::signal::db_fs(r.mixed_peak as f64),
+    );
+    if r.residual_samples.is_some() {
+        line.push_str(&format!(
+            "; residual peak {:.1} dBFS",
+            rmp_core::signal::db_fs(r.residual_peak as f64)
+        ));
+    }
+    if r.clipped_samples > 0 {
+        line.push_str(&format!(" — {} samples clipped", r.clipped_samples));
+    }
+    line
 }
 
 #[cfg(test)]

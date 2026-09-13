@@ -66,9 +66,9 @@ struct Session {
     /// A render in flight. Independent of `running`: a tab can be analysing the next excerpt while
     /// the previous book is still being written out.
     synthesising: Option<task::Synthesising>,
-    /// Where the render in flight is headed. Promoted to `rendered` only when it reports success,
-    /// so a failed render does not leave Play pointing at a file that was never written.
-    rendering_to: Option<PathBuf>,
+    /// What a render should contain. Not an analysis setting — it changes nothing about the book —
+    /// so it lives here rather than in the settings document.
+    mode: task::RenderMode,
     /// What Synthesize last wrote, and so what Play plays. Set only on a render that succeeded, so
     /// a failed one leaves the previous file playable rather than pointing at nothing.
     rendered: Option<PathBuf>,
@@ -89,7 +89,7 @@ impl Session {
             ran_with: None,
             running: None,
             synthesising: None,
-            rendering_to: None,
+            mode: task::RenderMode::default(),
             rendered: None,
             outcome: None,
             log: Vec::new(),
@@ -112,7 +112,7 @@ impl Session {
             ran_with: None,
             running: None,
             synthesising: None,
-            rendering_to: None,
+            mode: self.mode,
             rendered: None,
             outcome: None,
             log: Vec::new(),
@@ -146,16 +146,15 @@ impl Session {
         if let Some(synth) = &mut self.synthesising {
             for update in synth.drain() {
                 self.log.push(match update {
-                    task::SynthUpdate::Done(r) => {
-                        self.rendered = self.rendering_to.clone();
-                        describe_render(&r)
+                    task::SynthUpdate::Done { path, summary } => {
+                        self.rendered = Some(path);
+                        summary
                     }
                     task::SynthUpdate::Failed(e) => format!("synthesis failed: {e}"),
                 });
             }
             if synth.finished() {
                 self.synthesising = None;
-                self.rendering_to = None;
             }
         }
 
@@ -215,20 +214,39 @@ impl Session {
                 }
             }
 
+            // What a render should hold. Offered whether or not a book exists yet, so the choice
+            // can be made before pressing Analyse; which entries are *selectable* depends on the
+            // book, and before there is one they all are.
+            let book = self.outcome.as_ref().map(|o| &o.analysis.book);
+            egui::ComboBox::from_id_salt("render-mode")
+                .selected_text(self.mode.label())
+                .show_ui(ui, |ui| {
+                    for m in task::RenderMode::ALL {
+                        let can = book.is_none_or(|b| m.available(b));
+                        ui.add_enabled_ui(can, |ui| {
+                            ui.selectable_value(&mut self.mode, m, m.label())
+                                .on_disabled_hover_text(m.why_not());
+                        });
+                    }
+                });
+
             match &self.synthesising {
                 Some(_) => {
                     ui.spinner();
                     ui.label("rendering…");
                 }
                 None => {
-                    // Nothing to render until a run has produced something: an empty book with no
-                    // residual would write a file of silence.
-                    let book = self.outcome.as_ref().map(|o| &o.analysis.book);
-                    let ready =
-                        book.is_some_and(|b| !b.is_empty() || b.residual.is_some());
+                    // Checked against the chosen mode rather than "is there a book": a book with no
+                    // residual analysis cannot produce three of the four, and finding that out
+                    // after the save dialog would be worse than a greyed-out button.
+                    let ready = book.is_some_and(|b| self.mode.available(b));
                     if ui
                         .add_enabled(ready, egui::Button::new("Synthesize"))
-                        .on_disabled_hover_text("analyse something first")
+                        .on_disabled_hover_text(if book.is_none() {
+                            "analyse something first"
+                        } else {
+                            self.mode.why_not()
+                        })
                         .on_hover_text("render this book back to a soundfile")
                         .clicked()
                     {
@@ -266,11 +284,13 @@ impl Session {
     fn start_synthesis(&mut self) {
         let Some(outcome) = &self.outcome else { return };
         let Some(output) = pick_audio_save(&self.default_render_name()) else { return };
-        self.rendering_to = Some(output.clone());
         // Cloned rather than borrowed: the render outlives this frame on a thread of its own, and
         // the tab stays live meanwhile — you can edit its settings, or start the next analysis.
         self.synthesising = Some(task::spawn_synthesis(task::SynthJob {
             book: outcome.analysis.book.clone(),
+            residual: outcome.analysis.residual.clone(),
+            sample_rate: outcome.signal.sample_rate,
+            mode: self.mode,
             output,
         }));
     }
@@ -309,16 +329,18 @@ impl Session {
         format!("{stem}-{:02}.toml", self.number)
     }
 
-    /// The file name Synthesize proposes: `<audio file, less its extension>-<tab number>.wav`.
+    /// The file name Synthesize proposes:
+    /// `<audio file, less its extension>-<tab number>-<what it holds>.wav`.
     ///
-    /// The same scheme as the settings document, and for the same reason — two tabs on one
-    /// soundfile must not propose one output file.
+    /// The tab number is there for the same reason the settings document has one: two tabs on one
+    /// soundfile must not propose one output file. The mode is there so the four kinds of render do
+    /// not overwrite each other either — the whole point of having them is to hear them together.
     fn default_render_name(&self) -> String {
         let stem = self
             .input
             .file_stem()
             .map_or_else(|| "render".to_string(), |s| s.to_string_lossy().into_owned());
-        format!("{stem}-{:02}.wav", self.number)
+        format!("{stem}-{:02}-{}.wav", self.number, self.mode.suffix())
     }
 
     /// Whether the settings panel has moved on from what the displayed results came from.
@@ -766,28 +788,6 @@ fn pick_settings_save(current: Option<&std::path::Path>, name: &str) -> Option<P
     d.save_file()
 }
 
-/// What a finished render did. The peaks are the part worth reading: the residual's is where a
-/// stochastic model is weakest, and `clipped` is the only thing here that is a fault.
-fn describe_render(r: &rmp_synthesis::RenderReport) -> String {
-    let kinds: Vec<String> = r.atoms.iter().map(|(k, n)| format!("{n} {k}")).collect();
-    let mut line = format!(
-        "rendered {:.2} s ({}), peak {:.1} dBFS",
-        r.samples_written as f64 / r.sample_rate,
-        if kinds.is_empty() { "residual only".to_string() } else { kinds.join(", ") },
-        rmp_core::signal::db_fs(r.mixed_peak as f64),
-    );
-    if r.residual_samples.is_some() {
-        line.push_str(&format!(
-            "; residual peak {:.1} dBFS",
-            rmp_core::signal::db_fs(r.residual_peak as f64)
-        ));
-    }
-    if r.clipped_samples > 0 {
-        line.push_str(&format!(" — {} samples clipped", r.clipped_samples));
-    }
-    line
-}
-
 /// One line of log for a progress message.
 fn describe(p: &Progress) -> String {
     match p {
@@ -1032,16 +1032,15 @@ mod tests {
         assert_eq!(app.sessions[0].default_settings_name(), "settings-01.toml");
     }
 
+    /// Renders and settings share the `<file>-<tab number>` stem, so everything a tab produces
+    /// sorts together in a directory. A render adds what it holds; see
+    /// `each_render_mode_proposes_its_own_file_name`.
     #[test]
-    fn synthesize_proposes_a_name_on_the_same_scheme_as_the_settings() {
+    fn a_render_and_a_settings_file_share_the_tabs_stem() {
         let app = with(&["/a/b/chopin-nocturne-2.wav", "/a/zyklus.wav"]);
-        assert_eq!(app.sessions[0].default_render_name(), "chopin-nocturne-2-01.wav");
-        assert_eq!(app.sessions[1].default_render_name(), "zyklus-02.wav");
-        // Same stem, same number, different extension — two tabs never collide on either.
-        assert_eq!(
-            app.sessions[0].default_settings_name().trim_end_matches("toml"),
-            app.sessions[0].default_render_name().trim_end_matches("wav")
-        );
+        assert_eq!(app.sessions[0].default_settings_name(), "chopin-nocturne-2-01.toml");
+        assert!(app.sessions[0].default_render_name().starts_with("chopin-nocturne-2-01-"));
+        assert!(app.sessions[1].default_render_name().starts_with("zyklus-02-"));
     }
 
     /// A tab is "busy" for the repaint and the strip spinner whether it is analysing or rendering.
@@ -1054,6 +1053,9 @@ mod tests {
 
         s.synthesising = Some(task::spawn_synthesis(task::SynthJob {
             book: rmp_core::book::Book::new(1.0, 48_000.0),
+            residual: vec![0.0; 480],
+            sample_rate: 48_000.0,
+            mode: task::RenderMode::Atoms,
             output: std::env::temp_dir().join("rmp-gui-busy-test.wav"),
         }));
         assert!(s.busy(), "a render in flight counts");
@@ -1071,39 +1073,65 @@ mod tests {
         std::fs::remove_file(std::env::temp_dir().join("rmp-gui-busy-test.wav")).ok();
     }
 
-    /// Play is offered only once a render has landed, and a *failed* render must not offer it:
-    /// `rendering_to` is where the output was headed, `rendered` where one actually arrived.
-    #[test]
-    fn play_waits_for_a_render_that_actually_succeeded() {
-        let mut app = with(&["a.wav"]);
-        let s = &mut app.sessions[0];
-        assert!(s.rendered.is_none(), "nothing has been rendered");
-
-        // As `start_synthesis` does.
-        s.rendering_to = Some(PathBuf::from("/tmp/a-01.wav"));
-        assert!(s.rendered.is_none(), "a render in flight is not a render");
-
-        // As `pump` does on failure: the destination is dropped, nothing is promoted.
-        s.rendering_to = None;
-        assert!(s.rendered.is_none(), "a failed render leaves nothing to play");
-
-        // And on success.
-        s.rendering_to = Some(PathBuf::from("/tmp/a-01.wav"));
-        s.rendered = s.rendering_to.clone();
-        s.rendering_to = None;
-        assert_eq!(s.rendered, Some(PathBuf::from("/tmp/a-01.wav")));
-    }
-
     /// A duplicate has rendered nothing of its own, so it must not offer to play the original's
     /// file — the two tabs exist to be compared, and one playing the other's audio defeats that.
+    /// It does carry the *mode*, which is a preference rather than a result.
     #[test]
-    fn a_duplicate_has_nothing_to_play() {
+    fn a_duplicate_has_nothing_to_play_but_keeps_the_mode() {
         let mut app = with(&["a.wav"]);
-        app.sessions[0].rendered = Some(PathBuf::from("/tmp/a-01.wav"));
+        app.sessions[0].rendered = Some(PathBuf::from("/tmp/a-01-atoms.wav"));
+        app.sessions[0].mode = task::RenderMode::Mixed;
 
         let copy = app.sessions[0].duplicate(2);
         assert!(copy.rendered.is_none());
-        assert!(copy.rendering_to.is_none());
+        assert_eq!(copy.mode, task::RenderMode::Mixed);
+    }
+
+    /// The four renders must not overwrite each other: hearing them together is the point of
+    /// having them.
+    #[test]
+    fn each_render_mode_proposes_its_own_file_name() {
+        let mut app = with(&["/a/piano.wav"]);
+        let mut names: Vec<String> = Vec::new();
+        for m in task::RenderMode::ALL {
+            app.sessions[0].mode = m;
+            names.push(app.sessions[0].default_render_name());
+        }
+        assert_eq!(
+            names,
+            [
+                "piano-01-atoms.wav",
+                "piano-01-residual.wav",
+                "piano-01-residual-synth.wav",
+                "piano-01-mixed.wav",
+            ]
+        );
+
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "two modes share a file name");
+    }
+
+    /// What each mode needs of a book. The two that want a residual analysis are the ones a default
+    /// config cannot produce, since `[residual] enabled` is off by default — so they have to be
+    /// unavailable rather than fail after the save dialog.
+    #[test]
+    fn a_mode_is_available_only_when_the_book_can_produce_it() {
+        use task::RenderMode as M;
+
+        let empty = rmp_core::book::Book::new(1.0, 48_000.0);
+        assert!(!M::Atoms.available(&empty), "no atoms to render");
+        assert!(M::ResidualMeasured.available(&empty), "the residue exists regardless");
+        assert!(!M::ResidualSynthesised.available(&empty), "no residual book");
+        assert!(!M::Mixed.available(&empty));
+
+        // Every mode that is unavailable has something to say about why.
+        for m in M::ALL {
+            if !m.available(&empty) {
+                assert!(!m.why_not().is_empty(), "{m:?} is unavailable and says nothing");
+            }
+        }
     }
 
     /// The tab you were looking at is the tab you are still looking at.
