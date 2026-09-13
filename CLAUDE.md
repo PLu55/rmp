@@ -150,8 +150,10 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   `rmp-synthesis`; no DSP lives in it.
 - **`rmp-cli/src/bin/rmpstat`** — the statistics CLI: clap, `plotters`, and text tables. A thin
   shell, so everything worth an oracle lives in `stats`/`tfmap` where `cargo test` reaches it.
-- **`rmp-gui`** — the eframe front end. `task` runs a decomposition off the UI thread; everything
-  else is a stub naming the `rmp-core` call it is a view of.
+- **`rmp-gui`** — the eframe front end. The window is a strip of tabs, each an independent
+  analysis: its own input file, settings, run, log and results, titled `NN filename.wav` with `NN`
+  the lowest two-digit number no open tab is using. `task` runs a decomposition off the UI thread;
+  the panels inside a tab are stubs naming the `rmp-core` call each is a view of.
 
 ### Invariants that are not locally obvious
 
@@ -271,6 +273,12 @@ decided by asking *again* after the run returns — because the book of an inter
 perfectly ordinary book and nothing in it says it stopped early. A flag that could go back to false
 would report a completed run. `Mp::run` delegates to `run_with` with a constant false, so every
 existing call site, bench and bit-identity gate is untouched.
+
+`task::Running` cancels in its `Drop`, which is what closing a GUI tab relies on. A closed channel
+is not enough on its own: the worker only discovers that on its next send, and a single-window run
+sends nothing between starting and finishing, so it would hold a core to the end of a decomposition
+nobody is going to look at. `a_cancelled_run_selects_nothing_and_reports_that_it_was_cancelled` is
+the gate, paired with an uncancelled run over the same fixture so it cannot pass for being barren.
 
 **A synthesised book is longer than the excerpt it came from.**
 `rmp_synthesis::atoms::natural_len` sizes the output by rendering each atom's envelope and taking

@@ -111,8 +111,7 @@ impl Running {
 /// Start `job` on a worker thread.
 ///
 /// The thread is detached: dropping [`Running`] abandons it rather than joining, which would block
-/// the UI for as long as the pursuit takes. The channel send then fails and the worker returns on
-/// its own, so nothing is leaked beyond the current run.
+/// the UI for as long as the pursuit takes. Dropping also *cancels* — see the `Drop` impl.
 pub fn spawn(job: Job) -> Running {
     let (tx, updates) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -130,6 +129,18 @@ pub fn spawn(job: Job) -> Running {
         .expect("spawning the analysis thread");
 
     Running { updates, cancel, finished: false }
+}
+
+/// Dropping a run cancels it.
+///
+/// Closing a tab drops its `Running`, and without this the worker would keep a core busy to the end
+/// of a decomposition nobody is going to look at. A closed channel is *not* enough on its own: the
+/// worker only discovers that on its next send, and a single-window run sends nothing between
+/// starting and finishing.
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// The worker body: the same sequence `rmp`'s `analyse` performs, reported to a channel instead of
@@ -217,5 +228,45 @@ impl Reporter for Forward<'_> {
 
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A smoke test over the whole worker plumbing: spawn, run, report, terminate.
+    ///
+    /// A path that does not exist is the cheapest job that still goes all the way through
+    /// `spawn` -> thread -> `work` -> channel, and it needs no audio fixture, which matters because
+    /// `data/` is not checked in. What it pins is that exactly one terminal message arrives and
+    /// that `finished` latches on it — the two things the UI's `pump` relies on to stop polling.
+    #[test]
+    fn a_job_that_cannot_start_reports_one_failure_and_finishes() {
+        let mut run = spawn(Job {
+            input: PathBuf::from("/nonexistent/definitely-not-here.wav"),
+            config: Default::default(),
+            start: None,
+            duration: None,
+            residual_analysis: false,
+        });
+
+        // The worker is a real thread; give it a moment rather than spinning forever.
+        let mut updates = Vec::new();
+        for _ in 0..200 {
+            updates.extend(run.drain());
+            if run.finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(run.finished(), "the worker never reported a terminal message");
+        let terminal: Vec<_> = updates
+            .iter()
+            .filter(|u| matches!(u, Update::Done(_) | Update::Failed(_)))
+            .collect();
+        assert_eq!(terminal.len(), 1, "exactly one terminal message");
+        assert!(matches!(terminal[0], Update::Failed(_)), "a missing file must fail, not succeed");
     }
 }

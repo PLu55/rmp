@@ -277,6 +277,86 @@ pub fn unrefinable_blocks<'a>(dict: &'a Dictionary, cfg: &MpConfig) -> Vec<&'a c
 mod tests {
     use super::*;
 
+    /// A signal with something in it, and a dictionary small enough to analyse it in milliseconds.
+    fn noisy(n: usize, sr: f32) -> Signal {
+        let mut x = crate::residual::pseudo_noise(n);
+        for (i, v) in x.iter_mut().enumerate() {
+            *v += 0.5 * (i as f32 * 0.05).sin();
+        }
+        Signal::new(x, sr)
+    }
+
+    fn small_config() -> Config {
+        let mut c = Config::default();
+        c.dictionary.fof.alphas = vec![256.0];
+        c.dictionary.fof.betas_ms = vec![1.0];
+        c.dictionary.gaussian.sigmas_ms.clear();
+        c.blocks.f_min = 200.0;
+        c.blocks.f_max = 2000.0;
+        c.pursuit.max_atoms = 40;
+        c.pursuit.target_snr_db = 60.0;
+        c.refine.enabled = false;
+        c
+    }
+
+    /// A reporter that says "stop" from the outset.
+    #[derive(Default)]
+    struct StopAtOnce {
+        events: usize,
+    }
+
+    impl Reporter for StopAtOnce {
+        fn event(&mut self, _: Event<'_>) {
+            self.events += 1;
+        }
+        fn cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    /// The gate behind "closing a tab stops the work" and behind `rmpsynth`'s never seeing a
+    /// half-finished book without knowing it: a cancelled run selects nothing and *says* it was
+    /// cancelled, because the book alone cannot be told from a completed one.
+    #[test]
+    fn a_cancelled_run_selects_nothing_and_reports_that_it_was_cancelled() {
+        let sig = noisy(8_000, 48_000.0);
+        let cfg = small_config();
+        let mut planner = Planner::new();
+        let mut report = StopAtOnce::default();
+
+        let got = analyse(
+            AnalysisRequest { signal: &sig, offset: 0, config: &cfg, residual: None },
+            &mut planner,
+            &mut report,
+        )
+        .unwrap();
+
+        assert!(got.cancelled, "the run was cancelled and must say so");
+        assert!(got.book.is_empty(), "cancelled before the first atom, got {}", got.book.len());
+        // The dictionary is built before the pursuit starts, so that event still fires: cancelling
+        // stops the *search*, it does not abandon the request.
+        assert!(report.events >= 1, "the dictionary event should still have been reported");
+    }
+
+    /// The same run, uninterrupted, to show the fixture is not simply barren — otherwise the
+    /// assertion above would pass for the wrong reason.
+    #[test]
+    fn the_same_fixture_uncancelled_does_select_atoms() {
+        let sig = noisy(8_000, 48_000.0);
+        let cfg = small_config();
+        let mut planner = Planner::new();
+
+        let got = analyse(
+            AnalysisRequest { signal: &sig, offset: 0, config: &cfg, residual: None },
+            &mut planner,
+            &mut (),
+        )
+        .unwrap();
+
+        assert!(!got.cancelled);
+        assert!(!got.book.is_empty(), "the fixture has nothing to decompose");
+    }
+
     fn ramp(n: usize) -> Signal {
         Signal::new((0..n).map(|i| i as f32).collect(), 1000.0)
     }
