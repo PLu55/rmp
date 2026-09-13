@@ -12,3 +12,4 @@ egui_plot = "0.37.0"
 rfd = "0.17.2"
 rmp-core.workspace = true
 rmp-synthesis.workspace = true
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav", "flac", "symphonia-wav"] }

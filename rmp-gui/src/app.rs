@@ -10,11 +10,12 @@
 //! settings and their validation, the statistics and the time-frequency map all exist and are
 //! tested, and a panel that recomputed any of them would be a second definition.
 
+use crate::audio::Audio;
 use crate::help::Help;
 use crate::settings::SettingsDoc;
 use crate::task::{self, Outcome, Progress, Running, Update};
 use rmp_core::signal::{db_fs, rms_of};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What a tab's results area is showing.
 ///
@@ -65,6 +66,12 @@ struct Session {
     /// A render in flight. Independent of `running`: a tab can be analysing the next excerpt while
     /// the previous book is still being written out.
     synthesising: Option<task::Synthesising>,
+    /// Where the render in flight is headed. Promoted to `rendered` only when it reports success,
+    /// so a failed render does not leave Play pointing at a file that was never written.
+    rendering_to: Option<PathBuf>,
+    /// What Synthesize last wrote, and so what Play plays. Set only on a render that succeeded, so
+    /// a failed one leaves the previous file playable rather than pointing at nothing.
+    rendered: Option<PathBuf>,
     /// The last finished run, if any.
     outcome: Option<Box<Outcome>>,
     log: Vec<String>,
@@ -82,6 +89,8 @@ impl Session {
             ran_with: None,
             running: None,
             synthesising: None,
+            rendering_to: None,
+            rendered: None,
             outcome: None,
             log: Vec::new(),
             view: View::Summary,
@@ -103,6 +112,8 @@ impl Session {
             ran_with: None,
             running: None,
             synthesising: None,
+            rendering_to: None,
+            rendered: None,
             outcome: None,
             log: Vec::new(),
             view: self.view,
@@ -135,12 +146,16 @@ impl Session {
         if let Some(synth) = &mut self.synthesising {
             for update in synth.drain() {
                 self.log.push(match update {
-                    task::SynthUpdate::Done(r) => describe_render(&r),
+                    task::SynthUpdate::Done(r) => {
+                        self.rendered = self.rendering_to.clone();
+                        describe_render(&r)
+                    }
                     task::SynthUpdate::Failed(e) => format!("synthesis failed: {e}"),
                 });
             }
             if synth.finished() {
                 self.synthesising = None;
+                self.rendering_to = None;
             }
         }
 
@@ -166,7 +181,7 @@ impl Session {
         }
     }
 
-    fn input_bar(&mut self, ui: &mut egui::Ui) {
+    fn input_bar(&mut self, ui: &mut egui::Ui, out: &mut SettingsOut, playing: bool) {
         ui.horizontal(|ui| {
             // Reported, not chosen: a tab's file is what the tab is.
             ui.label(self.input.display().to_string())
@@ -221,12 +236,37 @@ impl Session {
                     }
                 }
             }
+
+            // Playing is the window's job, not the tab's: there is one output device. The tab only
+            // says which file and when.
+            match (&self.rendered, playing) {
+                (Some(_), true) => {
+                    if ui.button("Stop").clicked() {
+                        out.stop = true;
+                    }
+                }
+                (rendered, _) => {
+                    let path = rendered.clone();
+                    if ui
+                        .add_enabled(path.is_some(), egui::Button::new("Play"))
+                        .on_disabled_hover_text("synthesize something first")
+                        .on_hover_text(
+                            path.as_deref()
+                                .map_or_else(String::new, |p| p.display().to_string()),
+                        )
+                        .clicked()
+                    {
+                        out.play = path;
+                    }
+                }
+            }
         });
     }
 
     fn start_synthesis(&mut self) {
         let Some(outcome) = &self.outcome else { return };
         let Some(output) = pick_audio_save(&self.default_render_name()) else { return };
+        self.rendering_to = Some(output.clone());
         // Cloned rather than borrowed: the render outlives this frame on a thread of its own, and
         // the tab stays live meanwhile — you can edit its settings, or start the next analysis.
         self.synthesising = Some(task::spawn_synthesis(task::SynthJob {
@@ -461,6 +501,10 @@ impl Session {
 struct SettingsOut {
     error: Option<String>,
     open_help: bool,
+    /// A file to play, or `None`. The device lives on `RmpApp` — one output for the whole window,
+    /// since one pair of speakers is what the machine has.
+    play: Option<PathBuf>,
+    stop: bool,
 }
 
 /// What a click on the tab strip asked for, applied after the strip has been drawn.
@@ -484,6 +528,10 @@ pub struct RmpApp {
     /// One help window for the whole app, not one per tab: it is the manual, and it is the same
     /// manual whichever tab you asked from.
     help: Help,
+    /// The output device, opened on the first Play and kept for the life of the window. One for the
+    /// app rather than one per tab, because one pair of speakers is what the machine has — and
+    /// playing two tabs' renders at once would be a mix, not a comparison.
+    audio: Option<Audio>,
     /// Index into `sessions`. Meaningless while that is empty, which is the one time nothing
     /// indexes it.
     active: usize,
@@ -499,7 +547,11 @@ impl eframe::App for RmpApp {
         // asked for rather than waited on: without this the window sleeps and the log arrives late.
         // Asked for if *any* tab is busy, since a hidden tab still drives its strip spinner — and
         // a render that finished would otherwise sit unreported until the mouse moved.
-        if self.sessions.iter().any(Session::busy) {
+        // Playing counts too: the Stop button has to turn back into Play when the sound ends, and
+        // nothing else would wake the window to notice.
+        if self.sessions.iter().any(Session::busy)
+            || self.audio.as_ref().is_some_and(Audio::playing)
+        {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -526,9 +578,14 @@ impl eframe::App for RmpApp {
         // A failed load or save belongs in the tab's own log, but the panel drawing it holds the
         // session borrow; it is carried out and pushed afterwards.
         let mut out = SettingsOut::default();
+        // Read before the session borrow begins; the device is the window's, not the tab's. It is
+        // *this tab's* render that decides whether to offer Stop, not merely that something is
+        // sounding — otherwise every tab with a render would offer to stop another tab's playback.
+        let sounding = self.audio.as_ref().and_then(Audio::playing_path).map(Path::to_path_buf);
         let session = &mut self.sessions[self.active];
+        let playing = sounding.is_some() && sounding == session.rendered;
         egui::Panel::top("input").show(ui, |ui| {
-            ui.push_id(salt, |ui| session.input_bar(ui));
+            ui.push_id(salt, |ui| session.input_bar(ui, &mut out, playing));
         });
         egui::Panel::left("settings").default_size(440.0).show(ui, |ui| {
             ui.push_id(salt, |ui| session.settings(ui, &mut out));
@@ -544,6 +601,24 @@ impl eframe::App for RmpApp {
         }
         if out.open_help {
             self.help.open_or_raise();
+        }
+        if out.stop && let Some(a) = &mut self.audio {
+            a.stop();
+        }
+        if let Some(path) = out.play {
+            // Opened on first use, so a machine with no sound card fails here rather than at
+            // launch, over a feature it may never be asked for.
+            if self.audio.is_none() {
+                match Audio::open() {
+                    Ok(a) => self.audio = Some(a),
+                    Err(e) => session.log.push(e),
+                }
+            }
+            if let Some(a) = &mut self.audio
+                && let Err(e) = a.play(&path)
+            {
+                session.log.push(e);
+            }
         }
         // Outside every panel: it is a window of its own, not part of this one's layout.
         self.help.show(ui);
@@ -994,6 +1069,41 @@ mod tests {
         assert!(!s.busy(), "and stops counting once it is done");
         assert_eq!(s.log.len(), 1, "exactly one line, whatever the outcome: {:?}", s.log);
         std::fs::remove_file(std::env::temp_dir().join("rmp-gui-busy-test.wav")).ok();
+    }
+
+    /// Play is offered only once a render has landed, and a *failed* render must not offer it:
+    /// `rendering_to` is where the output was headed, `rendered` where one actually arrived.
+    #[test]
+    fn play_waits_for_a_render_that_actually_succeeded() {
+        let mut app = with(&["a.wav"]);
+        let s = &mut app.sessions[0];
+        assert!(s.rendered.is_none(), "nothing has been rendered");
+
+        // As `start_synthesis` does.
+        s.rendering_to = Some(PathBuf::from("/tmp/a-01.wav"));
+        assert!(s.rendered.is_none(), "a render in flight is not a render");
+
+        // As `pump` does on failure: the destination is dropped, nothing is promoted.
+        s.rendering_to = None;
+        assert!(s.rendered.is_none(), "a failed render leaves nothing to play");
+
+        // And on success.
+        s.rendering_to = Some(PathBuf::from("/tmp/a-01.wav"));
+        s.rendered = s.rendering_to.clone();
+        s.rendering_to = None;
+        assert_eq!(s.rendered, Some(PathBuf::from("/tmp/a-01.wav")));
+    }
+
+    /// A duplicate has rendered nothing of its own, so it must not offer to play the original's
+    /// file — the two tabs exist to be compared, and one playing the other's audio defeats that.
+    #[test]
+    fn a_duplicate_has_nothing_to_play() {
+        let mut app = with(&["a.wav"]);
+        app.sessions[0].rendered = Some(PathBuf::from("/tmp/a-01.wav"));
+
+        let copy = app.sessions[0].duplicate(2);
+        assert!(copy.rendered.is_none());
+        assert!(copy.rendering_to.is_none());
     }
 
     /// The tab you were looking at is the tab you are still looking at.

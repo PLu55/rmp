@@ -9,6 +9,7 @@
 //! decompositions of the same input.
 
 mod app;
+mod audio;
 mod help;
 mod settings;
 mod task;

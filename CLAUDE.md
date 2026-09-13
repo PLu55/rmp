@@ -334,6 +334,16 @@ window that freezes for a second reads as a window that has crashed. The residua
 the book carries one, decided in `task` rather than left to `RenderRequest::residual_source` — both
 skip it, but only one can say in the log that it did.
 
+**Play** sounds what Synthesize last wrote, through rodio, and turns into Stop while it does. Three
+things about it. The output device is opened on the *first* Play, so a machine with no sound card
+fails at a line in the log rather than at launch, over a feature analysis never needs. It is one
+device for the window rather than one per tab, and the tab offers Stop only when the file sounding
+is *its own* render — otherwise every tab with a render would offer to stop another tab's playback.
+And `Audio::playing` consults both `player.empty()` and its own `current`: the first catches a
+track that ended by itself, but rodio's `stop()` only sets a flag and `sound_count` is decremented
+later by the audio thread, so without the second a Stop button lingers after the sound was told to
+stop.
+
 Save as proposes `<audio file, less its extension>-<tab number>.toml`, derived every time rather
 than only for a document with no file yet. The tab number in it is the point: duplicating a tab
 copies the settings *and the file they came from*, so two tabs comparing one setting on one
