@@ -9,6 +9,7 @@
 //! decompositions of the same input.
 
 mod app;
+mod settings;
 mod task;
 
 fn main() -> eframe::Result {

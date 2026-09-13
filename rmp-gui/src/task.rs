@@ -36,8 +36,6 @@ pub struct Job {
     pub config: Config,
     pub start: Option<f32>,
     pub duration: Option<f32>,
-    /// Whether to analyse the residue into ERB band power afterwards.
-    pub residual_analysis: bool,
 }
 
 /// An [`Event`], flattened to something that can be owned and sent.
@@ -169,8 +167,11 @@ fn work(job: Job, cancel: &AtomicBool, tx: &mpsc::Sender<Update>) -> Result<Outc
 
     // Resolved here rather than inside the pursuit so that an ERB range that does not fit under
     // this file's Nyquist fails now, not after a seven-second analysis.
+    // `[residual] enabled` in the settings document is the whole of the decision. There used to be
+    // a GUI checkbox ANDed with it, which meant two controls for one thing and no way to tell from
+    // the panel which of them was saying no.
     let residual_cfg = job.config.residual_config(sample_rate as f64).map_err(|e| e.to_string())?;
-    let want_residual = job.residual_analysis && residual_cfg.enabled;
+    let want_residual = residual_cfg.enabled;
 
     let mut reporter =
         Forward { tx: tx.clone(), cancel, mp_cfg: job.config.mp_config(), sr: sample_rate };
@@ -248,7 +249,6 @@ mod tests {
             config: Default::default(),
             start: None,
             duration: None,
-            residual_analysis: false,
         });
 
         // The worker is a real thread; give it a moment rather than spinning forever.

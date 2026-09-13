@@ -159,8 +159,9 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   there is no state for an empty tab to be in and nothing to write a second file into. The reason
   is that a tab's results, log and title all describe one file, and swapping it underneath would
   leave a book describing a file the tab no longer names. With no tabs the window shows an Open
-  button and nothing else. `task` runs a decomposition off the UI thread; the panels inside a tab
-  are stubs naming the `rmp-core` call each is a view of.
+  button and nothing else. A tab's settings are a **document**, loaded, edited and saved as a TOML
+  file — `settings::SettingsDoc`. `task` runs a decomposition off the UI thread; the result panels
+  inside a tab are stubs naming the `rmp-core` call each is a view of.
 
 ### Invariants that are not locally obvious
 
@@ -273,6 +274,20 @@ keeping:
   analyse a buffer it never read from disk. `Analysis` therefore returns the `ResidualBook` beside
   the `Book` rather than embedded in it; whether the two share a file is `rmp`'s decision, not the
   pipeline's.
+
+**The GUI edits the settings document as text, not as widgets.** `SettingsDoc` holds the TOML and
+re-runs `Config::from_toml` + `Config::validate` on every keystroke. A widget per field would
+enumerate every setting a second time and go stale the day one is added — the new knob simply
+unreachable, with nothing failing to say so. It also means what is saved is what was *edited*, so
+comments and ordering survive a load-edit-save round trip, where re-serialising the parsed `Config`
+would quietly rewrite a hand-annotated file. `DEFAULT_CONFIG_HEADER` moved into `rmp_core::config`
+for the same reason the pipeline did: `rmp --write-config` prints it and the GUI seeds its editor
+with it, and two copies would be two manuals.
+
+Staleness is compared through `SettingsDoc::effective` — the parsed config re-serialised — not
+through the text. Annotating a document or reflowing it must not make a finished run look stale,
+and only the settings that reach the analysis can say whether it did. A document that does not
+currently parse counts as stale, because it cannot be shown to agree with anything.
 
 **Cancellation is sticky, and that is load-bearing.** `Reporter::cancelled` is polled once per
 selected atom by `Mp::run_with` and once per window by `run_windowed`, and `Analysis::cancelled` is

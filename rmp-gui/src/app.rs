@@ -10,8 +10,8 @@
 //! settings and their validation, the statistics and the time-frequency map all exist and are
 //! tested, and a panel that recomputed any of them would be a second definition.
 
+use crate::settings::SettingsDoc;
 use crate::task::{self, Outcome, Progress, Running, Update};
-use rmp_core::config::Config;
 use rmp_core::signal::{db_fs, rms_of};
 use std::path::PathBuf;
 
@@ -55,10 +55,11 @@ struct Session {
     input: PathBuf,
     start: String,
     duration: String,
-    residual_analysis: bool,
-    /// The settings document itself, edited in place. Held as the real `Config` rather than as
-    /// widget state so that `Config::validate` is the only definition of what is legal.
-    config: Config,
+    /// The settings this tab analyses with: a document, loaded and saved as a file.
+    settings: SettingsDoc,
+    /// The *effective* settings the displayed results came from — see `SettingsDoc::effective`.
+    /// `None` until a run starts. What makes a result knowable as stale once the document moves on.
+    ran_with: Option<String>,
     running: Option<Running>,
     /// The last finished run, if any.
     outcome: Option<Box<Outcome>>,
@@ -73,8 +74,8 @@ impl Session {
             input,
             start: String::new(),
             duration: String::new(),
-            residual_analysis: false,
-            config: Config::default(),
+            settings: SettingsDoc::default(),
+            ran_with: None,
             running: None,
             outcome: None,
             log: Vec::new(),
@@ -93,8 +94,8 @@ impl Session {
             input: self.input.clone(),
             start: self.start.clone(),
             duration: self.duration.clone(),
-            residual_analysis: self.residual_analysis,
-            config: self.config.clone(),
+            settings: self.settings.clone(),
+            ran_with: None,
             running: None,
             outcome: None,
             log: Vec::new(),
@@ -179,27 +180,107 @@ impl Session {
     }
 
     fn start_run(&mut self) {
-        let input = self.input.clone();
+        let Ok(config) = self.settings.status() else { return };
+        let config = config.clone();
+        // Recorded now rather than on completion, so an interrupted run is still attributed to the
+        // settings it ran under.
+        self.ran_with = self.settings.effective().map(str::to_owned);
         self.log.clear();
         self.outcome = None;
         self.running = Some(task::spawn(task::Job {
-            input,
-            config: self.config.clone(),
+            input: self.input.clone(),
+            config,
             start: self.start.trim().parse().ok(),
             duration: self.duration.trim().parse().ok(),
-            residual_analysis: self.residual_analysis,
         }));
     }
 
-    fn settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
-        ui.checkbox(&mut self.residual_analysis, "Analyse the residue into ERB band power");
+    /// Whether the settings panel has moved on from what the displayed results came from.
+    ///
+    /// Compared through `effective`, so reflowing the document or annotating a line does not read
+    /// as a change. A document that currently does not parse counts as stale: it cannot be shown to
+    /// agree with anything.
+    fn results_are_stale(&self) -> bool {
+        match (&self.ran_with, self.settings.effective()) {
+            (Some(ran), Some(now)) => ran != now,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    /// The settings document: load, edit, save, save as.
+    ///
+    /// The residue's ERB analysis is `[residual] enabled` in the document like everything else.
+    /// It used to have a checkbox of its own here, ANDed with the setting — two controls for one
+    /// thing, and no way to tell from the panel which of them was the one saying no.
+    fn settings(&mut self, ui: &mut egui::Ui, err: &mut Option<String>) {
+        ui.horizontal(|ui| {
+            ui.heading("Settings");
+            if ui.button("Load…").clicked()
+                && let Some(p) = pick_settings()
+            {
+                match SettingsDoc::load(&p) {
+                    // Deliberately not reset: the results stay, and `results_are_stale` starts
+                    // reporting them against the document that is now on screen.
+                    Ok(d) => self.settings = d,
+                    Err(e) => *err = Some(e),
+                }
+            }
+            // Nothing to write, or nowhere to write it.
+            let can_save = self.settings.path().is_some() && self.settings.modified();
+            if ui
+                .add_enabled(can_save, egui::Button::new("Save"))
+                .on_disabled_hover_text(if self.settings.path().is_some() {
+                    "no changes to save"
+                } else {
+                    "this document has no file yet — use Save as"
+                })
+                .clicked()
+                && let Err(e) = self.settings.save()
+            {
+                *err = Some(e);
+            }
+            if ui.button("Save as…").clicked()
+                && let Some(p) = pick_settings_save(self.settings.path())
+                && let Err(e) = self.settings.save_as(&p)
+            {
+                *err = Some(e);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            match self.settings.path() {
+                Some(p) => ui.label(p.display().to_string()),
+                None => ui.weak("unsaved — the built-in defaults"),
+            };
+            if self.settings.modified() {
+                ui.strong("*");
+            }
+        });
         ui.separator();
-        // TODO: edit `self.config` in place, section by section, and show what
-        // `Config::validate` says. `Config::to_toml` and `Config::from_toml` are the
-        // import/export pair, and `data/config/*.toml` are the worked examples.
-        ui.label("Dictionary, envelope, blocks, pursuit, refine, HRMP and residual sections go here,");
-        ui.label("editing rmp_core::Config directly so validation has one definition.");
+
+        // The verdict, above the editor rather than below it, so it does not move as the document
+        // grows.
+        match self.settings.status() {
+            Ok(c) => {
+                let blocks = c.dictionary_shapes().len();
+                ui.label(format!("valid — {blocks} block shapes"));
+            }
+            Err(e) => {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+        }
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let resp = ui.add_sized(
+                ui.available_size(),
+                egui::TextEdit::multiline(self.settings.text_mut()).code_editor(),
+            );
+            if resp.changed() {
+                self.settings.reparse();
+            }
+        });
     }
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {
@@ -223,11 +304,21 @@ impl Session {
             return;
         };
 
+        let stale = self.results_are_stale();
         ui.horizontal(|ui| {
             for v in View::ALL {
                 ui.selectable_value(&mut self.view, v, v.label());
             }
         });
+        // The results are a fact about the settings that produced them, and the panel beside them
+        // no longer shows those. Said here rather than by hiding or discarding the book: a
+        // decomposition can take minutes, and it is still the result you got.
+        if stale {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "settings have changed since this run — analyse again to match them",
+            );
+        }
         ui.separator();
 
         let book = &outcome.analysis.book;
@@ -332,12 +423,15 @@ impl eframe::App for RmpApp {
         // chrome, and they should not jump when you switch. Widget state inside them is not — see
         // the `push_id` below.
         let salt = self.sessions[self.active].number;
+        // A failed load or save belongs in the tab's own log, but the panel drawing it holds the
+        // session borrow; it is carried out and pushed afterwards.
+        let mut file_error: Option<String> = None;
         let session = &mut self.sessions[self.active];
         egui::Panel::top("input").show(ui, |ui| {
             ui.push_id(salt, |ui| session.input_bar(ui));
         });
-        egui::Panel::left("settings").default_size(320.0).show(ui, |ui| {
-            ui.push_id(salt, |ui| session.settings(ui));
+        egui::Panel::left("settings").default_size(440.0).show(ui, |ui| {
+            ui.push_id(salt, |ui| session.settings(ui, &mut file_error));
         });
         egui::Panel::bottom("log").resizable(true).default_size(140.0).show(ui, |ui| {
             ui.push_id(salt, |ui| session.log_panel(ui));
@@ -345,6 +439,9 @@ impl eframe::App for RmpApp {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.push_id(salt, |ui| session.results(ui));
         });
+        if let Some(e) = file_error {
+            session.log.push(format!("settings: {e}"));
+        }
     }
 }
 
@@ -360,9 +457,13 @@ impl RmpApp {
                         if ui.selectable_label(i == self.active, s.title()).clicked() {
                             action = Some(Action::Select(i));
                         }
-                        // A background run is visible without switching to it.
+                        // A background run is visible without switching to it, and so are unsaved
+                        // settings — both are reasons to come back to a tab you are not looking at.
                         if s.running.is_some() {
                             ui.spinner();
+                        }
+                        if s.settings.modified() {
+                            ui.strong("*").on_hover_text("unsaved settings changes");
                         }
                         if ui
                             .small_button("×")
@@ -453,9 +554,27 @@ impl RmpApp {
     }
 }
 
-/// The one file dialog, shared by the tab strip and the empty window.
+/// The one audio file dialog, shared by the tab strip and the empty window.
 fn pick_file() -> Option<PathBuf> {
     rfd::FileDialog::new().add_filter("audio", &["wav", "aiff", "aif", "flac"]).pick_file()
+}
+
+fn pick_settings() -> Option<PathBuf> {
+    rfd::FileDialog::new().add_filter("settings", &["toml"]).pick_file()
+}
+
+/// Save-as, starting wherever the document currently lives.
+fn pick_settings_save(current: Option<&std::path::Path>) -> Option<PathBuf> {
+    let mut d = rfd::FileDialog::new().add_filter("settings", &["toml"]);
+    if let Some(p) = current {
+        if let Some(dir) = p.parent() {
+            d = d.set_directory(dir);
+        }
+        if let Some(name) = p.file_name() {
+            d = d.set_file_name(name.to_string_lossy());
+        }
+    }
+    d.save_file()
 }
 
 /// One line of log for a progress message.
@@ -491,6 +610,39 @@ fn describe(p: &Progress) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Change a setting, the way typing over its value in the editor would.
+    ///
+    /// By replacing the line in place rather than appending: the document ends inside
+    /// `[residual.power]`, so an appended `max_atoms = …` is an unknown field there and *breaks*
+    /// the document instead of changing it — which is subtle enough that the first version of
+    /// these tests did exactly that, and the staleness one passed for the wrong reason.
+    fn set(s: &mut Session, key: &str, value: &str) {
+        let text = s.settings.text_mut();
+        let prefix = format!("{key} = ");
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with(&prefix))
+            .unwrap_or_else(|| panic!("{key} is not in the default document"))
+            .to_string();
+        *text = text.replace(&line, &format!("{key} = {value}"));
+        s.settings.reparse();
+        assert!(s.settings.status().is_ok(), "the fixture broke the document: {:?}", s.settings.status().err());
+    }
+
+    /// A change that reaches the text but not the analysis. Safe to append: a comment is legal
+    /// anywhere, including at the end of the last section.
+    fn comment(s: &mut Session, note: &str) {
+        s.settings.text_mut().push_str(&format!("\n# {note}\n"));
+        s.settings.reparse();
+        assert!(s.settings.status().is_ok());
+    }
+
+    fn break_doc(s: &mut Session) {
+        s.settings.text_mut().push_str("\nthis is not toml =\n");
+        s.settings.reparse();
+        assert!(s.settings.status().is_err(), "the fixture was supposed to break it");
+    }
 
     /// An app holding one tab per path, built the way the UI builds them.
     fn with(paths: &[&str]) -> RmpApp {
@@ -553,15 +705,45 @@ mod tests {
     #[test]
     fn a_tab_that_open_creates_starts_from_the_defaults() {
         let mut app = with(&["/a/piano.wav"]);
-        app.sessions[0].config.pursuit.max_atoms = 4321;
-        app.sessions[0].residual_analysis = true;
+        set(&mut app.sessions[0], "max_atoms", "4321");
         app.sessions[0].start = "2.5".into();
 
         app.open(PathBuf::from("/a/zyklus.wav"));
         let new = &app.sessions[1];
-        assert_eq!(new.config.pursuit.max_atoms, Config::default().pursuit.max_atoms);
-        assert!(!new.residual_analysis);
+        assert_eq!(new.settings.effective(), SettingsDoc::default().effective());
+        assert!(!new.settings.modified());
         assert!(new.start.is_empty());
+    }
+
+    /// The results describe the settings that produced them, so the panel moving on has to be
+    /// visible. Compared through `effective`, so a comment is not a change.
+    #[test]
+    fn results_go_stale_when_the_settings_move_on_but_not_when_a_comment_does() {
+        let mut app = with(&["/a/piano.wav"]);
+        let s = &mut app.sessions[0];
+
+        assert!(!s.results_are_stale(), "nothing has run yet");
+
+        // Stand in for a finished run: this is what `start_run` records.
+        s.ran_with = s.settings.effective().map(str::to_owned);
+        assert!(!s.results_are_stale());
+
+        comment(s, "just a note");
+        assert!(!s.results_are_stale(), "a comment does not change the analysis");
+
+        set(s, "max_atoms", "4321");
+        assert!(s.results_are_stale(), "a real change does");
+    }
+
+    /// A document that does not parse cannot be shown to agree with anything.
+    #[test]
+    fn a_broken_settings_document_reads_as_stale() {
+        let mut app = with(&["/a/piano.wav"]);
+        let s = &mut app.sessions[0];
+        s.ran_with = s.settings.effective().map(str::to_owned);
+
+        break_doc(s);
+        assert!(s.results_are_stale());
     }
 
     /// Reuse is what keeps the number two digits: closing the middle tab frees 02, and the next
@@ -644,18 +826,19 @@ mod tests {
     fn a_duplicate_carries_the_settings_but_not_the_results() {
         let mut app = with(&["a.wav"]);
         app.sessions[0].start = "2.5".into();
-        app.sessions[0].residual_analysis = true;
-        app.sessions[0].config.pursuit.max_atoms = 4321;
+        set(&mut app.sessions[0], "max_atoms", "4321");
         app.sessions[0].log.push("something happened".into());
+        app.sessions[0].ran_with = Some("whatever ran".into());
 
         let copy = app.sessions[0].duplicate(7);
         assert_eq!(copy.number, 7);
         assert_eq!(copy.input, app.sessions[0].input);
         assert_eq!(copy.start, "2.5");
-        assert!(copy.residual_analysis);
-        assert_eq!(copy.config.pursuit.max_atoms, 4321);
+        assert_eq!(copy.settings.status().unwrap().pursuit.max_atoms, 4321);
         assert!(copy.log.is_empty());
         assert!(copy.outcome.is_none());
         assert!(copy.running.is_none());
+        assert!(copy.ran_with.is_none(), "a copy has not run, so nothing of its own is stale");
+        assert!(!copy.results_are_stale());
     }
 }
