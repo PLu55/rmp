@@ -326,6 +326,13 @@ writes its formulas, and a help window of missing-glyph boxes where the operator
 worse than none. Appended rather than prepended, so it fills gaps and changes nothing that already
 rendered.
 
+Save as proposes `<audio file, less its extension>-<tab number>.toml`, derived every time rather
+than only for a document with no file yet. The tab number in it is the point: duplicating a tab
+copies the settings *and the file they came from*, so two tabs comparing one setting on one
+soundfile would otherwise both propose the original's name and the second would silently offer to
+overwrite the first. The directory still comes from the last save, so this decides what is
+proposed, not where.
+
 Staleness is compared through `SettingsDoc::effective` — the parsed config re-serialised — not
 through the text. Annotating a document or reflowing it must not make a finished run look stale,
 and only the settings that reach the analysis can say whether it did. A document that does not

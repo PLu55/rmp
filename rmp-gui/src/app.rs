@@ -196,6 +196,24 @@ impl Session {
         }));
     }
 
+    /// The file name Save as proposes: `<audio file, less its extension>-<tab number>.toml`.
+    ///
+    /// Derived every time rather than only for a document that has no file yet, because the tab
+    /// number in it is the point. Duplicating a tab copies the settings *and the file they came
+    /// from*, so two tabs comparing one setting on one soundfile would both propose the original's
+    /// name and the second would silently offer to overwrite the first. The number is what tells
+    /// them apart, and it only helps if it is the name actually offered.
+    ///
+    /// The directory still comes from wherever the document was last saved — see
+    /// `pick_settings_save` — so this changes what is proposed, not where.
+    fn default_settings_name(&self) -> String {
+        let stem = self
+            .input
+            .file_stem()
+            .map_or_else(|| "settings".to_string(), |s| s.to_string_lossy().into_owned());
+        format!("{stem}-{:02}.toml", self.number)
+    }
+
     /// Whether the settings panel has moved on from what the displayed results came from.
     ///
     /// Compared through `effective`, so reflowing the document or annotating a line does not read
@@ -250,7 +268,8 @@ impl Session {
                 *err = Some(e);
             }
             if ui.button("Save as…").clicked()
-                && let Some(p) = pick_settings_save(self.settings.path())
+                && let Some(p) =
+                    pick_settings_save(self.settings.path(), &self.default_settings_name())
                 && let Err(e) = self.settings.save_as(&p)
             {
                 *err = Some(e);
@@ -590,16 +609,15 @@ fn pick_settings() -> Option<PathBuf> {
     rfd::FileDialog::new().add_filter("settings", &["toml"]).pick_file()
 }
 
-/// Save-as, starting wherever the document currently lives.
-fn pick_settings_save(current: Option<&std::path::Path>) -> Option<PathBuf> {
-    let mut d = rfd::FileDialog::new().add_filter("settings", &["toml"]);
-    if let Some(p) = current {
-        if let Some(dir) = p.parent() {
-            d = d.set_directory(dir);
-        }
-        if let Some(name) = p.file_name() {
-            d = d.set_file_name(name.to_string_lossy());
-        }
+/// Save-as, proposing `name` in whatever directory the document was last saved to.
+///
+/// The two halves come from different places on purpose: the name identifies the *tab* (see
+/// `Session::default_settings_name`), while the directory is wherever this person keeps their
+/// settings, which only the previous save knows.
+fn pick_settings_save(current: Option<&std::path::Path>, name: &str) -> Option<PathBuf> {
+    let mut d = rfd::FileDialog::new().add_filter("settings", &["toml"]).set_file_name(name);
+    if let Some(dir) = current.and_then(|p| p.parent()) {
+        d = d.set_directory(dir);
     }
     d.save_file()
 }
@@ -800,6 +818,52 @@ mod tests {
             ns.dedup();
             assert_eq!(ns.len(), before, "two tabs share a number");
         }
+    }
+
+    #[test]
+    fn save_as_proposes_the_audio_file_and_the_tab_number() {
+        let app = with(&["/a/b/chopin-nocturne-2.wav", "/a/zyklus.wav"]);
+        assert_eq!(app.sessions[0].default_settings_name(), "chopin-nocturne-2-01.toml");
+        assert_eq!(app.sessions[1].default_settings_name(), "zyklus-02.toml");
+    }
+
+    /// The case the number exists for: two tabs on one soundfile, comparing one setting. Without
+    /// it both would propose the same name and the second would offer to overwrite the first.
+    #[test]
+    fn two_tabs_on_one_file_propose_different_names() {
+        let mut app = with(&["/a/piano.wav"]);
+        app.push(app.sessions[0].duplicate(app.free_number()));
+
+        let names: Vec<String> =
+            app.sessions.iter().map(|s| s.default_settings_name()).collect();
+        assert_eq!(names, ["piano-01.toml", "piano-02.toml"]);
+    }
+
+    /// The number is padded like the tab title, and widens past 99 the same way rather than
+    /// truncating into a collision.
+    #[test]
+    fn the_number_is_padded_and_matches_the_tab_title() {
+        let mut app = with(&["/a/piano.wav"]);
+        let s = &mut app.sessions[0];
+        assert!(s.title().starts_with("01 ") && s.default_settings_name().contains("-01."));
+
+        s.number = 7;
+        assert_eq!(s.default_settings_name(), "piano-07.toml");
+        s.number = 128;
+        assert_eq!(s.default_settings_name(), "piano-128.toml");
+    }
+
+    /// Only the final extension goes, so a name with dots of its own survives; a file without one
+    /// keeps its whole name.
+    #[test]
+    fn only_the_extension_is_dropped_from_the_name() {
+        let mut app = with(&["/a/take.2.mix.wav", "/a/rawpcm"]);
+        assert_eq!(app.sessions[0].default_settings_name(), "take.2.mix-01.toml");
+        assert_eq!(app.sessions[1].default_settings_name(), "rawpcm-02.toml");
+
+        // Nothing to derive from at all still produces a usable name rather than ".toml".
+        app.sessions[0].input = PathBuf::from("/");
+        assert_eq!(app.sessions[0].default_settings_name(), "settings-01.toml");
     }
 
     /// The tab you were looking at is the tab you are still looking at.
