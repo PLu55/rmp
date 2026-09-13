@@ -160,8 +160,9 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   is that a tab's results, log and title all describe one file, and swapping it underneath would
   leave a book describing a file the tab no longer names. With no tabs the window shows an Open
   button and nothing else. A tab's settings are a **document**, loaded, edited and saved as a TOML
-  file — `settings::SettingsDoc`. `task` runs a decomposition off the UI thread; the result panels
-  inside a tab are stubs naming the `rmp-core` call each is a view of.
+  file — `settings::SettingsDoc` — with a `?` beside them opening `MANUAL.md` itself in a window
+  (`help`). `task` runs a decomposition off the UI thread; the result panels inside a tab are stubs
+  naming the `rmp-core` call each is a view of.
 
 ### Invariants that are not locally obvious
 
@@ -283,6 +284,20 @@ comments and ordering survive a load-edit-save round trip, where re-serialising 
 would quietly rewrite a hand-annotated file. `DEFAULT_CONFIG_HEADER` moved into `rmp_core::config`
 for the same reason the pipeline did: `rmp --write-config` prints it and the GUI seeds its editor
 with it, and two copies would be two manuals.
+
+**The help window is `MANUAL.md`, embedded and split, not a summary of it.** `help::parse` cuts the
+file at its `##` and `###` headings, and because the manual titles its subsections with the setting
+they document — "`### capture_tolerance` — default `0.95`" — the table of contents *is* the list of
+settings and is derived rather than written out. A setting documented in the manual appears in the
+window with no code change, which is the only arrangement that cannot drift. Two things the parse
+has to get right: `#` inside a fenced block is a shell comment and not a heading (the manual has
+such a fence), and a `##` runs past its own `###` children so selecting a section shows it whole.
+
+`rmp-gui` installs a system font as a *fallback* behind egui's built-ins, from the same candidate
+list `rmpstat` uses. eframe's own fonts have no `→ ≈ √ ∝ Σ σ π`, which is most of how `MANUAL.md`
+writes its formulas, and a help window of missing-glyph boxes where the operators should be is
+worse than none. Appended rather than prepended, so it fills gaps and changes nothing that already
+rendered.
 
 Staleness is compared through `SettingsDoc::effective` — the parsed config re-serialised — not
 through the text. Annotating a document or reflowing it must not make a finished run look stale,

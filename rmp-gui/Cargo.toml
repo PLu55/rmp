@@ -7,6 +7,7 @@ description = "A graphical front end over rmp: analyse, inspect and resynthesise
 [dependencies]
 eframe = "0.36.2"
 egui = "0.36.2"
+egui_commonmark = { version = "0.25.0", default-features = false, features = ["pulldown_cmark"] }
 egui_plot = "0.37.0"
 rfd = "0.17.2"
 rmp-core.workspace = true

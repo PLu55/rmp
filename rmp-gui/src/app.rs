@@ -10,6 +10,7 @@
 //! settings and their validation, the statistics and the time-frequency map all exist and are
 //! tested, and a panel that recomputed any of them would be a second definition.
 
+use crate::help::Help;
 use crate::settings::SettingsDoc;
 use crate::task::{self, Outcome, Progress, Running, Update};
 use rmp_core::signal::{db_fs, rms_of};
@@ -213,9 +214,17 @@ impl Session {
     /// The residue's ERB analysis is `[residual] enabled` in the document like everything else.
     /// It used to have a checkbox of its own here, ANDed with the setting — two controls for one
     /// thing, and no way to tell from the panel which of them was the one saying no.
-    fn settings(&mut self, ui: &mut egui::Ui, err: &mut Option<String>) {
+    fn settings(&mut self, ui: &mut egui::Ui, out: &mut SettingsOut) {
+        let err = &mut out.error;
         ui.horizontal(|ui| {
             ui.heading("Settings");
+            if ui
+                .button("?")
+                .on_hover_text("what every setting does, from MANUAL.md")
+                .clicked()
+            {
+                out.open_help = true;
+            }
             if ui.button("Load…").clicked()
                 && let Some(p) = pick_settings()
             {
@@ -358,6 +367,16 @@ impl Session {
     }
 }
 
+/// What the settings panel asks of the window.
+///
+/// The panel is a `Session` method, so it can reach neither the help window nor its own log while
+/// drawing. Both are carried out and applied once the borrow has ended.
+#[derive(Default)]
+struct SettingsOut {
+    error: Option<String>,
+    open_help: bool,
+}
+
 /// What a click on the tab strip asked for, applied after the strip has been drawn.
 ///
 /// The strip borrows `sessions` to draw itself, so it cannot add to or remove from that same list
@@ -376,6 +395,9 @@ enum Action {
 #[derive(Default)]
 pub struct RmpApp {
     sessions: Vec<Session>,
+    /// One help window for the whole app, not one per tab: it is the manual, and it is the same
+    /// manual whichever tab you asked from.
+    help: Help,
     /// Index into `sessions`. Meaningless while that is empty, which is the one time nothing
     /// indexes it.
     active: usize,
@@ -425,13 +447,13 @@ impl eframe::App for RmpApp {
         let salt = self.sessions[self.active].number;
         // A failed load or save belongs in the tab's own log, but the panel drawing it holds the
         // session borrow; it is carried out and pushed afterwards.
-        let mut file_error: Option<String> = None;
+        let mut out = SettingsOut::default();
         let session = &mut self.sessions[self.active];
         egui::Panel::top("input").show(ui, |ui| {
             ui.push_id(salt, |ui| session.input_bar(ui));
         });
         egui::Panel::left("settings").default_size(440.0).show(ui, |ui| {
-            ui.push_id(salt, |ui| session.settings(ui, &mut file_error));
+            ui.push_id(salt, |ui| session.settings(ui, &mut out));
         });
         egui::Panel::bottom("log").resizable(true).default_size(140.0).show(ui, |ui| {
             ui.push_id(salt, |ui| session.log_panel(ui));
@@ -439,9 +461,14 @@ impl eframe::App for RmpApp {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.push_id(salt, |ui| session.results(ui));
         });
-        if let Some(e) = file_error {
+        if let Some(e) = out.error {
             session.log.push(format!("settings: {e}"));
         }
+        if out.open_help {
+            self.help.open = true;
+        }
+        // Outside every panel, so it floats over the window rather than inside one of them.
+        self.help.show(ui.ctx());
     }
 }
 
