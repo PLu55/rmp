@@ -62,6 +62,9 @@ struct Session {
     /// `None` until a run starts. What makes a result knowable as stale once the document moves on.
     ran_with: Option<String>,
     running: Option<Running>,
+    /// A render in flight. Independent of `running`: a tab can be analysing the next excerpt while
+    /// the previous book is still being written out.
+    synthesising: Option<task::Synthesising>,
     /// The last finished run, if any.
     outcome: Option<Box<Outcome>>,
     log: Vec<String>,
@@ -78,6 +81,7 @@ impl Session {
             settings: SettingsDoc::default(),
             ran_with: None,
             running: None,
+            synthesising: None,
             outcome: None,
             log: Vec::new(),
             view: View::Summary,
@@ -98,6 +102,7 @@ impl Session {
             settings: self.settings.clone(),
             ran_with: None,
             running: None,
+            synthesising: None,
             outcome: None,
             log: Vec::new(),
             view: self.view,
@@ -116,12 +121,29 @@ impl Session {
         format!("{:02} {name}", self.number)
     }
 
+    /// Whether anything is happening in this tab that the window has to keep repainting for.
+    fn busy(&self) -> bool {
+        self.running.is_some() || self.synthesising.is_some()
+    }
+
     /// Drain the worker and fold its messages into this tab's state.
     ///
     /// Called for every session each frame, not only the visible one: a tab analysing in the
     /// background still has to drain its channel, or its log and its result appear all at once at
     /// the moment you switch to it and the tab looks frozen until then.
     fn pump(&mut self) {
+        if let Some(synth) = &mut self.synthesising {
+            for update in synth.drain() {
+                self.log.push(match update {
+                    task::SynthUpdate::Done(r) => describe_render(&r),
+                    task::SynthUpdate::Failed(e) => format!("synthesis failed: {e}"),
+                });
+            }
+            if synth.finished() {
+                self.synthesising = None;
+            }
+        }
+
         let Some(run) = &mut self.running else { return };
         for update in run.drain() {
             match update {
@@ -177,7 +199,40 @@ impl Session {
                     }
                 }
             }
+
+            match &self.synthesising {
+                Some(_) => {
+                    ui.spinner();
+                    ui.label("rendering…");
+                }
+                None => {
+                    // Nothing to render until a run has produced something: an empty book with no
+                    // residual would write a file of silence.
+                    let book = self.outcome.as_ref().map(|o| &o.analysis.book);
+                    let ready =
+                        book.is_some_and(|b| !b.is_empty() || b.residual.is_some());
+                    if ui
+                        .add_enabled(ready, egui::Button::new("Synthesize"))
+                        .on_disabled_hover_text("analyse something first")
+                        .on_hover_text("render this book back to a soundfile")
+                        .clicked()
+                    {
+                        self.start_synthesis();
+                    }
+                }
+            }
         });
+    }
+
+    fn start_synthesis(&mut self) {
+        let Some(outcome) = &self.outcome else { return };
+        let Some(output) = pick_audio_save(&self.default_render_name()) else { return };
+        // Cloned rather than borrowed: the render outlives this frame on a thread of its own, and
+        // the tab stays live meanwhile — you can edit its settings, or start the next analysis.
+        self.synthesising = Some(task::spawn_synthesis(task::SynthJob {
+            book: outcome.analysis.book.clone(),
+            output,
+        }));
     }
 
     fn start_run(&mut self) {
@@ -212,6 +267,18 @@ impl Session {
             .file_stem()
             .map_or_else(|| "settings".to_string(), |s| s.to_string_lossy().into_owned());
         format!("{stem}-{:02}.toml", self.number)
+    }
+
+    /// The file name Synthesize proposes: `<audio file, less its extension>-<tab number>.wav`.
+    ///
+    /// The same scheme as the settings document, and for the same reason — two tabs on one
+    /// soundfile must not propose one output file.
+    fn default_render_name(&self) -> String {
+        let stem = self
+            .input
+            .file_stem()
+            .map_or_else(|| "render".to_string(), |s| s.to_string_lossy().into_owned());
+        format!("{stem}-{:02}.wav", self.number)
     }
 
     /// Whether the settings panel has moved on from what the displayed results came from.
@@ -430,8 +497,9 @@ impl eframe::App for RmpApp {
         }
         // A run reports only once per window, which can be minutes apart, so the repaint has to be
         // asked for rather than waited on: without this the window sleeps and the log arrives late.
-        // Asked for if *any* tab is running, since a hidden tab still drives its strip spinner.
-        if self.sessions.iter().any(|s| s.running.is_some()) {
+        // Asked for if *any* tab is busy, since a hidden tab still drives its strip spinner — and
+        // a render that finished would otherwise sit unreported until the mouse moved.
+        if self.sessions.iter().any(Session::busy) {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -494,9 +562,9 @@ impl RmpApp {
                         if ui.selectable_label(i == self.active, s.title()).clicked() {
                             action = Some(Action::Select(i));
                         }
-                        // A background run is visible without switching to it, and so are unsaved
+                        // Background work is visible without switching to it, and so are unsaved
                         // settings — both are reasons to come back to a tab you are not looking at.
-                        if s.running.is_some() {
+                        if s.busy() {
                             ui.spinner();
                         }
                         if s.settings.modified() {
@@ -596,6 +664,16 @@ fn pick_file() -> Option<PathBuf> {
     rfd::FileDialog::new().add_filter("audio", &["wav", "aiff", "aif", "flac"]).pick_file()
 }
 
+/// Where to write a render. No directory is suggested: unlike a settings document, which belongs
+/// beside the others, a render is an output and the file dialog's own last-used place is as good a
+/// guess as any.
+fn pick_audio_save(name: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("soundfile", &["wav", "aiff", "flac"])
+        .set_file_name(name)
+        .save_file()
+}
+
 fn pick_settings() -> Option<PathBuf> {
     rfd::FileDialog::new().add_filter("settings", &["toml"]).pick_file()
 }
@@ -611,6 +689,28 @@ fn pick_settings_save(current: Option<&std::path::Path>, name: &str) -> Option<P
         d = d.set_directory(dir);
     }
     d.save_file()
+}
+
+/// What a finished render did. The peaks are the part worth reading: the residual's is where a
+/// stochastic model is weakest, and `clipped` is the only thing here that is a fault.
+fn describe_render(r: &rmp_synthesis::RenderReport) -> String {
+    let kinds: Vec<String> = r.atoms.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    let mut line = format!(
+        "rendered {:.2} s ({}), peak {:.1} dBFS",
+        r.samples_written as f64 / r.sample_rate,
+        if kinds.is_empty() { "residual only".to_string() } else { kinds.join(", ") },
+        rmp_core::signal::db_fs(r.mixed_peak as f64),
+    );
+    if r.residual_samples.is_some() {
+        line.push_str(&format!(
+            "; residual peak {:.1} dBFS",
+            rmp_core::signal::db_fs(r.residual_peak as f64)
+        ));
+    }
+    if r.clipped_samples > 0 {
+        line.push_str(&format!(" — {} samples clipped", r.clipped_samples));
+    }
+    line
 }
 
 /// One line of log for a progress message.
@@ -855,6 +955,45 @@ mod tests {
         // Nothing to derive from at all still produces a usable name rather than ".toml".
         app.sessions[0].input = PathBuf::from("/");
         assert_eq!(app.sessions[0].default_settings_name(), "settings-01.toml");
+    }
+
+    #[test]
+    fn synthesize_proposes_a_name_on_the_same_scheme_as_the_settings() {
+        let app = with(&["/a/b/chopin-nocturne-2.wav", "/a/zyklus.wav"]);
+        assert_eq!(app.sessions[0].default_render_name(), "chopin-nocturne-2-01.wav");
+        assert_eq!(app.sessions[1].default_render_name(), "zyklus-02.wav");
+        // Same stem, same number, different extension — two tabs never collide on either.
+        assert_eq!(
+            app.sessions[0].default_settings_name().trim_end_matches("toml"),
+            app.sessions[0].default_render_name().trim_end_matches("wav")
+        );
+    }
+
+    /// A tab is "busy" for the repaint and the strip spinner whether it is analysing or rendering.
+    /// Missing the render half would leave a finished one unreported until the mouse moved.
+    #[test]
+    fn a_tab_is_busy_while_either_kind_of_work_is_in_flight() {
+        let mut app = with(&["a.wav"]);
+        let s = &mut app.sessions[0];
+        assert!(!s.busy());
+
+        s.synthesising = Some(task::spawn_synthesis(task::SynthJob {
+            book: rmp_core::book::Book::new(1.0, 48_000.0),
+            output: std::env::temp_dir().join("rmp-gui-busy-test.wav"),
+        }));
+        assert!(s.busy(), "a render in flight counts");
+
+        // Let it finish and be drained, as `pump` does each frame.
+        for _ in 0..200 {
+            s.pump();
+            if s.synthesising.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!s.busy(), "and stops counting once it is done");
+        assert_eq!(s.log.len(), 1, "exactly one line, whatever the outcome: {:?}", s.log);
+        std::fs::remove_file(std::env::temp_dir().join("rmp-gui-busy-test.wav")).ok();
     }
 
     /// The tab you were looking at is the tab you are still looking at.

@@ -326,6 +326,14 @@ writes its formulas, and a help window of missing-glyph boxes where the operator
 worse than none. Appended rather than prepended, so it fills gaps and changes nothing that already
 rendered.
 
+**Synthesize** renders the tab's book back to a soundfile, greyed out until there is one to render
+— a book with neither atoms nor a residual would write a file of silence. It runs on a thread of
+its own like the analysis, though for a different reason: it has no stages to report and no useful
+cancellation (8 s of audio renders in ~0.22 s), but "usually fast" is not "always fast", and a
+window that freezes for a second reads as a window that has crashed. The residual is rendered when
+the book carries one, decided in `task` rather than left to `RenderRequest::residual_source` — both
+skip it, but only one can say in the log that it did.
+
 Save as proposes `<audio file, less its extension>-<tab number>.toml`, derived every time rather
 than only for a document with no file yet. The tab number in it is the point: duplicating a tab
 copies the settings *and the file they came from*, so two tabs comparing one setting on one

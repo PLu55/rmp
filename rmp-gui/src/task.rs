@@ -232,6 +232,73 @@ impl Reporter for Forward<'_> {
     }
 }
 
+/// Rendering a finished book back to a soundfile.
+///
+/// A far smaller thing than [`spawn`]: synthesis has no stages worth reporting and no meaningful
+/// cancellation — 8 s of audio renders in about 0.22 s — so there is one message and it is the
+/// last. It still runs off the UI thread, because "usually fast" is not "always fast": a long book
+/// is thousands of atoms and a second or two, and a window that freezes for a second reads as a
+/// window that has crashed.
+pub struct SynthJob {
+    pub book: rmp_core::book::Book,
+    pub output: PathBuf,
+}
+
+pub enum SynthUpdate {
+    Done(Box<rmp_synthesis::RenderReport>),
+    Failed(String),
+}
+
+/// A render in flight.
+pub struct Synthesising {
+    updates: mpsc::Receiver<SynthUpdate>,
+    finished: bool,
+}
+
+impl Synthesising {
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn drain(&mut self) -> Vec<SynthUpdate> {
+        let mut out = Vec::new();
+        while let Ok(u) = self.updates.try_recv() {
+            self.finished = true;
+            out.push(u);
+        }
+        out
+    }
+}
+
+pub fn spawn_synthesis(job: SynthJob) -> Synthesising {
+    let (tx, updates) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("rmp-synthesis".into())
+        .spawn(move || {
+            // The residual is rendered when the book carries one. Asking for it unconditionally is
+            // safe — `RenderRequest::residual_source` finds nothing and renders nothing — but then
+            // a book analysed without `[residual] enabled` would silently produce atoms only, with
+            // the report giving no hint that anything was skipped. Saying so is the point.
+            let has_residual = job.book.residual.is_some();
+            let request = rmp_synthesis::RenderRequest {
+                book: rmp_synthesis::BookInput::Full(job.book),
+                residual_book: None,
+                atoms: true,
+                residual: has_residual,
+                output: job.output,
+                config: rmp_synthesis::RenderConfig::default(),
+            };
+            let msg = match rmp_synthesis::render_to_file(&request) {
+                Ok(r) => SynthUpdate::Done(Box::new(r)),
+                Err(e) => SynthUpdate::Failed(e.to_string()),
+            };
+            tx.send(msg).ok();
+        })
+        .expect("spawning the synthesis thread");
+
+    Synthesising { updates, finished: false }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
