@@ -281,9 +281,11 @@ re-runs `Config::from_toml` + `Config::validate` on every keystroke. A widget pe
 enumerate every setting a second time and go stale the day one is added — the new knob simply
 unreachable, with nothing failing to say so. It also means what is saved is what was *edited*, so
 comments and ordering survive a load-edit-save round trip, where re-serialising the parsed `Config`
-would quietly rewrite a hand-annotated file. `DEFAULT_CONFIG_HEADER` moved into `rmp_core::config`
-for the same reason the pipeline did: `rmp --write-config` prints it and the GUI seeds its editor
-with it, and two copies would be two manuals.
+would quietly rewrite a hand-annotated file. A new tab starts on the settings alone, with no
+commentary: `DEFAULT_CONFIG_HEADER` is the *command line's* answer to "what does this knob do",
+having nowhere else to put one, and the GUI's is `MANUAL.md` in a window. It lives in
+`rmp_core::config` all the same, because what it documents is `Config`'s TOML form and adding a
+setting should be an edit to the same file as describing it.
 
 **The help window is `MANUAL.md`, embedded and split, not a summary of it.** `help::parse` cuts the
 file at its `##` and `###` headings, and because the manual titles its subsections with the setting

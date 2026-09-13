@@ -20,7 +20,7 @@
 //! press Analyse: [`SettingsDoc::status`] is recomputed on every edit, through the same
 //! `from_toml` + `validate` pair the CLI runs.
 
-use rmp_core::config::{Config, DEFAULT_CONFIG_HEADER};
+use rmp_core::config::Config;
 use std::path::{Path, PathBuf};
 
 /// The settings of one tab.
@@ -41,12 +41,15 @@ pub struct SettingsDoc {
 }
 
 impl Default for SettingsDoc {
-    /// The commented default document, the same text `rmp --write-config` prints.
+    /// The default settings, and nothing else: the values, with no commentary around them.
     ///
-    /// The comments are the point: in a text editor they are the manual, sitting beside the knob
-    /// they describe.
+    /// `rmp --write-config` prints the same settings wrapped in `DEFAULT_CONFIG_HEADER`, a hundred
+    /// lines explaining every knob, because a command line has nowhere else to put them. This
+    /// window does: the `?` beside the panel opens `MANUAL.md`, which says more and says it better.
+    /// Repeating a condensed version of it above every document would make the thing being edited
+    /// mostly prose, and would put two explanations on screen that have to agree.
     fn default() -> Self {
-        Self::from_text(format!("{DEFAULT_CONFIG_HEADER}{}", Config::default().to_toml()), None)
+        Self::from_text(Config::default().to_toml(), None)
     }
 }
 
@@ -142,13 +145,22 @@ mod tests {
         p
     }
 
+    /// A new tab starts on the settings alone. The explanations live in the help window, which is
+    /// the whole reason they are not repeated here.
     #[test]
-    fn the_default_document_is_what_write_config_prints_and_it_parses() {
+    fn the_default_document_is_settings_only_with_no_commentary() {
         let d = SettingsDoc::default();
-        assert!(d.text.starts_with(DEFAULT_CONFIG_HEADER), "the commented preamble is the manual");
         assert!(d.status().is_ok(), "the default document must be usable: {:?}", d.status().err());
         assert!(!d.modified());
         assert!(d.path().is_none());
+
+        let commented: Vec<&str> =
+            d.text.lines().filter(|l| l.trim_start().starts_with('#')).collect();
+        assert!(commented.is_empty(), "a fresh document carries comments: {commented:?}");
+
+        // Still the real settings, not an empty file.
+        assert_eq!(d.text, rmp_core::config::Config::default().to_toml());
+        assert!(d.text.contains("[dictionary.fof]") && d.text.contains("max_atoms"));
     }
 
     #[test]

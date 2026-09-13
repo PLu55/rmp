@@ -683,11 +683,13 @@ impl Config {
     }
 }
 
-/// The commented preamble of a default settings document.
+/// The commented preamble of a default settings document, printed by `rmp --write-config`.
 ///
-/// Lives here rather than in the CLI because it documents the settings *document*, and both front
-/// ends hand the same text to a user: `rmp --write-config` prints it, and the GUI seeds a new tab's
-/// editor with it. Two copies would be two manuals.
+/// Lives here rather than in the CLI, its only caller, because what it documents is [`Config`]'s
+/// TOML form — so adding a setting and describing it are edits to the same file, which is the only
+/// arrangement where the description reliably keeps up. It is the command line's answer to "what
+/// does this knob do", having nowhere else to put one; the GUI's is `MANUAL.md` in a window, and a
+/// new document there carries the settings alone.
 pub const DEFAULT_CONFIG_HEADER: &str = "\
 # rmp analysis settings.
 #
