@@ -30,6 +30,10 @@ struct Entry {
 
 pub struct Help {
     pub open: bool,
+    /// Set by [`Help::open_or_raise`], consumed by the next [`Help::show`]. A flag rather than a
+    /// direct call because the commands have to be sent *to the help viewport*, which only exists
+    /// inside `show`.
+    raise: bool,
     entries: Vec<Entry>,
     /// Index into `entries`, or `None` for the manual's preamble.
     selected: Option<usize>,
@@ -41,6 +45,7 @@ impl Default for Help {
     fn default() -> Self {
         Self {
             open: false,
+            raise: false,
             entries: parse(MANUAL),
             selected: None,
             filter: String::new(),
@@ -50,6 +55,15 @@ impl Default for Help {
 }
 
 impl Help {
+    /// Show the manual, and bring it forward whether or not it was already up.
+    ///
+    /// Both halves matter: a window that is open but buried behind the main one is, from where the
+    /// user is sitting, not open. Pressing `?` has to do something either way.
+    pub fn open_or_raise(&mut self) {
+        self.open = true;
+        self.raise = true;
+    }
+
     /// Open the manual in a window of its own.
     ///
     /// A real OS window rather than an `egui::Window`, because the point of it is to be read
@@ -78,6 +92,21 @@ impl Help {
                 .with_inner_size([980.0, 720.0])
                 .with_min_inner_size([560.0, 360.0]),
             |ui, _class| {
+                if std::mem::take(&mut self.raise) {
+                    let ctx = ui.ctx();
+                    // Two commands, because no one of them works everywhere. `Focus` raises and
+                    // takes input focus on X11, macOS and Windows, and is documented as having no
+                    // effect on Wayland — winit's Wayland `focus_window` is an empty function.
+                    // `RequestUserAttention` is the one that reaches a Wayland compositor at all:
+                    // winit implements it there through xdg-activation, which is the protocol a
+                    // compositor uses to activate a window, so KWin and Mutter generally raise it.
+                    // Where `Focus` does work the attention request is reset the moment focus
+                    // arrives, so the two do not stack into a flashing taskbar entry.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Informational,
+                    ));
+                }
                 egui::CentralPanel::default().show(ui, |ui| self.contents(ui));
                 // The OS close button. Without this the window shuts and the `?` cannot reopen it,
                 // because `open` would still say it is up.
@@ -303,6 +332,22 @@ mod tests {
         );
         assert!(shown.iter().any(|e| e.level == 2 && e.label.contains("[blocks]")), "its section");
         assert!(shown.len() < h.entries.len(), "and not simply everything");
+    }
+
+    /// Pressing `?` on an already-open window must still ask for a raise. The tempting
+    /// "optimisation" — only act when it is closed — is exactly the bug this is about: the window
+    /// is open, buried behind the main one, and the button appears to do nothing.
+    #[test]
+    fn asking_for_help_again_still_asks_for_a_raise() {
+        let mut h = Help::default();
+        h.open_or_raise();
+        assert!(h.open && h.raise);
+
+        // As `show` does once it has sent the commands.
+        h.raise = false;
+
+        h.open_or_raise();
+        assert!(h.raise, "a second press must raise the window that is already open");
     }
 
     #[test]

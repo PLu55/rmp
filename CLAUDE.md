@@ -295,6 +295,13 @@ window with no code change, which is the only arrangement that cannot drift. Two
 has to get right: `#` inside a fenced block is a shell comment and not a heading (the manual has
 such a fence), and a `##` runs past its own `###` children so selecting a section shows it whole.
 
+Pressing `?` raises the help window whether or not it was already open — a window buried behind the
+main one is, from where the user sits, not open. It takes two viewport commands, because neither
+works everywhere: `Focus` raises on X11, macOS and Windows and is a literal no-op on Wayland
+(winit's Wayland `focus_window` is an empty function), while `RequestUserAttention` is the one that
+reaches a Wayland compositor at all, through xdg-activation. Where `Focus` works the attention
+request is reset the moment focus arrives, so the two do not stack.
+
 The help is a real OS window, not an `egui::Window`, because the point of it is to be read *beside*
 the settings it explains — an in-app window is trapped inside the main one, covering the panel you
 opened it to understand. `show_viewport_immediate`, not `_deferred`: a deferred viewport's callback

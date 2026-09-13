@@ -465,7 +465,7 @@ impl eframe::App for RmpApp {
             session.log.push(format!("settings: {e}"));
         }
         if out.open_help {
-            self.help.open = true;
+            self.help.open_or_raise();
         }
         // Outside every panel: it is a window of its own, not part of this one's layout.
         self.help.show(ui);
