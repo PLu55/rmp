@@ -84,6 +84,10 @@ impl Session {
     /// The A/B case: one file, one setting changed. Copying the log or the outcome would attach a
     /// book to settings that did not produce it, which is the one thing a comparison view must not
     /// do.
+    fn is_empty(&self) -> bool {
+        self.input.is_none()
+    }
+
     fn duplicate(&self, number: u32) -> Self {
         Self {
             number,
@@ -140,18 +144,17 @@ impl Session {
 
     fn input_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Open…").clicked()
-                && let Some(p) = rfd::FileDialog::new()
-                    .add_filter("audio", &["wav", "aiff", "aif", "flac"])
-                    .pick_file()
-            {
-                self.input = Some(p);
+            // Reported, not chosen. A tab's file is fixed once it has one — see `RmpApp::open`.
+            match self.input.as_deref() {
+                Some(p) => {
+                    ui.label(p.display().to_string()).on_hover_text(
+                        "a tab's file cannot be changed; Open… puts another file in another tab",
+                    );
+                }
+                None => {
+                    ui.weak("no input — use Open… above");
+                }
             }
-            ui.label(
-                self.input
-                    .as_deref()
-                    .map_or_else(|| "no input".to_string(), |p| p.display().to_string()),
-            );
 
             ui.separator();
             ui.label("start");
@@ -281,6 +284,7 @@ enum Action {
     Close(usize),
     New,
     Duplicate,
+    Open(PathBuf),
 }
 
 pub struct RmpApp {
@@ -356,11 +360,26 @@ impl RmpApp {
                 }
 
                 ui.separator();
-                if ui.button("+").on_hover_text("a new tab, at the default settings").clicked() {
+                if ui
+                    .button("Open…")
+                    .on_hover_text("into this tab if it has no file yet, otherwise into a new one")
+                    .clicked()
+                    && let Some(p) = rfd::FileDialog::new()
+                        .add_filter("audio", &["wav", "aiff", "aif", "flac"])
+                        .pick_file()
+                {
+                    action = Some(Action::Open(p));
+                }
+                if ui.button("+").on_hover_text("a new empty tab, at the default settings").clicked()
+                {
                     action = Some(Action::New);
                 }
+                // Meaningless on a tab with no file: it would just be a second `+`.
                 if ui
-                    .button("Duplicate")
+                    .add_enabled(
+                        !self.sessions[self.active].is_empty(),
+                        egui::Button::new("Duplicate"),
+                    )
                     .on_hover_text("this tab's file and settings, without its results")
                     .clicked()
                 {
@@ -376,8 +395,28 @@ impl RmpApp {
             Some(Action::Duplicate) => {
                 self.push(self.sessions[self.active].duplicate(self.free_number()))
             }
+            Some(Action::Open(p)) => self.open(p),
             None => {}
         }
+    }
+
+    /// Put a file in the active tab if it has none, and in a new tab otherwise.
+    ///
+    /// This is the only place a `Session`'s `input` is ever written after construction, and it
+    /// writes only into a tab that has none — which is what makes "a tab's file does not change"
+    /// structural rather than a rule the UI has to keep remembering.
+    ///
+    /// It has to be that way round: a tab's results, log and title all describe one file, so
+    /// swapping the file underneath would leave a book and a log describing a file the tab no
+    /// longer names, and would rename the tab while it still showed the old file's results.
+    ///
+    /// The new tab is a default one rather than a copy of the current tab, matching `+`. Carrying
+    /// settings over to a different file is `Duplicate`'s job, and it cannot be both.
+    fn open(&mut self, path: PathBuf) {
+        if !self.sessions[self.active].is_empty() {
+            self.push(Session::new(self.free_number()));
+        }
+        self.sessions[self.active].input = Some(path);
     }
 
     /// The lowest number no open tab is using.
@@ -547,6 +586,71 @@ mod tests {
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(app.sessions[0].title(), "01 (no input)");
         assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn open_fills_the_active_tab_when_it_has_no_file() {
+        let mut app = with(&[None]);
+        app.open(PathBuf::from("/a/piano.wav"));
+        assert_eq!(app.sessions.len(), 1, "an empty tab is used, not added to");
+        assert_eq!(app.sessions[0].title(), "01 piano.wav");
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn open_makes_a_new_tab_when_the_active_one_already_has_a_file() {
+        let mut app = with(&[Some("/a/piano.wav")]);
+        app.open(PathBuf::from("/a/zyklus.wav"));
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions[0].title(), "01 piano.wav", "the first tab is untouched");
+        assert_eq!(app.sessions[1].title(), "02 zyklus.wav");
+        assert_eq!(app.active, 1, "the new tab is selected");
+    }
+
+    /// The point of the rule: a tab's results, log and title describe one file, and there is no
+    /// path through the UI that can swap the file out from under them.
+    #[test]
+    fn a_tabs_file_never_changes_once_it_has_one() {
+        let mut app = with(&[Some("/a/piano.wav")]);
+        app.sessions[0].log.push("analysed piano".into());
+
+        app.open(PathBuf::from("/a/zyklus.wav"));
+        app.active = 0;
+        app.open(PathBuf::from("/a/drums.wav"));
+
+        assert_eq!(app.sessions[0].title(), "01 piano.wav");
+        assert_eq!(app.sessions[0].log, ["analysed piano"], "its log still describes its own file");
+        let mut titles: Vec<String> = app.sessions.iter().map(|s| s.title()).collect();
+        titles.sort();
+        assert_eq!(titles, ["01 piano.wav", "02 zyklus.wav", "03 drums.wav"]);
+    }
+
+    /// A tab opened by `+` is empty, so the next Open lands in it rather than making a fourth.
+    #[test]
+    fn open_lands_in_a_tab_that_plus_just_made() {
+        let mut app = with(&[Some("/a/piano.wav")]);
+        app.push(Session::new(app.free_number()));
+        assert!(app.sessions[app.active].is_empty());
+
+        app.open(PathBuf::from("/a/zyklus.wav"));
+        assert_eq!(app.sessions.len(), 2, "the empty tab was filled, not skipped");
+        assert_eq!(app.sessions[1].title(), "02 zyklus.wav");
+    }
+
+    /// A tab Open creates is a default one, not a copy of whatever was selected. Carrying settings
+    /// to a different file is `Duplicate`'s job.
+    #[test]
+    fn a_tab_that_open_creates_starts_from_the_defaults() {
+        let mut app = with(&[Some("/a/piano.wav")]);
+        app.sessions[0].config.pursuit.max_atoms = 4321;
+        app.sessions[0].residual_analysis = true;
+        app.sessions[0].start = "2.5".into();
+
+        app.open(PathBuf::from("/a/zyklus.wav"));
+        let new = &app.sessions[1];
+        assert_eq!(new.config.pursuit.max_atoms, Config::default().pursuit.max_atoms);
+        assert!(!new.residual_analysis);
+        assert!(new.start.is_empty());
     }
 
     /// A duplicate carries the inputs and the settings and nothing that came out of them: a book

@@ -152,8 +152,13 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   shell, so everything worth an oracle lives in `stats`/`tfmap` where `cargo test` reaches it.
 - **`rmp-gui`** — the eframe front end. The window is a strip of tabs, each an independent
   analysis: its own input file, settings, run, log and results, titled `NN filename.wav` with `NN`
-  the lowest two-digit number no open tab is using. `task` runs a decomposition off the UI thread;
-  the panels inside a tab are stubs naming the `rmp-core` call each is a view of.
+  the lowest two-digit number no open tab is using. **A tab's file is fixed once it has one** —
+  `RmpApp::open` is the only writer of `Session::input` after construction and it writes only into
+  a tab that has none, so Open fills the active tab when it is empty and makes a new one otherwise.
+  That is structural rather than a UI rule to remember, and the reason is that a tab's results, log
+  and title all describe one file: swapping it underneath would leave a book describing a file the
+  tab no longer names. `task` runs a decomposition off the UI thread; the panels inside a tab are
+  stubs naming the `rmp-core` call each is a view of.
 
 ### Invariants that are not locally obvious
 
