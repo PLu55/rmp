@@ -49,7 +49,10 @@ struct Session {
     /// Unique among the open tabs, and the first half of the title. Not an index — closing a tab
     /// does not renumber the others.
     number: u32,
-    input: Option<PathBuf>,
+    /// The file this tab is the analysis of. Not an `Option` and never written after construction:
+    /// a tab exists because a file was opened, and its results, log and title all describe that one
+    /// file. Swapping it would leave a book describing a file the tab no longer names.
+    input: PathBuf,
     start: String,
     duration: String,
     residual_analysis: bool,
@@ -64,10 +67,10 @@ struct Session {
 }
 
 impl Session {
-    fn new(number: u32) -> Self {
+    fn new(number: u32, input: PathBuf) -> Self {
         Self {
             number,
-            input: None,
+            input,
             start: String::new(),
             duration: String::new(),
             residual_analysis: false,
@@ -84,10 +87,6 @@ impl Session {
     /// The A/B case: one file, one setting changed. Copying the log or the outcome would attach a
     /// book to settings that did not produce it, which is the one thing a comparison view must not
     /// do.
-    fn is_empty(&self) -> bool {
-        self.input.is_none()
-    }
-
     fn duplicate(&self, number: u32) -> Self {
         Self {
             number,
@@ -103,14 +102,15 @@ impl Session {
         }
     }
 
-    /// `NN filename.wav`, derived every frame rather than cached, so choosing a file in a tab that had
-    /// none renames it at once and keeps its number.
+    /// `NN filename.wav`.
+    ///
+    /// The fallback is the whole path, for the paths that have no final component at all. A file
+    /// chosen from a dialog always has one, so it is a formality rather than a case to plan around.
     fn title(&self) -> String {
         let name = self
             .input
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map_or_else(|| "(no input)".to_string(), |n| n.to_string_lossy().into_owned());
+            .file_name()
+            .map_or_else(|| self.input.display().to_string(), |n| n.to_string_lossy().into_owned());
         format!("{:02} {name}", self.number)
     }
 
@@ -144,17 +144,9 @@ impl Session {
 
     fn input_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            // Reported, not chosen. A tab's file is fixed once it has one — see `RmpApp::open`.
-            match self.input.as_deref() {
-                Some(p) => {
-                    ui.label(p.display().to_string()).on_hover_text(
-                        "a tab's file cannot be changed; Open… puts another file in another tab",
-                    );
-                }
-                None => {
-                    ui.weak("no input — use Open… above");
-                }
-            }
+            // Reported, not chosen: a tab's file is what the tab is.
+            ui.label(self.input.display().to_string())
+                .on_hover_text("a tab's file cannot be changed; Open… puts another file in its own tab");
 
             ui.separator();
             ui.label("start");
@@ -178,7 +170,7 @@ impl Session {
                     ui.label(if stopping { "stopping…" } else { "analysing…" });
                 }
                 None => {
-                    if ui.add_enabled(self.input.is_some(), egui::Button::new("Analyse")).clicked() {
+                    if ui.button("Analyse").clicked() {
                         self.start_run();
                     }
                 }
@@ -187,7 +179,7 @@ impl Session {
     }
 
     fn start_run(&mut self) {
-        let Some(input) = self.input.clone() else { return };
+        let input = self.input.clone();
         self.log.clear();
         self.outcome = None;
         self.running = Some(task::spawn(task::Job {
@@ -227,7 +219,7 @@ impl Session {
 
     fn results(&mut self, ui: &mut egui::Ui) {
         let Some(outcome) = &self.outcome else {
-            ui.centered_and_justified(|ui| ui.label("Open a soundfile and analyse it."));
+            ui.centered_and_justified(|ui| ui.label("Press Analyse."));
             return;
         };
 
@@ -282,20 +274,20 @@ impl Session {
 enum Action {
     Select(usize),
     Close(usize),
-    New,
     Duplicate,
     Open(PathBuf),
 }
 
+/// The window.
+///
+/// Starts with no tabs, and the default is exactly that: a tab is the analysis of a file, so there
+/// is nothing to show one of until a file has been opened, and nothing to seed the list with.
+#[derive(Default)]
 pub struct RmpApp {
     sessions: Vec<Session>,
+    /// Index into `sessions`. Meaningless while that is empty, which is the one time nothing
+    /// indexes it.
     active: usize,
-}
-
-impl Default for RmpApp {
-    fn default() -> Self {
-        Self { sessions: vec![Session::new(1)], active: 0 }
-    }
 }
 
 impl eframe::App for RmpApp {
@@ -312,6 +304,29 @@ impl eframe::App for RmpApp {
         }
 
         egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
+
+        // No tabs: the window a fresh start looks like, and the one it returns to when the last
+        // tab is closed. The per-tab panels are not drawn at all rather than drawn empty, because
+        // there is no session for them to be about.
+        if self.sessions.is_empty() {
+            let mut opened = None;
+            egui::CentralPanel::default().show(ui, |ui| {
+                // Not `centered_and_justified`: that justifies the *widget* too, and a button
+                // stretched over the whole panel reads as a broken background rather than a button.
+                ui.add_space(ui.available_height() * 0.4);
+                ui.vertical_centered(|ui| {
+                    if ui.button("Open a soundfile…").clicked() {
+                        opened = pick_file();
+                    }
+                    ui.add_space(8.0);
+                    ui.weak("each file gets a tab of its own");
+                });
+            });
+            if let Some(p) = opened {
+                self.open(p);
+            }
+            return;
+        }
 
         // Panel ids are shared across tabs on purpose: a panel's width and height are window
         // chrome, and they should not jump when you switch. Widget state inside them is not — see
@@ -359,27 +374,19 @@ impl RmpApp {
                     });
                 }
 
-                ui.separator();
+                if !self.sessions.is_empty() {
+                    ui.separator();
+                }
                 if ui
                     .button("Open…")
-                    .on_hover_text("into this tab if it has no file yet, otherwise into a new one")
+                    .on_hover_text("a soundfile, in a tab of its own")
                     .clicked()
-                    && let Some(p) = rfd::FileDialog::new()
-                        .add_filter("audio", &["wav", "aiff", "aif", "flac"])
-                        .pick_file()
+                    && let Some(p) = pick_file()
                 {
                     action = Some(Action::Open(p));
                 }
-                if ui.button("+").on_hover_text("a new empty tab, at the default settings").clicked()
-                {
-                    action = Some(Action::New);
-                }
-                // Meaningless on a tab with no file: it would just be a second `+`.
                 if ui
-                    .add_enabled(
-                        !self.sessions[self.active].is_empty(),
-                        egui::Button::new("Duplicate"),
-                    )
+                    .add_enabled(!self.sessions.is_empty(), egui::Button::new("Duplicate"))
                     .on_hover_text("this tab's file and settings, without its results")
                     .clicked()
                 {
@@ -391,7 +398,6 @@ impl RmpApp {
         match action {
             Some(Action::Select(i)) => self.active = i,
             Some(Action::Close(i)) => self.close(i),
-            Some(Action::New) => self.push(Session::new(self.free_number())),
             Some(Action::Duplicate) => {
                 self.push(self.sessions[self.active].duplicate(self.free_number()))
             }
@@ -400,23 +406,17 @@ impl RmpApp {
         }
     }
 
-    /// Put a file in the active tab if it has none, and in a new tab otherwise.
+    /// Open a file, in a tab of its own. The only way a tab comes into existence.
     ///
-    /// This is the only place a `Session`'s `input` is ever written after construction, and it
-    /// writes only into a tab that has none — which is what makes "a tab's file does not change"
-    /// structural rather than a rule the UI has to keep remembering.
+    /// A tab is never empty and its file never changes, and both of those are facts about
+    /// `Session` rather than rules the UI has to keep remembering: `input` is a `PathBuf` set at
+    /// construction, so there is no state for an empty tab to be in and nothing to write a second
+    /// file into.
     ///
-    /// It has to be that way round: a tab's results, log and title all describe one file, so
-    /// swapping the file underneath would leave a book and a log describing a file the tab no
-    /// longer names, and would rename the tab while it still showed the old file's results.
-    ///
-    /// The new tab is a default one rather than a copy of the current tab, matching `+`. Carrying
-    /// settings over to a different file is `Duplicate`'s job, and it cannot be both.
+    /// The new tab starts from the defaults. Carrying settings across to a different file is
+    /// `Duplicate`'s job, and one button cannot be both without becoming unpredictable.
     fn open(&mut self, path: PathBuf) {
-        if !self.sessions[self.active].is_empty() {
-            self.push(Session::new(self.free_number()));
-        }
-        self.sessions[self.active].input = Some(path);
+        self.push(Session::new(self.free_number(), path));
     }
 
     /// The lowest number no open tab is using.
@@ -435,8 +435,9 @@ impl RmpApp {
     /// Close a tab, cancelling whatever it was running.
     ///
     /// The cancel is `Running`'s `Drop`, not anything written here, so it cannot be forgotten at
-    /// some future call site. Closing the last tab leaves a fresh one rather than an empty window:
-    /// an empty state would exist for this one case alone.
+    /// some future call site. Closing the last tab leaves *no* tabs, and the window falls back to
+    /// the same empty state it starts in — a tab is the analysis of a file, so there is nothing to
+    /// show one of once the last file is closed.
     ///
     /// **Clamping `active` is not enough on its own.** Removing a tab *below* the active one shifts
     /// the rest down, so the same index now names a different tab — you close tab 1 of four with
@@ -444,16 +445,17 @@ impl RmpApp {
     /// shift first, and only then be clamped for the case where the active tab was itself the last.
     fn close(&mut self, i: usize) {
         self.sessions.remove(i);
-        if self.sessions.is_empty() {
-            self.sessions.push(Session::new(1));
-            self.active = 0;
-            return;
-        }
         if i < self.active {
             self.active -= 1;
         }
-        self.active = self.active.min(self.sessions.len() - 1);
+        // `saturating_sub` for the empty case, where `active` is not an index into anything.
+        self.active = self.active.min(self.sessions.len().saturating_sub(1));
     }
+}
+
+/// The one file dialog, shared by the tab strip and the empty window.
+fn pick_file() -> Option<PathBuf> {
+    rfd::FileDialog::new().add_filter("audio", &["wav", "aiff", "aif", "flac"]).pick_file()
 }
 
 /// One line of log for a progress message.
@@ -490,43 +492,87 @@ fn describe(p: &Progress) -> String {
 mod tests {
     use super::*;
 
-    fn with(paths: &[Option<&str>]) -> RmpApp {
-        let mut app = RmpApp { sessions: Vec::new(), active: 0 };
+    /// An app holding one tab per path, built the way the UI builds them.
+    fn with(paths: &[&str]) -> RmpApp {
+        let mut app = RmpApp::default();
         for p in paths {
-            let n = app.free_number();
-            let mut s = Session::new(n);
-            s.input = p.map(PathBuf::from);
-            app.sessions.push(s);
+            app.open(PathBuf::from(p));
         }
         app
     }
 
+    /// A tab exists because a file was opened, so there is nothing to show one of before that.
     #[test]
-    fn a_title_is_a_two_digit_number_then_the_file_name() {
-        let app = with(&[Some("/a/b/chopin-nocturne-2.wav"), None]);
-        assert_eq!(app.sessions[0].title(), "01 chopin-nocturne-2.wav");
-        assert_eq!(app.sessions[1].title(), "02 (no input)");
+    fn the_window_starts_with_no_tabs() {
+        let app = RmpApp::default();
+        assert!(app.sessions.is_empty());
     }
 
-    /// Choosing a file renames the tab but must not renumber it — the number is the tab's identity
-    /// for as long as it is open.
     #[test]
-    fn picking_a_file_renames_a_tab_without_renumbering_it() {
-        let mut app = with(&[None, None]);
-        assert_eq!(app.sessions[1].title(), "02 (no input)");
-        app.sessions[1].input = Some(PathBuf::from("zyklus.wav"));
+    fn a_title_is_a_two_digit_number_then_the_file_name() {
+        let app = with(&["/a/b/chopin-nocturne-2.wav", "zyklus.wav"]);
+        assert_eq!(app.sessions[0].title(), "01 chopin-nocturne-2.wav");
         assert_eq!(app.sessions[1].title(), "02 zyklus.wav");
+    }
+
+    /// Open is the only way a tab appears, and it always makes a new one — there is no empty tab
+    /// for it to land in, and it never touches the file of a tab that exists.
+    #[test]
+    fn open_always_makes_a_new_tab_and_selects_it() {
+        let mut app = RmpApp::default();
+
+        app.open(PathBuf::from("/a/piano.wav"));
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.active, 0);
+
+        app.open(PathBuf::from("/a/zyklus.wav"));
+        assert_eq!(app.sessions.len(), 2, "a second file is a second tab");
+        assert_eq!(app.active, 1, "the new tab is selected");
+        assert_eq!(app.sessions[0].title(), "01 piano.wav", "the first tab is untouched");
+    }
+
+    /// The rule behind it: a tab's results and log describe the file it was opened with, and
+    /// nothing can point them at another one.
+    #[test]
+    fn opening_more_files_never_disturbs_an_existing_tab() {
+        let mut app = with(&["/a/piano.wav"]);
+        app.sessions[0].log.push("analysed piano".into());
+
+        app.open(PathBuf::from("/a/zyklus.wav"));
+        app.active = 0;
+        app.open(PathBuf::from("/a/drums.wav"));
+
+        assert_eq!(app.sessions[0].title(), "01 piano.wav");
+        assert_eq!(app.sessions[0].log, ["analysed piano"], "its log still describes its own file");
+        let titles: Vec<String> = app.sessions.iter().map(|s| s.title()).collect();
+        assert_eq!(titles, ["01 piano.wav", "02 zyklus.wav", "03 drums.wav"]);
+    }
+
+    /// A tab Open creates is a default one, not a copy of whatever was selected. Carrying settings
+    /// to a different file is `Duplicate`'s job.
+    #[test]
+    fn a_tab_that_open_creates_starts_from_the_defaults() {
+        let mut app = with(&["/a/piano.wav"]);
+        app.sessions[0].config.pursuit.max_atoms = 4321;
+        app.sessions[0].residual_analysis = true;
+        app.sessions[0].start = "2.5".into();
+
+        app.open(PathBuf::from("/a/zyklus.wav"));
+        let new = &app.sessions[1];
+        assert_eq!(new.config.pursuit.max_atoms, Config::default().pursuit.max_atoms);
+        assert!(!new.residual_analysis);
+        assert!(new.start.is_empty());
     }
 
     /// Reuse is what keeps the number two digits: closing the middle tab frees 02, and the next
     /// new tab takes it rather than counting on to 04.
     #[test]
     fn a_closed_number_is_reused_by_the_next_tab() {
-        let mut app = with(&[Some("a.wav"), Some("b.wav"), Some("c.wav")]);
+        let mut app = with(&["a.wav", "b.wav", "c.wav"]);
         assert_eq!(app.free_number(), 4);
         app.close(1);
         assert_eq!(app.free_number(), 2);
-        app.push(Session::new(app.free_number()));
+        app.open(PathBuf::from("d.wav"));
         let mut got: Vec<u32> = app.sessions.iter().map(|s| s.number).collect();
         got.sort_unstable();
         assert_eq!(got, [1, 2, 3]);
@@ -534,10 +580,10 @@ mod tests {
 
     #[test]
     fn numbers_stay_unique_across_a_run_of_opens_and_closes() {
-        let mut app = with(&[None]);
+        let mut app = with(&["a.wav"]);
         for _ in 0..20 {
-            app.push(Session::new(app.free_number()));
-            app.push(Session::new(app.free_number()));
+            app.open(PathBuf::from("b.wav"));
+            app.open(PathBuf::from("c.wav"));
             app.close(0);
             let mut ns: Vec<u32> = app.sessions.iter().map(|s| s.number).collect();
             let before = ns.len();
@@ -554,7 +600,7 @@ mod tests {
     /// index-based assertion agrees with the bug.
     #[test]
     fn closing_another_tab_leaves_you_on_the_same_one() {
-        let mut app = with(&[None, None, None, None]); // 01 02 03 04
+        let mut app = with(&["a.wav", "b.wav", "c.wav", "d.wav"]); // 01 02 03 04
         app.active = 1;
         app.close(0); // a tab below the active one
         assert_eq!(app.sessions[app.active].number, 2, "the selection followed the shift");
@@ -567,7 +613,7 @@ mod tests {
     /// Closing the active tab selects its neighbour, and never runs off the end.
     #[test]
     fn closing_the_active_tab_keeps_the_index_in_bounds() {
-        let mut app = with(&[None, None, None]);
+        let mut app = with(&["a.wav", "b.wav", "c.wav"]);
         app.active = 2;
         app.close(2); // the last one
         assert_eq!(app.active, 1);
@@ -579,85 +625,24 @@ mod tests {
         assert_eq!(app.sessions[app.active].number, 2);
     }
 
+    /// Back to the window a fresh start shows, rather than to a blank tab.
     #[test]
-    fn closing_the_last_tab_leaves_a_fresh_one_rather_than_an_empty_window() {
-        let mut app = with(&[Some("a.wav")]);
+    fn closing_the_last_tab_leaves_no_tabs() {
+        let mut app = with(&["a.wav"]);
         app.close(0);
-        assert_eq!(app.sessions.len(), 1);
-        assert_eq!(app.sessions[0].title(), "01 (no input)");
+        assert!(app.sessions.is_empty());
+        // `active` is not an index into anything now, but it must not be left out of range for the
+        // next open either.
+        app.open(PathBuf::from("b.wav"));
         assert_eq!(app.active, 0);
-    }
-
-    #[test]
-    fn open_fills_the_active_tab_when_it_has_no_file() {
-        let mut app = with(&[None]);
-        app.open(PathBuf::from("/a/piano.wav"));
-        assert_eq!(app.sessions.len(), 1, "an empty tab is used, not added to");
-        assert_eq!(app.sessions[0].title(), "01 piano.wav");
-        assert_eq!(app.active, 0);
-    }
-
-    #[test]
-    fn open_makes_a_new_tab_when_the_active_one_already_has_a_file() {
-        let mut app = with(&[Some("/a/piano.wav")]);
-        app.open(PathBuf::from("/a/zyklus.wav"));
-        assert_eq!(app.sessions.len(), 2);
-        assert_eq!(app.sessions[0].title(), "01 piano.wav", "the first tab is untouched");
-        assert_eq!(app.sessions[1].title(), "02 zyklus.wav");
-        assert_eq!(app.active, 1, "the new tab is selected");
-    }
-
-    /// The point of the rule: a tab's results, log and title describe one file, and there is no
-    /// path through the UI that can swap the file out from under them.
-    #[test]
-    fn a_tabs_file_never_changes_once_it_has_one() {
-        let mut app = with(&[Some("/a/piano.wav")]);
-        app.sessions[0].log.push("analysed piano".into());
-
-        app.open(PathBuf::from("/a/zyklus.wav"));
-        app.active = 0;
-        app.open(PathBuf::from("/a/drums.wav"));
-
-        assert_eq!(app.sessions[0].title(), "01 piano.wav");
-        assert_eq!(app.sessions[0].log, ["analysed piano"], "its log still describes its own file");
-        let mut titles: Vec<String> = app.sessions.iter().map(|s| s.title()).collect();
-        titles.sort();
-        assert_eq!(titles, ["01 piano.wav", "02 zyklus.wav", "03 drums.wav"]);
-    }
-
-    /// A tab opened by `+` is empty, so the next Open lands in it rather than making a fourth.
-    #[test]
-    fn open_lands_in_a_tab_that_plus_just_made() {
-        let mut app = with(&[Some("/a/piano.wav")]);
-        app.push(Session::new(app.free_number()));
-        assert!(app.sessions[app.active].is_empty());
-
-        app.open(PathBuf::from("/a/zyklus.wav"));
-        assert_eq!(app.sessions.len(), 2, "the empty tab was filled, not skipped");
-        assert_eq!(app.sessions[1].title(), "02 zyklus.wav");
-    }
-
-    /// A tab Open creates is a default one, not a copy of whatever was selected. Carrying settings
-    /// to a different file is `Duplicate`'s job.
-    #[test]
-    fn a_tab_that_open_creates_starts_from_the_defaults() {
-        let mut app = with(&[Some("/a/piano.wav")]);
-        app.sessions[0].config.pursuit.max_atoms = 4321;
-        app.sessions[0].residual_analysis = true;
-        app.sessions[0].start = "2.5".into();
-
-        app.open(PathBuf::from("/a/zyklus.wav"));
-        let new = &app.sessions[1];
-        assert_eq!(new.config.pursuit.max_atoms, Config::default().pursuit.max_atoms);
-        assert!(!new.residual_analysis);
-        assert!(new.start.is_empty());
+        assert_eq!(app.sessions[app.active].title(), "01 b.wav");
     }
 
     /// A duplicate carries the inputs and the settings and nothing that came out of them: a book
     /// shown beside settings that did not produce it is the one thing a comparison view must not do.
     #[test]
     fn a_duplicate_carries_the_settings_but_not_the_results() {
-        let mut app = with(&[Some("a.wav")]);
+        let mut app = with(&["a.wav"]);
         app.sessions[0].start = "2.5".into();
         app.sessions[0].residual_analysis = true;
         app.sessions[0].config.pursuit.max_atoms = 4321;
