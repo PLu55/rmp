@@ -295,12 +295,22 @@ window with no code change, which is the only arrangement that cannot drift. Two
 has to get right: `#` inside a fenced block is a shell comment and not a heading (the manual has
 such a fence), and a `##` runs past its own `###` children so selecting a section shows it whole.
 
-Pressing `?` raises the help window whether or not it was already open — a window buried behind the
-main one is, from where the user sits, not open. It takes two viewport commands, because neither
-works everywhere: `Focus` raises on X11, macOS and Windows and is a literal no-op on Wayland
-(winit's Wayland `focus_window` is an empty function), while `RequestUserAttention` is the one that
-reaches a Wayland compositor at all, through xdg-activation. Where `Focus` works the attention
-request is reset the moment focus arrives, so the two do not stack.
+**Raising the help window takes a remap on Wayland, and that is not a choice.** winit 0.30
+implements none of the levers there: `focus_window` is an empty function, `set_visible` says "Not
+possible on Wayland", `set_window_level` is empty, and `request_user_attention` builds its
+xdg-activation token with `set_surface` alone — no seat and serial proving recent user input — so
+KWin's focus-stealing prevention demotes a genuine `activate` to a task-manager highlight. No
+`ViewportCommand` can raise a window on that platform.
+
+So `help::show` tries `Focus` first and, if the window is still unfocused `FOCUS_GRACE` later,
+**remaps** it: skips drawing the viewport for one frame, which destroys the window, then maps a
+fresh one at the stored position and size. A newly mapped window from the app that already has
+focus is one a compositor will normally focus, and the click that asked for it landed in the main
+window. Three things about the order: where `Focus` works nothing is destroyed and there is no
+blink, so the workaround costs the other platforms nothing; no platform detection is involved, so a
+winit that grows Wayland focus support quietly stops triggering the fallback; and the geometry is
+carried across the remap, or the window would come back wherever a new window lands rather than
+where the user put it.
 
 The help is a real OS window, not an `egui::Window`, because the point of it is to be read *beside*
 the settings it explains — an in-app window is trapped inside the main one, covering the panel you

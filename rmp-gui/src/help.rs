@@ -14,8 +14,17 @@
 
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 const MANUAL: &str = include_str!("../../MANUAL.md");
+
+/// How long to let [`egui::ViewportCommand::Focus`] work before giving up on it and remapping the
+/// window instead. Long enough for a compositor round trip, short enough not to read as a hang.
+const FOCUS_GRACE: Duration = Duration::from_millis(150);
+
+fn help_viewport() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("rmp-help")
+}
 
 /// One `##` or `###` heading, and the text under it.
 struct Entry {
@@ -34,6 +43,19 @@ pub struct Help {
     /// direct call because the commands have to be sent *to the help viewport*, which only exists
     /// inside `show`.
     raise: bool,
+    /// Set while waiting to see whether `Focus` actually raised the window. See [`Help::show`].
+    focus_deadline: Option<Instant>,
+    /// Skip drawing the viewport for one frame, which destroys the window so the next frame maps a
+    /// fresh one.
+    remap: bool,
+    /// Whether the window was drawn last frame. A raise means nothing before there is a window.
+    exists: bool,
+    /// Mirrors the child viewport's own report of itself, read inside the callback because that is
+    /// the only place its `ViewportInfo` is reachable.
+    focused: bool,
+    /// Outer position and inner size, carried across a remap so the window comes back where it was
+    /// rather than wherever the compositor would put a new one.
+    geometry: Option<(egui::Pos2, egui::Vec2)>,
     entries: Vec<Entry>,
     /// Index into `entries`, or `None` for the manual's preamble.
     selected: Option<usize>,
@@ -46,6 +68,11 @@ impl Default for Help {
         Self {
             open: false,
             raise: false,
+            focus_deadline: None,
+            remap: false,
+            exists: false,
+            focused: false,
+            geometry: None,
             entries: parse(MANUAL),
             selected: None,
             filter: String::new(),
@@ -64,10 +91,10 @@ impl Help {
         self.raise = true;
     }
 
-    /// Open the manual in a window of its own.
+    /// Open the manual in a window of its own, raising it if it is buried.
     ///
     /// A real OS window rather than an `egui::Window`, because the point of it is to be read
-    /// *beside* the settings it explains — and an in-app window is trapped inside the main one,
+    /// *beside* the settings it explains — an in-app window is trapped inside the main one,
     /// covering the very panel you opened it to understand. As its own window it can be moved
     /// aside, put on a second screen, and alt-tabbed to.
     ///
@@ -76,47 +103,98 @@ impl Help {
     /// here. An immediate one is `FnMut` and runs inside this frame, which is what lets the window
     /// simply read the state it is about.
     ///
-    /// Where the backend cannot open a second window, egui says so through
-    /// [`egui::ViewportClass::EmbeddedWindow`] and falls back to an in-app one on its own. Nothing
-    /// here has to handle that case differently; it is just less good.
+    /// # Raising it, which is harder than it should be
+    ///
+    /// On Wayland, winit 0.30 implements none of the obvious levers: `focus_window` is an empty
+    /// function, `set_visible` says "Not possible on Wayland", `set_window_level` is empty, and
+    /// `request_user_attention` builds its xdg-activation token with `set_surface` alone — no seat
+    /// and serial proving recent user input — so KWin's focus-stealing prevention demotes a
+    /// genuine `activate` to "demands attention", a highlight in the task manager. That is the
+    /// behaviour this works around: pressing `?` marked the window and left it buried.
+    ///
+    /// So the fallback is to **remap** it: skip drawing the viewport for one frame, which destroys
+    /// the window, then map a fresh one at the same position and size. A newly mapped window from
+    /// the app that already has focus is one a compositor will normally focus, which is exactly
+    /// the situation — the click that asked for it landed in the main window.
+    ///
+    /// It is a fallback rather than the first move, and the order matters: `Focus` is tried first
+    /// and the remap happens only if the window is still unfocused [`FOCUS_GRACE`] later. Where
+    /// `Focus` works — X11, macOS, Windows — nothing is destroyed and there is no blink; only
+    /// where the platform refuses does the window flicker. No platform detection is involved, so
+    /// a winit that grows Wayland focus support will quietly stop triggering the fallback.
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if !self.open {
+            self.exists = false;
             return;
         }
         let ctx = ui.ctx().clone();
+
+        // Ask politely first, and only if there is a window and it is not already in front.
+        if std::mem::take(&mut self.raise) && self.exists && !self.focused {
+            ctx.send_viewport_cmd_to(help_viewport(), egui::ViewportCommand::Focus);
+            ctx.send_viewport_cmd_to(
+                help_viewport(),
+                egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational),
+            );
+            self.focus_deadline = Some(Instant::now() + FOCUS_GRACE);
+        }
+
+        // Did it work? Keep the frames coming while waiting, or the answer never arrives.
+        if let Some(deadline) = self.focus_deadline {
+            if self.focused {
+                self.focus_deadline = None;
+            } else if Instant::now() >= deadline {
+                self.focus_deadline = None;
+                self.remap = true;
+            } else {
+                ctx.request_repaint();
+            }
+        }
+
+        if std::mem::take(&mut self.remap) {
+            // Not drawing it *is* destroying it: an immediate viewport exists only while it is
+            // being shown. The next frame maps a new one from `geometry`.
+            self.exists = false;
+            ctx.request_repaint();
+            return;
+        }
+
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("rmp settings — the manual")
+            .with_min_inner_size([560.0, 360.0]);
+        builder = match self.geometry {
+            // A remap: put it back exactly where it was.
+            Some((pos, size)) => builder.with_position(pos).with_inner_size(size),
+            // First open: let the window manager place it.
+            None => builder.with_inner_size([980.0, 720.0]),
+        };
+
         let mut close = false;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("rmp-help"),
-            egui::ViewportBuilder::default()
-                .with_title("rmp settings — the manual")
-                .with_inner_size([980.0, 720.0])
-                .with_min_inner_size([560.0, 360.0]),
-            |ui, _class| {
-                if std::mem::take(&mut self.raise) {
-                    let ctx = ui.ctx();
-                    // Two commands, because no one of them works everywhere. `Focus` raises and
-                    // takes input focus on X11, macOS and Windows, and is documented as having no
-                    // effect on Wayland — winit's Wayland `focus_window` is an empty function.
-                    // `RequestUserAttention` is the one that reaches a Wayland compositor at all:
-                    // winit implements it there through xdg-activation, which is the protocol a
-                    // compositor uses to activate a window, so KWin and Mutter generally raise it.
-                    // Where `Focus` does work the attention request is reset the moment focus
-                    // arrives, so the two do not stack into a flashing taskbar entry.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                        egui::UserAttentionType::Informational,
-                    ));
+        ctx.show_viewport_immediate(help_viewport(), builder, |ui, _class| {
+            let ictx = ui.ctx().clone();
+            ictx.input(|i| {
+                let vp = i.viewport();
+                self.focused = vp.focused.unwrap_or(false);
+                if let Some(outer) = vp.outer_rect {
+                    let size = vp.inner_rect.map_or(outer.size(), |r| r.size());
+                    self.geometry = Some((outer.min, size));
                 }
-                egui::CentralPanel::default().show(ui, |ui| self.contents(ui));
-                // The OS close button. Without this the window shuts and the `?` cannot reopen it,
-                // because `open` would still say it is up.
-                if ui.ctx().input(|i| i.viewport().close_requested()) {
-                    close = true;
-                }
-            },
-        );
+            });
+
+            egui::CentralPanel::default().show(ui, |ui| self.contents(ui));
+
+            // The OS close button. Without this the window shuts and the `?` cannot reopen it,
+            // because `open` would still say it is up.
+            if ictx.input(|i| i.viewport().close_requested()) {
+                close = true;
+            }
+        });
+        self.exists = true;
+
         if close {
             self.open = false;
+            self.exists = false;
+            self.focus_deadline = None;
         }
     }
 
@@ -348,6 +426,118 @@ mod tests {
 
         h.open_or_raise();
         assert!(h.raise, "a second press must raise the window that is already open");
+    }
+
+    /// The decision `show` makes each frame, lifted out so it can be tested without a compositor.
+    ///
+    /// Mirrors the first three blocks of `show` exactly. It is a duplicate of that logic rather
+    /// than the logic itself, which is the weakness of this test — but the alternative is no
+    /// coverage at all of a state machine whose failure mode is an invisible window.
+    fn step(h: &mut Help, now: Instant) -> &'static str {
+        if std::mem::take(&mut h.raise) && h.exists && !h.focused {
+            h.focus_deadline = Some(now + FOCUS_GRACE);
+            return "asked for focus";
+        }
+        if let Some(deadline) = h.focus_deadline {
+            if h.focused {
+                h.focus_deadline = None;
+                return "focus worked";
+            } else if now >= deadline {
+                h.focus_deadline = None;
+                h.remap = true;
+            } else {
+                return "waiting";
+            }
+        }
+        if std::mem::take(&mut h.remap) {
+            h.exists = false;
+            return "remapped";
+        }
+        h.exists = true;
+        "drawn"
+    }
+
+    /// The first open must not remap: there is no window yet, so there is nothing buried, and a
+    /// blink before the window has even appeared would be pure noise.
+    #[test]
+    fn opening_for_the_first_time_just_draws() {
+        let mut h = Help::default();
+        h.open_or_raise();
+        let t = Instant::now();
+        assert_eq!(step(&mut h, t), "drawn");
+        assert!(h.exists);
+        assert!(h.focus_deadline.is_none(), "nothing to wait for on a first open");
+    }
+
+    /// Where `Focus` works — X11, macOS, Windows — the window is never destroyed, so there is no
+    /// blink. This is what stops the Wayland workaround costing every other platform something.
+    #[test]
+    fn when_focus_works_the_window_is_never_remapped() {
+        let mut h = Help::default();
+        h.open_or_raise();
+        step(&mut h, Instant::now()); // drawn
+
+        h.open_or_raise();
+        let t = Instant::now();
+        assert_eq!(step(&mut h, t), "asked for focus");
+
+        // The compositor honours it before the grace runs out.
+        h.focused = true;
+        assert_eq!(step(&mut h, t + Duration::from_millis(10)), "focus worked");
+        assert_eq!(step(&mut h, t + Duration::from_millis(20)), "drawn");
+        assert!(h.exists, "the window survived");
+    }
+
+    /// Where it does not, the window is remapped once the grace expires — and only then.
+    #[test]
+    fn when_focus_is_ignored_the_window_is_remapped_after_the_grace() {
+        let mut h = Help::default();
+        h.open_or_raise();
+        step(&mut h, Instant::now());
+
+        h.open_or_raise();
+        let t = Instant::now();
+        assert_eq!(step(&mut h, t), "asked for focus");
+        assert_eq!(step(&mut h, t + Duration::from_millis(10)), "waiting", "not yet");
+        assert_eq!(step(&mut h, t + FOCUS_GRACE), "remapped");
+        assert!(!h.exists, "the viewport is gone for one frame");
+
+        // And comes straight back.
+        assert_eq!(step(&mut h, t + FOCUS_GRACE + Duration::from_millis(16)), "drawn");
+        assert!(h.exists);
+    }
+
+    /// A raise while the window is already in front does nothing at all — no commands, no grace,
+    /// and above all no blink.
+    #[test]
+    fn raising_a_window_that_is_already_in_front_is_a_no_op() {
+        let mut h = Help::default();
+        h.open_or_raise();
+        step(&mut h, Instant::now());
+        h.focused = true;
+
+        h.open_or_raise();
+        let t = Instant::now();
+        assert_eq!(step(&mut h, t), "drawn");
+        assert!(h.focus_deadline.is_none());
+        assert!(h.exists);
+    }
+
+    /// The geometry is what makes the remap tolerable: the window comes back where it was, not
+    /// wherever a new window would land.
+    #[test]
+    fn a_remap_keeps_the_position_and_size() {
+        let mut h = Help::default();
+        h.open_or_raise();
+        step(&mut h, Instant::now());
+        let placed = (egui::pos2(1200.0, 300.0), egui::vec2(700.0, 500.0));
+        h.geometry = Some(placed);
+
+        h.open_or_raise();
+        let t = Instant::now();
+        step(&mut h, t);
+        step(&mut h, t + FOCUS_GRACE);
+        assert_eq!(h.geometry, Some(placed), "a remap must not forget where the window was");
     }
 
     #[test]
