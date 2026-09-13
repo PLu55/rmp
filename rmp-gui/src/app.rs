@@ -441,22 +441,13 @@ impl eframe::App for RmpApp {
         // tab is closed. The per-tab panels are not drawn at all rather than drawn empty, because
         // there is no session for them to be about.
         if self.sessions.is_empty() {
-            let mut opened = None;
             egui::CentralPanel::default().show(ui, |ui| {
-                // Not `centered_and_justified`: that justifies the *widget* too, and a button
-                // stretched over the whole panel reads as a broken background rather than a button.
-                ui.add_space(ui.available_height() * 0.4);
-                ui.vertical_centered(|ui| {
-                    if ui.button("Open a soundfile…").clicked() {
-                        opened = pick_file();
-                    }
-                    ui.add_space(8.0);
-                    ui.weak("each file gets a tab of its own");
+                // A hint, not a second Open button: there is already one in the strip above, and
+                // two ways to do the same thing in one empty window is one too many.
+                ui.centered_and_justified(|ui| {
+                    ui.weak("Open a soundfile — each one gets a tab of its own.");
                 });
             });
-            if let Some(p) = opened {
-                self.open(p);
-            }
             return;
         }
 

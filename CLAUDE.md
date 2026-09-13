@@ -158,11 +158,11 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   rather than rules the UI has to keep remembering: `input` is a `PathBuf` set at construction, so
   there is no state for an empty tab to be in and nothing to write a second file into. The reason
   is that a tab's results, log and title all describe one file, and swapping it underneath would
-  leave a book describing a file the tab no longer names. With no tabs the window shows an Open
-  button and nothing else. A tab's settings are a **document**, loaded, edited and saved as a TOML
-  file — `settings::SettingsDoc` — with a `?` beside them opening `MANUAL.md` itself in a window of
-  its own (`help`). `task` runs a decomposition off the UI thread; the result panels inside a tab
-  are stubs naming the `rmp-core` call each is a view of.
+  leave a book describing a file the tab no longer names. With no tabs the window shows only a
+  hint, the `Open…` in the strip being the one way in. A tab's settings are a **document**, loaded,
+  edited and saved as a TOML file — `settings::SettingsDoc` — with a `?` beside them opening
+  `MANUAL.md` itself in a window of its own (`help`). `task` runs a decomposition off the UI thread;
+  the result panels inside a tab are stubs naming the `rmp-core` call each is a view of.
 
 ### Invariants that are not locally obvious
 
@@ -735,8 +735,8 @@ over the same run): the strongest seed is also the seed that refines best. It st
 because HRMP can *reject* a candidate rather than merely outscore it, and the loop then needs
 somewhere to fall through to.
 
-`cargo bench -p rmp-core --bench pursuit` splits one decomposition by stage. At 0.25 s of off-grid audio, each
-arm including its own `init` of 2.94 ms:
+`cargo bench -p rmp-core --bench pursuit` splits one decomposition by stage. At 0.25 s of off-grid
+audio, each arm including its own `init` of 2.94 ms:
 
 | arm | atoms | total | per atom |
 | --- | --- | --- | --- |
