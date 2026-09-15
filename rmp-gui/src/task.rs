@@ -39,6 +39,9 @@ pub struct Job {
     /// Keep the pursuit's leftover buffer. It is produced either way — this decides whether to hold
     /// on to it, which is one excerpt of f32 per tab and the difference between being able to hear
     /// the measured residue afterwards and not.
+    /// Where to write the book. Chosen before the run rather than after, as `rmp -b` is: a
+    /// decomposition that took minutes and then had nowhere to go would be the worst outcome here.
+    pub book_output: PathBuf,
     pub keep_residual: bool,
     /// Measure the residue into ERB band powers. Overrides `[residual] enabled` in the settings
     /// document the way the CLI's `--residual-analysis` flag does: defaults < document < panel.
@@ -54,6 +57,8 @@ pub enum Progress {
     /// The excerpt actually being decomposed, in samples from the start of the file.
     Excerpt { offset: usize, len: usize },
     Dictionary { blocks: usize, kinds: Vec<(String, usize)>, unrefinable: usize, elapsed: Duration },
+    /// Something the worker did that has no stage of its own — writing the book, or failing to.
+    Note(String),
     Windows { count: usize, core_seconds: f32, guard_seconds: f32, over_budget: bool },
     Window { index: usize, of: usize, atoms: usize },
 }
@@ -197,6 +202,22 @@ fn work(job: Job, cancel: &AtomicBool, tx: &mpsc::Sender<Update>) -> Result<Outc
     )?;
 
     let mut analysis = analysis;
+
+    // Embedded rather than left beside the book, which is what `rmp` does when `--residual-book`
+    // names no separate file. Two things follow: the file written carries everything the run
+    // produced, and the book held in memory has the same shape as one read back from disk, so
+    // nothing downstream has to ask which of the two places the residual is in.
+    analysis.book.residual = analysis.residual_book.take();
+
+    // Written here, on the worker, and reported rather than returned: a write that fails must not
+    // throw away a decomposition that has already been paid for. The line says so and the results
+    // stay.
+    let note = match rmp_core::book::write(&job.book_output, &analysis.book) {
+        Ok(()) => format!("wrote {}", job.book_output.display()),
+        Err(e) => format!("could not write the book: {e}"),
+    };
+    let _ = tx.send(Update::Progress(Progress::Note(note)));
+
     if !job.keep_residual {
         // Freed rather than never made: the pursuit's residue *is* its working buffer, so there is
         // nothing to skip computing — only something to stop holding.
@@ -397,6 +418,70 @@ fn describe_render(r: &rmp_synthesis::RenderReport) -> String {
 mod tests {
     use super::*;
 
+    /// The whole point of asking for a file up front: a run must actually leave one behind, and it
+    /// must be a book that reads back.
+    ///
+    /// Against a real soundfile, because the thing under test is the chain from audio through the
+    /// pursuit to `book::write` — a synthetic buffer would exercise the same code but would not
+    /// catch a file the analysis could not open. Skipped where `data/` is not checked out, since it
+    /// is gitignored.
+    #[test]
+    fn a_run_writes_a_book_that_reads_back_with_its_residual_inside() {
+        let input = std::path::Path::new("../data/audio/chopin-nocturne-2.wav");
+        if !input.is_file() {
+            eprintln!("no {} here; skipping", input.display());
+            return;
+        }
+        let out = std::env::temp_dir()
+            .join(format!("rmp-gui-book-test-{}.json.gz", std::process::id()));
+
+        let mut cfg = rmp_core::config::Config::default();
+        cfg.dictionary.fof.alphas = vec![256.0];
+        cfg.dictionary.fof.betas_ms = vec![1.0];
+        cfg.blocks.f_min = 200.0;
+        cfg.blocks.f_max = 2000.0;
+        cfg.pursuit.max_atoms = 20;
+        cfg.refine.enabled = false;
+
+        let mut run = spawn(Job {
+            input: input.to_path_buf(),
+            config: cfg,
+            // Past the file's silent lead-in, and short.
+            start: Some(2.0),
+            duration: Some(0.3),
+            book_output: out.clone(),
+            keep_residual: true,
+            residual_analysis: true,
+        });
+
+        let mut done = None;
+        for _ in 0..600 {
+            for u in run.drain() {
+                if let Update::Done(o) = u {
+                    done = Some(o);
+                }
+            }
+            if run.finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let outcome = done.expect("the run produced no result");
+
+        // In memory: the residual ends up *inside* the book, so nothing downstream has to ask
+        // which of the two places it is in.
+        assert!(outcome.analysis.residual_book.is_none(), "it was moved, not copied");
+        assert!(outcome.analysis.book.residual.is_some(), "and moved into the book");
+
+        // On disk: the same, and readable by the same reader `rmpstat` and `rmpsynth` use.
+        assert!(out.is_file(), "no book was written to {}", out.display());
+        let back = rmp_core::book::read(&out).expect("the book must read back");
+        assert_eq!(back.len(), outcome.analysis.book.len(), "a different book came back");
+        assert!(back.residual.is_some(), "the residual did not survive the write");
+
+        std::fs::remove_file(&out).ok();
+    }
+
     /// A smoke test over the whole worker plumbing: spawn, run, report, terminate.
     ///
     /// A path that does not exist is the cheapest job that still goes all the way through
@@ -410,6 +495,7 @@ mod tests {
             config: Default::default(),
             start: None,
             duration: None,
+            book_output: std::env::temp_dir().join("rmp-gui-never-written.json"),
             keep_residual: true,
             residual_analysis: false,
         });

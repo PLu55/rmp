@@ -76,6 +76,9 @@ struct Session {
     parts: task::RenderParts,
     /// The Play panel: which sources to hear together.
     sources: Sources,
+    /// Where the last run's book went, so re-analysing proposes the same file rather than making a
+    /// new one every time a setting is nudged.
+    book_path: Option<PathBuf>,
     /// What the *finished* run kept, as against what is ticked now. A switch changed after a run
     /// must not make a source look available that the run did not produce.
     available: Available,
@@ -100,6 +103,7 @@ impl Session {
             run_residual_analysis: false,
             parts: task::RenderParts::default(),
             sources: Sources::default(),
+            book_path: None,
             available: Available::default(),
             outcome: None,
             log: Vec::new(),
@@ -126,6 +130,9 @@ impl Session {
             run_residual_analysis: self.run_residual_analysis,
             parts: self.parts,
             sources: self.sources,
+            // Not the original's file: two tabs writing one book is the collision the tab number
+            // exists to prevent, and `default_book_name` already numbers them apart.
+            book_path: None,
             available: Available::default(),
             outcome: None,
             log: Vec::new(),
@@ -338,6 +345,14 @@ impl Session {
     fn start_run(&mut self) {
         let Ok(config) = self.settings.status() else { return };
         let config = config.clone();
+        // Asked before the run, as `rmp -b` requires it: a decomposition that took minutes and then
+        // had nowhere to go would be the worst outcome here. Cancelling the dialog cancels the run.
+        let Some(book_output) =
+            pick_book_save(self.book_path.as_deref(), &self.default_book_name())
+        else {
+            return;
+        };
+        self.book_path = Some(book_output.clone());
         // Recorded now rather than on completion, so an interrupted run is still attributed to the
         // settings it ran under.
         self.ran_with = self.settings.effective().map(str::to_owned);
@@ -348,6 +363,7 @@ impl Session {
             config,
             start: self.start.trim().parse().ok(),
             duration: self.duration.trim().parse().ok(),
+            book_output,
             keep_residual: self.keep_residual,
             residual_analysis: self.run_residual_analysis,
         }));
@@ -382,6 +398,25 @@ impl Session {
             .file_stem()
             .map_or_else(|| "settings".to_string(), |s| s.to_string_lossy().into_owned());
         format!("{stem}-{:02}.toml", self.number)
+    }
+
+    /// The file name Analyse proposes for the book:
+    /// `<audio file, less its extension>-<tab number>-book[-residual].json.gz`.
+    ///
+    /// Gzipped by default because a JSON book is 1.19x the size of the f32 WAV it decomposes and
+    /// the suffix is worth about 7x; `book::write` reads the format from the extension *beneath*
+    /// the `.gz`, so this is a JSON book either way.
+    ///
+    /// The `-residual` is there when the run will measure one, and it is worth saying in the name:
+    /// the residual book is roughly 12x the atom list on a short excerpt, so two files of the same
+    /// stem can differ by an order of magnitude in size and in what they can be rendered into.
+    fn default_book_name(&self) -> String {
+        let stem = self
+            .input
+            .file_stem()
+            .map_or_else(|| "book".to_string(), |s| s.to_string_lossy().into_owned());
+        let residual = if self.run_residual_analysis { "-residual" } else { "" };
+        format!("{stem}-{:02}-book{residual}.json.gz", self.number)
     }
 
     /// The file name Synthesize proposes:
@@ -847,6 +882,17 @@ fn pick_audio_save(name: &str) -> Option<PathBuf> {
         .save_file()
 }
 
+/// Where to write a book, starting wherever the last one went.
+fn pick_book_save(current: Option<&std::path::Path>, name: &str) -> Option<PathBuf> {
+    let mut d = rfd::FileDialog::new()
+        .add_filter("book", &["gz", "json", "toml"])
+        .set_file_name(name);
+    if let Some(dir) = current.and_then(|p| p.parent()) {
+        d = d.set_directory(dir);
+    }
+    d.save_file()
+}
+
 fn pick_settings() -> Option<PathBuf> {
     rfd::FileDialog::new().add_filter("settings", &["toml"]).pick_file()
 }
@@ -881,6 +927,7 @@ fn describe(p: &Progress) -> String {
         Progress::Excerpt { offset, len } => {
             format!("analysing {len} samples from {offset}")
         }
+        Progress::Note(line) => line.clone(),
         Progress::Dictionary { blocks, kinds, unrefinable, elapsed } => {
             let k: Vec<_> = kinds.iter().map(|(k, n)| format!("{n} {k}")).collect();
             let note = if *unrefinable > 0 {
@@ -1112,6 +1159,44 @@ mod tests {
         // Nothing to derive from at all still produces a usable name rather than ".toml".
         app.sessions[0].input = PathBuf::from("/");
         assert_eq!(app.sessions[0].default_settings_name(), "settings-01.toml");
+    }
+
+    /// The book's name says what is in it. `-residual` is not decoration: the residual book is
+    /// roughly 12x the atom list on a short excerpt, so two files of the same stem differ by an
+    /// order of magnitude in size and in what they can be rendered into.
+    #[test]
+    fn the_book_name_says_whether_a_residual_was_measured() {
+        let mut app = with(&["/a/b/chopin-nocturne-2.wav"]);
+        let s = &mut app.sessions[0];
+
+        assert_eq!(s.default_book_name(), "chopin-nocturne-2-01-book.json.gz");
+        s.run_residual_analysis = true;
+        assert_eq!(s.default_book_name(), "chopin-nocturne-2-01-book-residual.json.gz");
+    }
+
+    /// Gzipped, and JSON *beneath* the gzip — `book::write` reads the format from the extension
+    /// under the suffix, so the proposed name has to carry both.
+    #[test]
+    fn the_proposed_book_is_gzipped_json() {
+        let app = with(&["/a/piano.wav"]);
+        let name = app.sessions[0].default_book_name();
+        assert!(name.ends_with(".json.gz"), "got {name}");
+    }
+
+    /// Two tabs on one soundfile must not write one book, and a duplicate must not inherit the
+    /// original's path — which would make its first Analyse silently overwrite the original's book.
+    #[test]
+    fn two_tabs_never_propose_or_inherit_one_book_file() {
+        let mut app = with(&["/a/piano.wav"]);
+        app.sessions[0].book_path = Some(PathBuf::from("/out/piano-01-book.json.gz"));
+
+        app.push(app.sessions[0].duplicate(app.free_number()));
+        assert!(app.sessions[1].book_path.is_none(), "a copy has written no book of its own");
+        assert_ne!(
+            app.sessions[0].default_book_name(),
+            app.sessions[1].default_book_name(),
+            "two tabs propose one book"
+        );
     }
 
     /// Renders and settings share the `<file>-<tab number>` stem, so everything a tab produces

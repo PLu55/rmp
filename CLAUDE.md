@@ -338,11 +338,18 @@ skip it, but only one can say in the log that it did.
 That is why they are grouped rather than laid out as one row: a flat row of checkboxes would leave
 the word ambiguous.
 
-- **Analyse** — `residual` keeps the pursuit's leftover buffer (it is produced either way; this
-  decides whether to hold on to it), and `residual analysis` measures that residue into ERB band
-  powers. The second overrides `[residual] enabled` in the settings document, the same precedence
-  the CLI's `--residual-analysis` flag has and for the same reason: the control you just touched
-  should win. Together they decide what Play can offer afterwards.
+- **Analyse** — asks where the book goes *before* it runs, as `rmp -b` requires it: a
+  decomposition that took minutes and then had nowhere to go would be the worst outcome, so
+  cancelling the dialog cancels the run. The name proposed is
+  `<file>-<tab number>-book[-residual].json.gz`, gzipped because a JSON book is 1.19x the size of
+  the WAV it decomposes, and JSON *beneath* the suffix because that is where `book::write` reads
+  the format from. `-residual` is not decoration: the residual book is roughly 12x the atom list on
+  a short excerpt, so two files of one stem differ by an order of magnitude. Its two switches are
+  `residual` (keep the pursuit's leftover buffer — it is produced either way; this decides whether
+  to hold on to it) and `residual analysis` (measure that residue into ERB band powers). The second
+  overrides `[residual] enabled` in the settings document, the same precedence the CLI's
+  `--residual-analysis` flag has and for the same reason: the control you just touched should win.
+  Together they decide what Play can offer afterwards.
 - **Synthesize** — `atoms` and `residual (synthesised)`, the two halves `rmpsynth` exposes,
   independently, so either alone or both. The name carries which, so renders of different parts
   never overwrite each other.
@@ -351,6 +358,13 @@ the word ambiguous.
   how much energy the atoms took. Two combinations are worth naming — atoms + measured residual
   reconstructs the origin exactly by construction, and atoms + synthesised residual is the
   resynthesis.
+
+**The GUI embeds the residual into the book it writes, and keeps it embedded in memory.** That is
+what `rmp` does when `--residual-book` names no separate file, and it means the file written and
+the book held have one shape — the shape a book read back from disk has — so nothing downstream has
+to ask which of the two places the residual is in. The write happens on the worker and is *reported*
+rather than returned: a failed write must not throw away a decomposition already paid for, so the
+line says so and the results stay.
 
 **A run's residual book lives beside its atom book, not inside it, and both halves of the GUI have
 to look in both places.** `pipeline::analyse` returns `Analysis::residual_book` separately —
