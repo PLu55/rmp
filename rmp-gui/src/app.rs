@@ -276,12 +276,11 @@ impl Session {
                     None => {
                         // Checked against what is actually ticked, not merely "is there a book":
                         // finding out after the save dialog would be worse than a disabled button.
-                        let can = self
-                            .outcome
-                            .as_ref()
-                            .map_or(Err("analyse something first"), |o| {
-                                self.parts.available(&o.analysis.book)
-                            });
+                        let can = if self.outcome.is_some() {
+                            self.parts.available(self.available)
+                        } else {
+                            Err("analyse something first")
+                        };
                         if ui
                             .add_enabled(can.is_ok(), egui::Button::new("Synthesize"))
                             .on_disabled_hover_text(can.err().unwrap_or_default())
@@ -371,6 +370,7 @@ impl Session {
         // the tab stays live meanwhile — you can edit its settings, or start the next analysis.
         self.synthesising = Some(task::spawn_synthesis(task::SynthJob {
             book: outcome.analysis.book.clone(),
+            residual_book: playback::residual_book(&outcome.analysis).cloned(),
             parts: self.parts,
             output,
         }));
@@ -1135,6 +1135,7 @@ mod tests {
 
         s.synthesising = Some(task::spawn_synthesis(task::SynthJob {
             book: rmp_core::book::Book::new(1.0, 48_000.0),
+            residual_book: None,
             parts: task::RenderParts::default(),
             output: std::env::temp_dir().join("rmp-gui-busy-test.wav"),
         }));
@@ -1188,20 +1189,43 @@ mod tests {
         );
     }
 
-    /// What Synthesize needs of a book. The residual half is the one a default run cannot produce,
-    /// since the Analyse panel starts with residual analysis off.
+    /// What Synthesize will and will not offer, judged against what the run produced.
+    ///
+    /// The residual-alone case is the one this is really about. `pipeline::analyse` hands the
+    /// residual book back *beside* the atom book, so `Book::residual` is empty on a fresh run
+    /// however it was configured — checking the book directly refused every residual render,
+    /// including the mix, and the panel's residual tickbox did nothing at all.
     #[test]
-    fn synthesis_is_offered_only_when_the_book_can_produce_what_is_ticked() {
+    fn the_residual_can_be_rendered_alone_once_a_run_has_measured_one() {
         use task::RenderParts as P;
-        let empty = rmp_core::book::Book::new(1.0, 48_000.0);
 
-        for p in [
-            P { atoms: false, residual: false },
-            P { atoms: true, residual: false },
-            P { atoms: false, residual: true },
+        let measured = Available {
+            origin: true,
+            atoms: true,
+            residual_measured: true,
+            residual_synthesised: true,
+        };
+        assert!(P { atoms: false, residual: true }.available(measured).is_ok(), "residual alone");
+        assert!(P { atoms: true, residual: true }.available(measured).is_ok(), "and mixed");
+        assert!(P { atoms: true, residual: false }.available(measured).is_ok(), "and atoms alone");
+    }
+
+    /// And refuses, with a reason, whatever the run did not make.
+    #[test]
+    fn synthesis_refuses_what_the_run_did_not_produce_and_says_why() {
+        use task::RenderParts as P;
+
+        let atoms_only = Available { origin: true, atoms: true, ..Available::default() };
+        let nothing = Available { origin: true, ..Available::default() };
+
+        for (parts, av, what) in [
+            (P { atoms: false, residual: false }, atoms_only, "nothing ticked"),
+            (P { atoms: false, residual: true }, atoms_only, "no residual was measured"),
+            (P { atoms: true, residual: true }, atoms_only, "the mix needs one too"),
+            (P { atoms: true, residual: false }, nothing, "no atoms were selected"),
         ] {
-            let refusal = p.available(&empty).expect_err("an empty book can produce nothing");
-            assert!(!refusal.is_empty(), "{p:?} refuses silently");
+            let refusal = parts.available(av).expect_err(what);
+            assert!(!refusal.is_empty(), "{parts:?} refuses silently ({what})");
         }
     }
 

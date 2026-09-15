@@ -278,17 +278,23 @@ impl RenderParts {
         }
     }
 
-    /// Whether this book can produce this. Checked rather than attempted, so an impossible request
-    /// is a disabled button that says why instead of a render that fails after the save dialog.
-    pub fn available(self, book: &rmp_core::book::Book) -> Result<(), &'static str> {
+    /// Whether the finished run can produce this. Checked rather than attempted, so an impossible
+    /// request is a disabled button that says why instead of a render that fails after the save
+    /// dialog.
+    ///
+    /// Judged against [`crate::playback::Available`] — what the run *made* — and not against the
+    /// `Book` alone. `pipeline::analyse` returns the residual book beside the atom book rather than
+    /// inside it, so a book straight from a run has `Book::residual` empty however the analysis was
+    /// configured; asking it directly refused every residual render, the mixed one included.
+    pub fn available(self, av: crate::playback::Available) -> Result<(), &'static str> {
         if !self.atoms && !self.residual {
             return Err("nothing selected to render");
         }
-        if self.atoms && book.is_empty() {
+        if self.atoms && !av.atoms {
             return Err("no atoms were selected by the analysis");
         }
-        if self.residual && book.residual.is_none() {
-            return Err("this book has no residual analysis — tick it before analysing");
+        if self.residual && !av.residual_synthesised {
+            return Err("this run measured no residual — tick residual analysis and analyse again");
         }
         Ok(())
     }
@@ -303,6 +309,10 @@ impl RenderParts {
 /// window that has crashed.
 pub struct SynthJob {
     pub book: rmp_core::book::Book,
+    /// The stochastic model, when the run produced one. Passed separately because that is where
+    /// `pipeline::analyse` leaves it, and `RenderRequest::residual_book` exists for exactly this —
+    /// the standalone residual book `rmp --residual-book` writes beside an atom book.
+    pub residual_book: Option<rmp_core::residual::ResidualBook>,
     pub parts: RenderParts,
     pub output: PathBuf,
 }
@@ -343,7 +353,7 @@ pub fn spawn_synthesis(job: SynthJob) -> Synthesising {
             let where_to = job.output.display().to_string();
             let request = rmp_synthesis::RenderRequest {
                 book: rmp_synthesis::BookInput::Full(job.book),
-                residual_book: None,
+                residual_book: job.residual_book,
                 atoms: job.parts.atoms,
                 residual: job.parts.residual,
                 output: job.output,

@@ -343,13 +343,25 @@ the word ambiguous.
   powers. The second overrides `[residual] enabled` in the settings document, the same precedence
   the CLI's `--residual-analysis` flag has and for the same reason: the control you just touched
   should win. Together they decide what Play can offer afterwards.
-- **Synthesize** — `atoms` and `residual (synthesised)`, the two halves `rmpsynth` exposes, written
-  to a file. The name carries which, so renders of different parts never overwrite each other.
+- **Synthesize** — `atoms` and `residual (synthesised)`, the two halves `rmpsynth` exposes,
+  independently, so either alone or both. The name carries which, so renders of different parts
+  never overwrite each other.
 - **Play** — `origin`, `atoms`, `residual (measured)`, `residual (synthesised)`, summed and sounded
   at their own levels. Not normalised: the levels *are* the result, and scaling the mix would hide
   how much energy the atoms took. Two combinations are worth naming — atoms + measured residual
   reconstructs the origin exactly by construction, and atoms + synthesised residual is the
   resynthesis.
+
+**A run's residual book lives beside its atom book, not inside it, and both halves of the GUI have
+to look in both places.** `pipeline::analyse` returns `Analysis::residual_book` separately —
+whether the two share a file is the caller's decision — while a book read back from disk carries
+its own in `Book::residual`. `playback::residual_book` is the one definition of "where the
+stochastic model is", and `a_fresh_run_keeps_its_residual_book_outside_the_atom_book` pins the trap
+against a real run: it asserts `residual_book.is_some()` *and* `book.residual.is_none()` together,
+because it is the pair that is surprising. Asking the book alone is not hypothetical — Synthesize
+did, and so refused every residual render including the mixed one, which made its residual tickbox
+do nothing at all whatever the analysis had measured. Synthesize now judges against
+`playback::Available`, the same record of what the run produced that Play uses.
 
 **Play mixes from memory; it does not replay what Synthesize wrote.** Going through a file would
 mean naming and saving something before you could hear it, and the comparisons worth making are

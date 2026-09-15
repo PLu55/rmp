@@ -69,8 +69,7 @@ impl Available {
             origin: true,
             atoms: !analysis.book.is_empty(),
             residual_measured: kept_residual && !analysis.residual.is_empty(),
-            residual_synthesised: analysis.residual_book.is_some()
-                || analysis.book.residual.is_some(),
+            residual_synthesised: residual_book(analysis).is_some(),
         }
     }
 
@@ -136,6 +135,19 @@ impl Which {
     }
 }
 
+/// Where an analysis keeps its stochastic model, whichever of the two places that is.
+///
+/// `pipeline::analyse` returns the residual book *beside* the atom book rather than inside it —
+/// whether the two share a file is the caller's decision, not the pipeline's — but a book read back
+/// from disk carries its own in `Book::residual`. Anything asking "is there a residual to work
+/// with" has to look in both, and this is the single place that does.
+///
+/// Getting this wrong is not hypothetical: Synthesize checked only `book.residual` and so refused
+/// every residual render, including the mixed one, however the analysis had been run.
+pub fn residual_book(analysis: &Analysis) -> Option<&rmp_core::residual::ResidualBook> {
+    analysis.residual_book.as_ref().or(analysis.book.residual.as_ref())
+}
+
 /// Build the mix.
 ///
 /// Everything is aligned to the *excerpt*, sample 0 being the excerpt's first sample, so the four
@@ -162,11 +174,7 @@ pub fn mix(
         parts.push(analysis.residual.clone());
     }
     if want.residual_synthesised {
-        let book = analysis
-            .residual_book
-            .as_ref()
-            .or(analysis.book.residual.as_ref())
-            .ok_or("this analysis has no residual book")?;
+        let book = residual_book(analysis).ok_or("this analysis has no residual book")?;
         let rendered =
             rmp_synthesis::render_residual_book(book, &rmp_synthesis::RenderConfig::default())
                 .map_err(|e| format!("rendering the residual: {e}"))?;
@@ -229,6 +237,51 @@ mod tests {
             assert!(w.get(&s), "{w:?} did not take");
         }
         assert!(s.origin && s.atoms && s.residual_measured && s.residual_synthesised);
+    }
+
+    /// The trap itself, against a real run: `pipeline::analyse` leaves the residual book *beside*
+    /// the atom book, so `Book::residual` is empty even when a residual analysis ran. Anything that
+    /// asks the book alone concludes there is no residual — which is exactly what made Synthesize
+    /// refuse every residual render.
+    #[test]
+    fn a_fresh_run_keeps_its_residual_book_outside_the_atom_book() {
+        use rmp_core::config::Config;
+        use rmp_core::fft::Planner;
+        use rmp_core::pipeline::{self, AnalysisRequest};
+
+        let mut cfg = Config::default();
+        cfg.dictionary.fof.alphas = vec![256.0];
+        cfg.dictionary.fof.betas_ms = vec![1.0];
+        cfg.blocks.f_min = 200.0;
+        cfg.blocks.f_max = 2000.0;
+        cfg.pursuit.max_atoms = 8;
+        cfg.refine.enabled = false;
+        cfg.residual.enabled = true;
+
+        let samples: Vec<f32> = rmp_core::residual::pseudo_noise(8_000);
+        let sig = Signal::new(samples, 48_000.0);
+        let residual_cfg = cfg.residual_config(48_000.0).expect("a usable ERB range");
+        let mut planner = Planner::new();
+
+        let analysis = pipeline::analyse(
+            AnalysisRequest {
+                signal: &sig,
+                offset: 0,
+                config: &cfg,
+                residual: Some(&residual_cfg),
+            },
+            &mut planner,
+            &mut (),
+        )
+        .expect("the fixture decomposes");
+
+        assert!(analysis.residual_book.is_some(), "the run measured a residual");
+        assert!(
+            analysis.book.residual.is_none(),
+            "and left it beside the book — this is the trap, not an accident"
+        );
+        assert!(residual_book(&analysis).is_some(), "so only looking in both finds it");
+        assert!(Available::of(&analysis, true).residual_synthesised);
     }
 
     /// The mix is the sum at unit gain, and as long as its longest part. Checked with plain
