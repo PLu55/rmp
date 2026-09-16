@@ -372,6 +372,14 @@ window would be worth less than none. `Timing::realtime_factor` went the same wa
 reason — `init + pursuit` over the excerpt, deliberately *not* the dictionary, which is built once
 per settings rather than once per second of audio.
 
+**A selection the book cannot describe is dropped, not compensated for.** `DistributionView::prune`
+removes from `selected` any quantity with no applicable atoms, and the tick is then plainly
+`selected.contains(q)`. Drawing it as `selected && applicable` instead is what let the two drift:
+on a Gaussian-only book `alpha` and `beta` rendered as unticked boxes while the plot loop — reading
+`selected` alone — went on drawing their empty histograms underneath. It is the rule Play already
+follows for its sources, and the same failure both times is a reason to reach for the rule rather
+than for a second condition.
+
 **Both plot tabs cache against the options that produced them.** A histogram renders envelopes for
 `support` and `periods`; a map is 0.13 s for 5000 atoms at 1200x800 and the grid size is a setting,
 so its cost is whatever is asked for. Neither can run per frame. The map is built on a worker

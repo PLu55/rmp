@@ -95,6 +95,9 @@ impl DistributionView {
             self.cache.clear();
             self.cached_under = Some(self.options.clone());
         }
+        // Before anything is drawn: a selection the book cannot describe is dropped, so the ticks
+        // and the plots below cannot disagree about what is showing.
+        self.prune(book);
         self.controls(ui, book);
         ui.separator();
 
@@ -149,7 +152,10 @@ impl DistributionView {
                 // it. `histogram` reports the rest as `inapplicable`, so this needs no per-quantity
                 // rule of its own.
                 let can = self.applicable(book, q);
-                let mut on = self.selected.contains(&q) && can;
+                // Not `contains && can`: `prune` has already guaranteed that a selected quantity is
+                // an applicable one, and compensating here a second time is what let the tick and
+                // the plot drift apart in the first place.
+                let mut on = self.selected.contains(&q);
                 ui.add_enabled_ui(can, |ui| {
                     let r = ui
                         .checkbox(&mut on, q.label())
@@ -205,6 +211,23 @@ impl DistributionView {
                 ui.weak("(ignored until both are numbers and hi > lo)");
             }
         });
+    }
+
+    /// Drop any selection this book cannot describe.
+    ///
+    /// The invariant it establishes is that **`selected` holds only quantities the book has**, so
+    /// what is plotted is what is ticked. Without it the two disagreed: the tick was drawn as
+    /// `selected && applicable` while the plot loop read `selected` alone, so on a Gaussian-only
+    /// book `alpha` and `beta` showed empty histograms under unticked boxes.
+    ///
+    /// The same rule Play follows for its sources — a choice the run cannot honour is cleared
+    /// rather than left set and silently ignored.
+    fn prune(&mut self, book: &Book) {
+        for q in self.selected.clone() {
+            if !self.applicable(book, q) {
+                self.selected.retain(|&s| s != q);
+            }
+        }
     }
 
     /// Whether any atom in this book has a value for `q`.
@@ -266,5 +289,75 @@ fn plot(ui: &mut egui::Ui, h: &Histogram) {
     }
     if !notes.is_empty() {
         ui.weak(notes.join("   "));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmp_core::config::Config;
+    use rmp_core::fft::Planner;
+    use rmp_core::pipeline::{self, AnalysisRequest};
+    use rmp_core::signal::Signal;
+
+    /// A book of one kind only, so the other kind's quantities are inapplicable.
+    fn a_book(gaussian: bool) -> Book {
+        let mut cfg = Config::default();
+        if gaussian {
+            cfg.dictionary.fof.alphas.clear();
+            cfg.dictionary.gaussian.sigmas_ms = vec![2.5];
+        } else {
+            cfg.dictionary.fof.alphas = vec![256.0];
+            cfg.dictionary.fof.betas_ms = vec![1.0];
+        }
+        cfg.blocks.f_min = 200.0;
+        cfg.blocks.f_max = 2000.0;
+        cfg.pursuit.max_atoms = 16;
+        cfg.refine.enabled = false;
+
+        let sig = Signal::new(rmp_core::residual::pseudo_noise(8_000), 48_000.0);
+        let mut planner = Planner::new();
+        pipeline::analyse(
+            AnalysisRequest { signal: &sig, offset: 0, config: &cfg, residual: None },
+            &mut planner,
+            &mut (),
+        )
+        .expect("the fixture decomposes")
+        .book
+    }
+
+    /// What is plotted is what is ticked.
+    ///
+    /// The two came apart because the tick was drawn as `selected && applicable` while the plot
+    /// loop read `selected` alone: on a Gaussian-only book `alpha` and `beta` are inapplicable, so
+    /// their boxes rendered empty while their (empty) histograms went on being drawn underneath.
+    #[test]
+    fn a_quantity_the_book_cannot_describe_is_not_left_selected() {
+        let book = a_book(true);
+        let mut v = DistributionView::default();
+        assert!(v.selected.contains(&Quantity::Alpha), "the default list starts with alpha");
+
+        v.prune(&book);
+
+        assert!(!v.selected.contains(&Quantity::Alpha), "alpha describes no Gaussian");
+        assert!(!v.selected.contains(&Quantity::Beta), "nor does beta");
+        assert!(v.selected.contains(&Quantity::Freq), "frequency describes both kinds");
+        for q in &v.selected {
+            assert!(v.cache.get(q).is_some_and(|h| matches!(h, Ok(x) if x.total > 0.0)));
+        }
+    }
+
+    /// And the mirror: a FOF book keeps its FOF quantities and drops `sigma`.
+    #[test]
+    fn a_fof_book_keeps_alpha_and_would_drop_sigma() {
+        let book = a_book(false);
+        let mut v = DistributionView::default();
+        v.selected.push(Quantity::Sigma);
+
+        v.prune(&book);
+
+        assert!(v.selected.contains(&Quantity::Alpha));
+        assert!(v.selected.contains(&Quantity::Beta));
+        assert!(!v.selected.contains(&Quantity::Sigma), "sigma describes no FOF");
     }
 }
