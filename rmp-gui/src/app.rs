@@ -14,6 +14,7 @@ use crate::audio::Audio;
 use crate::help::Help;
 use crate::playback::{self, Available, Sources, Which};
 use crate::view::distribution::DistributionView;
+use crate::view::function::FunctionView;
 use crate::view::summary::SummaryView;
 use crate::view::timefreq::TimeFreqView;
 use crate::settings::SettingsDoc;
@@ -30,17 +31,21 @@ enum View {
     Summary,
     /// `rmp_core::stats::Histogram` over a `Quantity`, as `rmpstat hist`.
     Distribution,
+    /// Curves over the book, as a function of atom index — `Book::snr_trace` and its relatives.
+    Function,
     /// `rmp_core::tfmap::TfMap` — the atom-based pseudo-Wigner map, as `rmpstat wv`.
     TimeFrequency,
 }
 
 impl View {
-    const ALL: [View; 3] = [View::Summary, View::Distribution, View::TimeFrequency];
+    const ALL: [View; 4] =
+        [View::Summary, View::Distribution, View::Function, View::TimeFrequency];
 
     fn label(self) -> &'static str {
         match self {
             View::Summary => "Summary",
             View::Distribution => "Distributions",
+            View::Function => "Functions",
             View::TimeFrequency => "Time-frequency",
         }
     }
@@ -89,6 +94,7 @@ struct Session {
     /// together when a run finishes, since all three are views of one book.
     summary_view: SummaryView,
     distribution_view: DistributionView,
+    function_view: FunctionView,
     timefreq_view: TimeFreqView,
 }
 
@@ -114,6 +120,7 @@ impl Session {
             view: View::Summary,
             summary_view: SummaryView::default(),
             distribution_view: DistributionView::default(),
+            function_view: FunctionView::default(),
             timefreq_view: TimeFreqView::default(),
         }
     }
@@ -146,6 +153,7 @@ impl Session {
             view: self.view,
             summary_view: SummaryView::default(),
             distribution_view: DistributionView::default(),
+            function_view: FunctionView::default(),
             timefreq_view: TimeFreqView::default(),
         }
     }
@@ -197,6 +205,7 @@ impl Session {
                     // Every result tab is a view of the book that just changed.
                     self.summary_view.invalidate();
                     self.distribution_view.invalidate();
+                    self.function_view.invalidate();
                     self.timefreq_view.invalidate();
                     // And anything already ticked that the run did not make is dropped, rather than
                     // left ticked and silently ignored.
@@ -587,6 +596,7 @@ impl Session {
         match self.view {
             View::Summary => self.summary_view.ui(ui, outcome),
             View::Distribution => self.distribution_view.ui(ui, &outcome.analysis.book),
+            View::Function => self.function_view.ui(ui, &outcome.analysis.book),
             View::TimeFrequency => self.timefreq_view.ui(ui, &outcome.analysis.book),
         }
     }

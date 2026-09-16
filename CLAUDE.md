@@ -361,7 +361,8 @@ the word ambiguous.
   resynthesis.
 
 **The result tabs recompute nothing.** `view/summary` is `stats::summarize`, `view/distribution`
-is `stats::histogram`, `view/timefreq` is `tfmap::compute` — the same calls `rmpstat` drives, so
+is `stats::histogram`, `view/function` is `Book::snr_trace` and its relatives, `view/timefreq` is
+`tfmap::compute` — the same calls `rmpstat` drives, so
 the window and the charts report one set of numbers rather than two that agree by luck. Two things
 moved into `rmp-core` to keep it that way: `Quantity::ALL`, because a front end offering the
 quantities has to enumerate them and the only list was a hand-written one inside `rmpstat`'s own
@@ -371,6 +372,20 @@ decision about how to read a map and a diagnostic that coloured differently in a
 window would be worth less than none. `Timing::realtime_factor` went the same way for the same
 reason — `init + pursuit` over the excerpt, deliberately *not* the dictionary, which is built once
 per settings rather than once per second of audio.
+
+**Distributions asks how the atoms are spread; Functions asks how the decomposition progressed.**
+`view/function` plots quantities against atom index, the requested one being how the energy falls.
+Two of its curves are one fact twice — residual energy falls, SNR rises, each the other negated —
+and both are there because the question is asked both ways: `atoms_to_reach`, `MANUAL.md` and the
+CLI all speak in SNR, while "how much is left" is the thing you watch. The tooltip says they are
+not independent evidence.
+
+The summed-removals curve is plotted as an *implied residual*, `1 - sum(energy_removed)/initial`,
+rather than as the running sum in dB of initial. The running sum rises from far below zero while
+the residual falls toward it — opposite directions, nothing to compare. As an implied residual it
+falls alongside the real one and the **gap between them is the overlap**, which is
+`BookSummary::deposited_frac` drawn rather than summarised. The inequality is one-sided (the parts
+sum to at most the whole), and that is what makes the gap readable as a quantity instead of noise.
 
 **A selection the book cannot describe is dropped, not compensated for.** `DistributionView::prune`
 removes from `selected` any quantity with no applicable atoms, and the tick is then plainly

@@ -14,6 +14,7 @@
 //! both are held until an option actually moves.
 
 pub mod distribution;
+pub mod function;
 pub mod summary;
 pub mod timefreq;
 
