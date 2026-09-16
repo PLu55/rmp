@@ -147,10 +147,11 @@ impl Cli {
         let (init, pursuit) = (a.timing.init, a.timing.pursuit);
         let book = &a.book;
         self.say(&format!(
-            "analysis: {} atoms, {:.1} dB in {pursuit:.2?} (init {init:.2?}, {:.1}x realtime)",
+            "analysis: {} atoms, {:.1} dB in {pursuit:.2?} (init {init:.2?}, {:.1}x realtime, {} threads)",
             book.len(),
             book.snr_db(),
-            a.timing.realtime_factor(duration)
+            a.timing.realtime_factor(duration),
+            rmp_core::threads::pool_size(),
         ));
         if a.cancelled {
             self.say("  interrupted: the book holds only what had been selected by then");

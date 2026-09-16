@@ -95,6 +95,8 @@ impl Args {
 }
 
 fn main() -> ExitCode {
+    rmp_core::threads::configure_pool();
+    rmp_core::threads::prefer_fast_cores();
     let args = Args::parse();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,

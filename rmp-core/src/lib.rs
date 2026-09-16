@@ -22,6 +22,7 @@ pub mod residual;
 pub mod signal;
 pub mod stats;
 pub mod tfmap;
+pub mod threads;
 
 pub use atom::{AtomKind, Shape};
 pub use book::{Book, Selection};

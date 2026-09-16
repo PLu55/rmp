@@ -166,6 +166,9 @@ impl BlockState {
 pub struct Mp<'a> {
     dict: &'a Dictionary,
     corrs: Vec<Correlator>,
+    /// Further correlators per block, forked from `corrs` when a refresh splits a heavy block's
+    /// frames across threads, and kept for the refreshes after.
+    spares: Vec<Vec<Correlator>>,
     states: Vec<BlockState>,
     residual: Vec<f32>,
     /// Envelopes rendered during refinement, reused across candidates and iterations.
@@ -273,6 +276,7 @@ impl<'a> Mp<'a> {
         };
         Self {
             dict,
+            spares: corrs.iter().map(|_| Vec::new()).collect(),
             corrs,
             states,
             residual: signal.samples.clone(),
@@ -488,65 +492,67 @@ impl<'a> Mp<'a> {
             } else {
                 f64::NEG_INFINITY
             };
-            let pending: Vec<(usize, usize)> = self
-                .states
-                .iter()
-                .enumerate()
-                .flat_map(|(bi, st)| {
-                    st.dirty
-                        .iter()
-                        .enumerate()
-                        .filter(move |&(n, &d)| d && st.energy[n] >= threshold)
-                        .map(move |(n, _)| (bi, n))
-                })
-                .collect();
-            if pending.is_empty() {
+            let pending = self.dirty_frames(|e| e >= threshold);
+            if pending.iter().all(Vec::is_empty) {
                 return seeds;
             }
             self.resolve(&pending);
         }
     }
 
-    /// Recompute the given frames exactly.
-    fn resolve(&mut self, pending: &[(usize, usize)]) {
-        self.resolved += pending.len();
-        let mut per_block: Vec<Vec<usize>> = vec![Vec::new(); self.states.len()];
-        for &(bi, n) in pending {
-            per_block[bi].push(n);
-            self.per_block[bi].1 += 1;
+    /// Each block's dirty frames whose stored bound satisfies `keep`, in frame order.
+    ///
+    /// A pass over every frame of every block, twice per selected atom, so on a long clip it is
+    /// worth spreading across the pool; each block's list is its own, so the result is the same.
+    fn dirty_frames(&self, keep: impl Fn(f64) -> bool + Sync) -> Vec<Vec<usize>> {
+        let scan = |st: &BlockState| -> Vec<usize> {
+            st.dirty
+                .iter()
+                .zip(&st.energy)
+                .enumerate()
+                .filter(|&(_, (&d, &e))| d && keep(e))
+                .map(|(n, _)| n)
+                .collect()
+        };
+        let frames: usize = self.states.iter().map(|s| s.energy.len()).sum();
+        if frames >= PARALLEL_SCAN_FRAMES {
+            self.states.par_iter().map(scan).collect()
+        } else {
+            self.states.iter().map(scan).collect()
         }
-        let (dict, residual) = (self.dict, &self.residual);
-        for_each_block(&mut self.corrs, &mut self.states, |bi, corr, state| {
-            let block = &dict.blocks[bi];
-            for &n in &per_block[bi] {
-                let bound = state.energy[n];
-                refresh_one(block, corr, state, residual, n);
-                state.dirty[n] = false;
+    }
+
+    /// Recompute the listed frames of each block exactly.
+    fn resolve(&mut self, per_block: &[Vec<usize>]) {
+        for (bi, frames) in per_block.iter().enumerate() {
+            self.resolved += frames.len();
+            self.per_block[bi].1 += frames.len();
+        }
+        let exact = refresh_frames(
+            &self.dict.blocks,
+            &mut self.corrs,
+            &mut self.spares,
+            &self.residual,
+            per_block,
+        );
+        for (bi, (frames, exact)) in per_block.iter().zip(exact).enumerate() {
+            let state = &mut self.states[bi];
+            for (&n, (bin, energy)) in frames.iter().zip(exact) {
                 debug_assert!(
-                    state.energy[n] <= bound,
-                    "block {bi} frame {n}: exact {} exceeds its bound {bound}",
+                    energy <= state.energy[n],
+                    "block {bi} frame {n}: exact {energy} exceeds its bound {}",
                     state.energy[n]
                 );
+                (state.energy[n], state.bin[n], state.dirty[n]) = (energy, bin, false);
             }
-        });
+        }
     }
 
     /// Make every frame exact. The tables then equal a full recompute's, which is what lets the
     /// table-for-table gate keep its teeth on the lazy path.
     pub fn resolve_all(&mut self) {
-        let pending: Vec<(usize, usize)> = self
-            .states
-            .iter()
-            .enumerate()
-            .flat_map(|(bi, st)| {
-                st.dirty
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &d)| d)
-                    .map(move |(n, _)| (bi, n))
-            })
-            .collect();
-        if !pending.is_empty() {
+        let pending = self.dirty_frames(|_| true);
+        if !pending.iter().all(Vec::is_empty) {
             self.resolve(&pending);
         }
     }
@@ -660,13 +666,17 @@ impl<'a> Mp<'a> {
             a2.push(a2.last().unwrap() + x * x);
         }
         let atom_end = tau + atom.len();
+        let blocks = &self.dict.blocks;
 
-        for (bi, st) in self.states.iter_mut().enumerate() {
-            let block = &self.dict.blocks[bi];
+        // Each block bounds only its own frames, so the blocks go across the pool once there are
+        // enough stale frames to pay for waking it. Returns how many frames the block bounded.
+        let bound_block = |(bi, st): (usize, &mut BlockState)| -> usize {
+            let block = &blocks[bi];
             let Some((n_lo, n_hi)) = stale_range_of(block, st.energy.len(), tau, atom.len()) else {
-                continue;
+                return 0;
             };
             let support = block.support_len();
+            let mut marked = 0;
             for n in n_lo..=n_hi {
                 let onset = block.frame_onset(n);
                 let (lo, hi) = (onset.max(tau), (onset + support).min(atom_end));
@@ -714,22 +724,44 @@ impl<'a> Mp<'a> {
                 let bound = (old.sqrt() + delta.sqrt()).powi(2) * (1.0 + 1e-4) + 1e-12;
                 st.energy[n] = bound;
                 st.dirty[n] = true;
-                self.marked += 1;
-                self.per_block[bi].0 += 1;
+                marked += 1;
             }
+            marked
+        };
+
+        let stale: usize = self
+            .states
+            .iter()
+            .zip(blocks)
+            .filter_map(|(st, b)| stale_range_of(b, st.energy.len(), tau, atom.len()))
+            .map(|(lo, hi)| hi - lo + 1)
+            .sum();
+        let marked: Vec<usize> = if stale >= PARALLEL_BOUND_FRAMES {
+            self.states.par_iter_mut().enumerate().map(bound_block).collect()
+        } else {
+            self.states.iter_mut().enumerate().map(bound_block).collect()
+        };
+        for (bi, m) in marked.into_iter().enumerate() {
+            self.marked += m;
+            self.per_block[bi].0 += m;
         }
     }
 
     /// Recompute every frame — the reference behaviour.
     fn refresh_all(&mut self) {
-        let (dict, residual) = (self.dict, &self.residual);
-        for_each_block(&mut self.corrs, &mut self.states, |bi, corr, state| {
-            let block = &dict.blocks[bi];
-            for n in 0..state.energy.len() {
-                refresh_one(block, corr, state, residual, n);
-                state.dirty[n] = false;
+        let every: Vec<Vec<usize>> = self.states.iter().map(|s| (0..s.energy.len()).collect()).collect();
+        let exact = refresh_frames(
+            &self.dict.blocks,
+            &mut self.corrs,
+            &mut self.spares,
+            &self.residual,
+            &every,
+        );
+        for (state, exact) in self.states.iter_mut().zip(exact) {
+            for (n, (bin, energy)) in exact.into_iter().enumerate() {
+                (state.energy[n], state.bin[n], state.dirty[n]) = (energy, bin, false);
             }
-        });
+        }
     }
 
     /// Per-frame best energies for one block. Exposed so the incremental and full-recompute paths
@@ -755,31 +787,74 @@ impl<'a> Mp<'a> {
     }
 }
 
-/// Run `f` over every block's correlator and frame table, in parallel.
+/// Recompute `frames[b]` of every block `b`, returning each frame's `(bin, energy)` in the order
+/// listed.
 ///
-/// The whole per-frame cost of the pursuit — one FFT and one bin scan — lives inside this, and
-/// nothing crosses between blocks: each writes only its own frame table. Results are therefore
-/// identical to running the blocks in sequence, which is what lets the bit-identity gates keep
-/// their teeth.
+/// The whole per-frame cost of the pursuit — one FFT and one bin scan — lives inside this. A frame's
+/// result depends only on the residual and its block, never on which correlator or thread computed
+/// it, so the parallel result is identical to computing the frames in sequence, which is what lets
+/// the bit-identity gates keep their teeth.
 ///
-/// Small jobs stay on one thread. Rayon's per-task overhead is real next to a block whose stale set
-/// is a handful of short frames, and the test fixtures are all that size.
-fn for_each_block<F>(corrs: &mut [Correlator], states: &mut [BlockState], f: F)
-where
-    F: Fn(usize, &mut Correlator, &mut BlockState) + Sync + Send,
-{
-    let total: usize = states.iter().map(|s| s.energy.len()).sum();
-    if total < PARALLEL_FRAME_THRESHOLD {
-        for (bi, (corr, state)) in corrs.iter_mut().zip(states.iter_mut()).enumerate() {
-            f(bi, corr, state);
-        }
-        return;
+/// **The work is divided by transform samples, not by block.** A block's frames used to run in
+/// sequence on one thread, and a low-`alpha` block pending several 337,500-point frames was then a
+/// chain every other thread waited on: on 10 s of piano the `alpha = 1` blocks averaged six pending
+/// frames a pass and up to 25, and summing each pass's largest block gave 2.9x the floor that
+/// dividing the work evenly allows. So each block's list is cut into chunks of about the pass's
+/// work over the thread count — a heavy block into several, each on a correlator forked from the
+/// block's own and kept in `spares` for the passes after, and a light block left whole, which keeps
+/// the locality that made a pure per-frame split measure 30% slower.
+///
+/// Small jobs stay on one thread: rayon's per-task overhead is real next to a handful of short
+/// frames, and the test fixtures are all that size.
+fn refresh_frames(
+    blocks: &[crate::dict::Block],
+    corrs: &mut [Correlator],
+    spares: &mut [Vec<Correlator>],
+    residual: &[f32],
+    frames: &[Vec<usize>],
+) -> Vec<Vec<(u32, f64)>> {
+    let scan = |bi: usize, corr: &mut Correlator, list: &[usize]| -> Vec<(u32, f64)> {
+        let block = &blocks[bi];
+        list.iter()
+            .map(|&n| {
+                let (k, p) = scan_frame(corr, block, residual, block.frame_onset(n));
+                (k as u32, p.energy)
+            })
+            .collect()
+    };
+
+    let work: usize = frames.iter().zip(blocks).map(|(f, b)| f.len() * b.fft_len).sum();
+    if work < PARALLEL_TRANSFORM_SAMPLES {
+        return corrs.iter_mut().zip(frames).enumerate().map(|(bi, (c, f))| scan(bi, c, f)).collect();
     }
-    corrs
-        .par_iter_mut()
-        .zip(states.par_iter_mut())
-        .enumerate()
-        .for_each(|(bi, (corr, state))| f(bi, corr, state));
+
+    let threads = rayon::current_num_threads().max(1);
+    let target = work.div_ceil(threads);
+    let mut tasks: Vec<(usize, &mut Correlator, &[usize])> = Vec::new();
+    for (bi, ((corr, spare), list)) in corrs.iter_mut().zip(spares.iter_mut()).zip(frames).enumerate() {
+        if list.is_empty() {
+            continue;
+        }
+        let chunks = (list.len() * blocks[bi].fft_len).div_ceil(target).clamp(1, list.len().min(threads));
+        while spare.len() + 1 < chunks {
+            spare.push(corr.fork());
+        }
+        let size = list.len().div_ceil(chunks);
+        for (c, part) in std::iter::once(corr).chain(spare.iter_mut()).zip(list.chunks(size)) {
+            tasks.push((bi, c, part));
+        }
+    }
+
+    let done: Vec<(usize, Vec<(u32, f64)>)> = tasks
+        .into_par_iter()
+        .with_max_len(1)
+        .map(|(bi, c, part)| (bi, scan(bi, c, part)))
+        .collect();
+    let mut out = vec![Vec::new(); frames.len()];
+    for (bi, part) in done {
+        out[bi].extend(part);
+    }
+    out
 }
 
 /// Bytes of frame table one frame costs: `energy` (f64), `bin` (u32) and `dirty` (bool).
@@ -976,24 +1051,24 @@ pub fn run_windowed(
     WindowedRun { book, residual, marked, resolved, per_block, init }
 }
 
-/// Frame count below which the blocks are refreshed on one thread.
-///
-/// Chosen to sit under any realistic analysis and over every test fixture, so the threshold is not
-/// itself a thing that needs tuning.
-const PARALLEL_FRAME_THRESHOLD: usize = 4096;
+/// Frames below which collecting the dirty frames stays on one thread: about 6 ns a frame against
+/// tens of microseconds to wake the pool, twice per selected atom. The same line as `cand`'s scan,
+/// for the same reason.
+const PARALLEL_SCAN_FRAMES: usize = 1 << 13;
 
-/// Recompute one frame's stored energy and bin.
-fn refresh_one(
-    block: &crate::dict::Block,
-    corr: &mut Correlator,
-    state: &mut BlockState,
-    residual: &[f32],
-    n: usize,
-) {
-    let (k, p) = scan_frame(corr, block, residual, block.frame_onset(n));
-    state.energy[n] = p.energy;
-    state.bin[n] = k as u32;
-}
+/// Stale frames below which bounding them stays on one thread. A bound is about 170 ns — eight
+/// range-maxima and prefix-sum lookups — so this line is far lower than the scan's.
+const PARALLEL_BOUND_FRAMES: usize = 1 << 10;
+
+/// Transform samples below which the blocks are refreshed on one thread — a few hundred
+/// microseconds of work, against rayon's tens for waking the pool.
+///
+/// **Measured in transform samples, not frames.** This used to be the size of the whole frame
+/// table, which says nothing about the work: a frame of an `alpha = 1` block is a 337,500-point
+/// transform. A 2 s excerpt has a table under the old 4096-frame line, so every refresh of those
+/// transforms ran on one thread: 100% CPU on a 24-thread machine, with the refresh 5–20x slower
+/// than the same frames spread across the blocks.
+const PARALLEL_TRANSFORM_SAMPLES: usize = 1 << 16;
 
 /// Frames of `block` whose read window overlaps `[tau, tau + atom_len)`.
 ///
@@ -1378,6 +1453,58 @@ mod tests {
     }
 
     /// Stale bounds must be exactly the frames that overlap, checked against the definition.
+    /// Dividing a refresh by transform samples — heavy blocks cut into chunks, each on a correlator
+    /// forked from the block's own — computes exactly what one correlator computes frame by frame.
+    ///
+    /// Run twice so the second pass reuses the forks with the first pass's buffers still in them.
+    #[test]
+    fn a_divided_refresh_matches_one_frame_at_a_time() {
+        let mut planner = Planner::new();
+        let cfg = BlockConfig { f_min: 100.0, f_max: 6000.0, ..BlockConfig::default() };
+        let d = Dictionary::from_grid(&[(40.0, 0.001), (300.0, 0.002), (2147.0, 0.0003)], SR, &mut planner, &cfg)
+            .unwrap();
+        let sig = noise(60_000, 11);
+        let frames: Vec<Vec<usize>> = d
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(bi, b)| (0..b.frame_count(sig.len())).filter(|n| n % (bi + 1) == 0).collect())
+            .collect();
+        let work: usize = frames.iter().zip(&d.blocks).map(|(f, b)| f.len() * b.fft_len).sum();
+        assert!(work >= PARALLEL_TRANSFORM_SAMPLES, "the fixture must take the divided path");
+
+        let expected: Vec<Vec<(u32, f64)>> = d
+            .blocks
+            .iter()
+            .zip(&frames)
+            .map(|(b, list)| {
+                let mut c = Correlator::new(b, &mut planner);
+                list.iter()
+                    .map(|&n| {
+                        let (k, p) = scan_frame(&mut c, b, &sig.samples, b.frame_onset(n));
+                        (k as u32, p.energy)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut corrs: Vec<Correlator> = d.blocks.iter().map(|b| Correlator::new(b, &mut planner)).collect();
+        let mut spares: Vec<Vec<Correlator>> = d.blocks.iter().map(|_| Vec::new()).collect();
+        for pass in 0..2 {
+            let got = refresh_frames(&d.blocks, &mut corrs, &mut spares, &sig.samples, &frames);
+            assert_eq!(got.len(), expected.len());
+            for (bi, (g, e)) in got.iter().zip(&expected).enumerate() {
+                assert_eq!(g.len(), e.len(), "pass {pass}, block {bi}");
+                for (i, (a, b)) in g.iter().zip(e).enumerate() {
+                    assert!(a.0 == b.0 && a.1.to_bits() == b.1.to_bits(), "pass {pass}, block {bi}, frame {i}");
+                }
+            }
+        }
+        if rayon::current_num_threads() > 1 {
+            assert!(spares.iter().any(|s| !s.is_empty()), "no block was divided");
+        }
+    }
+
     #[test]
     fn stale_range_matches_the_overlap_definition() {
         let d = tiny_dict();

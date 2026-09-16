@@ -130,6 +130,7 @@ pub fn spawn(job: Job) -> Running {
     std::thread::Builder::new()
         .name("rmp-analysis".into())
         .spawn(move || {
+            rmp_core::threads::prefer_fast_cores();
             let tx2 = tx.clone();
             match work(job, &flag, &tx) {
                 Ok(outcome) => tx2.send(Update::Done(Box::new(outcome))).ok(),
@@ -371,6 +372,7 @@ pub fn spawn_synthesis(job: SynthJob) -> Synthesising {
     std::thread::Builder::new()
         .name("rmp-synthesis".into())
         .spawn(move || {
+            rmp_core::threads::prefer_fast_cores();
             let where_to = job.output.display().to_string();
             let request = rmp_synthesis::RenderRequest {
                 book: rmp_synthesis::BookInput::Full(job.book),
@@ -473,6 +475,7 @@ pub fn spawn_tfmap(job: MapJob) -> Mapping {
     std::thread::Builder::new()
         .name("rmp-tfmap".into())
         .spawn(move || {
+            rmp_core::threads::prefer_fast_cores();
             let msg = match build_map(&job) {
                 Ok(done) => MapUpdate::Done(Box::new(done)),
                 Err(e) => MapUpdate::Failed(e),

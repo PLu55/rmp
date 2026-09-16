@@ -622,7 +622,7 @@ fn accumulate(cells: &mut [f64], n_f: usize, k: &AtomKernel) {
 /// The kernels are computed in parallel and folded in serially, in book order. That is deliberate:
 /// per-thread accumulators would cost more to reduce than the fold takes, and fixing the f64
 /// addition order to book order makes the result **bit-identical regardless of thread count** —
-/// the same standard `mp::for_each_block` is held to, and the only thing that gives a determinism
+/// the same standard `mp::refresh_frames` is held to, and the only thing that gives a determinism
 /// gate any teeth.
 pub fn compute(book: &Book, grid: MapGrid, opts: &MapOptions) -> Result<TfMap, FofError> {
     let sr = book.sample_rate;
@@ -1219,7 +1219,7 @@ mod tests {
     ///
     /// The kernels are computed in parallel but folded in serially, in book order, precisely so
     /// that the f64 addition order does not depend on scheduling. This is the same standard
-    /// `mp::for_each_block` is held to, and it is what lets any later comparison of two maps mean
+    /// `mp::refresh_frames` is held to, and it is what lets any later comparison of two maps mean
     /// something.
     #[test]
     fn the_map_does_not_depend_on_the_thread_count() {

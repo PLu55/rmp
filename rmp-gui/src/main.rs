@@ -55,6 +55,7 @@ fn install_fallback_font(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result {
+    rmp_core::threads::configure_pool();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 860.0])

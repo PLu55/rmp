@@ -140,6 +140,8 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   pursuit, analyse the residue. It computes and reports facts and formats nothing, which is what
   lets the CLI and the GUI drive the same code without one of them dictating how the other reads.
 - **`config` / `audio`** — TOML settings, libsndfile I/O.
+- **`threads`** — sizing the rayon pool to the machine's fast physical cores and keeping the pool and
+  the thread driving an analysis on them. Changes how long a run takes and nothing else.
 - **`rmp-synthesis`** — all synthesis. `atoms` renders a book's atoms through the same per-atom
   render the pursuit subtracted; the rest is the inverse of `residual`: a power-complementary ERB
   bank driven by independent per-band noise at `sqrt(P_b)`, reusing `rmp_core::residual::filter`
@@ -206,12 +208,31 @@ scan compares energies and the full projection is solved once, for the winner. `
 `fit::Quad::solve_z` exist so the energy-only and full paths cannot drift apart. The same trap is
 live in `refine`, whose 1-D searches read nothing but `.energy` a few hundred times per candidate.
 
-**Blocks are independent, and that is load-bearing for speed.** Each owns its correlator, frame
-table and tree; the only shared thing is the residual, read-only during a refresh. `mp::for_each_block`
-runs them on rayon, which is why `Correlator` holds its own FFT plan and `RealFft::forward` takes
-`&mut self`. Nothing crosses between blocks, so the parallel result is bit-identical and the
-bit-identity gates keep their teeth. Below `PARALLEL_FRAME_THRESHOLD` it stays serial, because
-rayon's per-task overhead is real next to the test fixtures' tiny stale sets.
+**A frame's refresh depends only on the residual and its block, and that is load-bearing for
+speed.** Each block owns its frame table and a correlator; the only shared thing is the residual,
+read-only during a refresh. `mp::refresh_frames` runs the work on rayon, which is why `Correlator`
+holds its own FFT scratch and `RealFft::forward` takes `&mut self`. No frame's result depends on which
+correlator or thread computed it, so the parallel result is bit-identical and the bit-identity gates
+keep their teeth. Two things about how the work is divided:
+
+- **By transform samples, not by block.** A block's frames used to run in sequence on one thread, and
+  on 10 s of piano the `alpha = 1` blocks averaged six pending 337,500-point frames a pass (up to 25)
+  — a chain every other thread waited on. Summing each pass's largest block gave 6,974 Msamples
+  against a 2,391 floor for dividing the work evenly over 24 threads. Each block's list is now cut
+  into chunks of about the pass's work over the thread count, a heavy block into several — each on a
+  correlator `fork`ed from the block's own, sharing its plan and kept in `Mp::spares` — and a light
+  block left whole, keeping the locality that made a pure per-frame split measure 30% slower.
+  `a_divided_refresh_matches_one_frame_at_a_time` is the gate.
+- **The serial threshold is transform samples too**, `PARALLEL_TRANSFORM_SAMPLES`. It used to be the
+  frame table's size, which a 2 s excerpt falls under while each of its `alpha = 1` frames is a
+  337,500-point transform: short excerpts refreshed on one thread, 100% CPU on a 24-thread machine,
+  with the refresh 5–20x slower than spread across the pool.
+
+The per-atom scans are divided the same way, by block: `cand::top_seeds` finds each block's best `k`
+after suppression and merges by rank — exact, because suppression never crosses blocks, and pinned
+against the one-scan form by `searching_blocks_separately_matches_one_scan_over_all_of_them` — and
+the dirty-frame collection and `mark_stale` go across the pool once there are enough frames to pay
+for it. On 10 s of piano those three cost 2.4 s serial.
 
 **`support_len` and `fft_len` are different fields.** The stale set and the envelope use support; the
 frame read and the FFT use `fft_len` (rounded to an even 5-smooth length, not a power of two).
@@ -499,6 +520,30 @@ whole when exceeded, which is safe at any point because it is a pure memo. RSS i
 afterwards. Do not "improve" the eviction into something per-entry: a whole search must fit, and
 clearing whole is what keeps the current search's working set intact.
 
+**Refinement's search is speculative, and the envelope cache is what makes that delicate.** A
+golden-section step's next probe is fixed by the bracket and one comparison, so every probe of the
+next `k` steps is known before any is scored — `2^k - 1` of them, one per path of outcomes.
+`refine::golden` scores the whole tree as one rayon batch and walks the path the real comparisons
+take. The points probed and the comparisons made are the serial search's, so a book is bit-identical
+at any width. Scoring is pure but the cache is not — a lookup inserts, and an insertion can clear —
+so `Objective` splits the two: `speculate` reads the cache and renders what it lacks while changing
+nothing, and `commit`, called in serial order for the probes on the path only, makes exactly the
+insertions and clears the serial search would have made, from renders already done. Three things are
+load-bearing:
+
+- **A held entry is trusted only if no clear has happened since the batch was scored.** Entries leave
+  only by a clear and are never overwritten, so an unchanged clear count proves it is the same entry.
+  After a clear a lookup renders afresh, and because a FOF key leaves out the release, that render
+  need not match what was held. `a_held_entry_is_not_trusted_across_a_clear` plants exactly that
+  stale entry; it is the only test that fails without the check.
+- **Width 1 is not the speculative path with one trial.** `speculate` does nothing and `commit` calls
+  `fit_score_with` — the serial search as it was. Short envelopes run it, because below
+  `PARALLEL_SUPPORT` a rayon dispatch (15–20 µs) costs more than a probe (7 µs on 2000 samples), and
+  it is the independent reference `refinement_is_the_same_at_every_width` compares against. While
+  width 1 went through the batch logic too, that gate passed with the logic broken.
+- **`golden_section_is_the_same_search_at_every_width` compares against `golden_reference`**, the
+  pre-speculation loop kept verbatim in the tests, for the same reason.
+
 **A signal too large for the frame-table budget is windowed, and that is the one thing in the crate
 that changes which atoms are selected.** `mp::WindowPlan` sizes a *core* from `max_memory_mb` and the
 dictionary's own per-sample cost, plus a *guard* of one longest atom — the longest block support, or
@@ -743,7 +788,7 @@ an unrefined one.
 **Kernels are computed in parallel and folded in serially, in book order.** Per-thread accumulators
 would cost more to reduce than the fold takes (24 x 7.7 MB against ~100 ms), and fixing the f64
 addition order makes the map bit-identical whatever the thread count — the same standard
-`mp::for_each_block` is held to, and what gives the determinism gate teeth. 5000 atoms onto
+`mp::refresh_frames` is held to, and what gives the determinism gate teeth. 5000 atoms onto
 1200x800 takes 0.13 s wall; the FFTs are the whole cost.
 
 **`plotters` uses the `ab_glyph` backend, which has no font discovery.** `render::init_fonts` finds
@@ -817,11 +862,11 @@ check (1.06×).
 on-grid; refining `(t0, f, alpha, beta)` after selection cuts that to 3×, and 99% of selected atoms
 move off the grid.
 
-Refinement is now the *expensive* part of an iteration rather than a rounding error on it — 2.76 ms
-per atom against 1.54 ms without. That is a reversal: it used to be the cheaper of the two because
-`refresh_stale` dominated everything. Parallelising the refresh removed that cover, and refinement's
-few hundred accumulation passes per candidate are still serial. It remains worth it four times over
-on atom count, and it is where the next parallelism would go.
+Refinement is the *expensive* part of an iteration rather than a rounding error on it — 2.76 ms
+per atom against 1.54 ms without, measured while its search was still serial. That is a reversal: it
+used to be the cheaper of the two because `refresh_stale` dominated everything, and parallelising the
+refresh removed that cover. It remains worth it four times over on atom count. Its search is now
+speculative, which about halves it on long envelopes — see *Where the cores go*.
 
 Caching `G` across the onset sweep — the one stage holding both envelope and carrier fixed, so `G`
 cannot change — takes the refined arm from 266 ms to 248 ms, about 7% of that stage and 3%
@@ -862,6 +907,72 @@ attack, so they trade against each other along a shallow valley that coordinate 
 but not along — a known cost of the one-dimensional method, bounded by a fit that still captures
 99.9% of an isolated atom.
 
+### Where the cores go
+
+Measured on a 24-thread i7-13700KF — 8 performance cores with hyperthreading, 8 efficiency cores —
+where analyses used 100–360% CPU. Every book and residual below is byte-identical at every step.
+Timings are interleaved A/B runs; see *Measurement discipline* for why that matters here.
+
+| run | original | round 1 | round 2 |
+| --- | --- | --- | --- |
+| `chopin-nocturne-2.toml`, 3 s | 5.30 s | 4.46 s | 3.53 s |
+| `mp_1.toml`, 3 s | 12.28 s | 10.06 s | 7.90 s |
+| `lux-eterna-1-mixed.toml`, 2 s | 11.01 s | 4.14 s | 3.48 s |
+| `lux-eterna-1-gaussian.toml`, 2 s | 11.25 s | 8.55 s | 6.42 s |
+| `chopin-nocturne-2.toml` with HRMP, 1 s | 3.50 s | 1.68 s | 1.32 s |
+| `zyklus-mp-1.toml`, 2 s | 10.64 s | 6.21 s | 4.49 s |
+| `chopin-nocturne-2.toml`, 10 s | — | 38.00 s | 29.79 s |
+
+The *original* column was measured in a different session from the other two, so compare it loosely.
+
+**Round 1** removed two serial stages. The refresh threshold counted frames (see *A frame's refresh
+depends only on the residual*), so every excerpt under about 2 s refreshed on one thread; that alone
+took the mixed run from 11.0 s to 4.7 s. And refinement was serial — 3.1 of 5.2 s on 3 s of piano, the
+same at 1 thread as at 24 — until its search went speculative, about 1.8x faster on envelopes of 16k
+samples and up.
+
+**Round 2** divided the refresh by transform samples and parallelised the per-atom scans — 1–14%
+at 24 threads, most on the 10 s clip and `zyklus` — and then stopped using most of the machine, which
+was the larger win. The
+evidence, all on this CPU:
+
+- **Big transforms stop scaling at 10–12 threads and then get slower.** Throughput of concurrent
+  337,500-point correlations, each thread its own buffers: 1.9x at 2, 3.3x at 4, 4.6x at 8, 4.9x at
+  10–12, 4.4x at 16, 3.2x at 24. 168,750 points peaks at 8.3x on 12 and gives 6.1x at 24; 86,400 and
+  below keep climbing to about 10.5x. A 337,500-point frame walks about 9 MB. Pinned runs place the
+  loss: 8 physical performance cores 4.6x, the same 8 cores with their hyperthreads 3.3x, 8 efficiency
+  cores 1.9x — they share an L2 per cluster of four.
+- **Huge pages change nothing** (`madvise(MADV_HUGEPAGE)` on 2 MB-aligned buffers: 9,417 against
+  9,423 frames/s at 12 threads), so this is memory traffic and cache, not the TLB.
+- **Capping only the heavy transforms did not help.** Packing heavy frames into at most 12 or 8
+  sequential lanes while light blocks used the whole pool measured the same as or slower than the
+  plain division: the light transforms load the same memory bus.
+- **A pool of one thread per performance core was fastest end to end**: 3 s of piano 3.6 s against
+  4.2 s at 24, with 10, 12 and 16 in between, and the same ordering on every configuration.
+- **Where the driving thread runs matters as much.** It does refinement's serial half, the
+  subtraction and the scans, and with eight busy workers the scheduler parks it on an efficiency core.
+  Keeping it and the workers on the performance cores' CPUs was another 10–13%. Pinning the workers
+  alone was *worse* than nothing on the Gaussian run (7.8 s against 7.3). Pinning each worker to its
+  own core gained a further 3–5%, but was not taken: two processes side by side would pin to the same
+  eight CPUs.
+
+So `threads::configure_pool` builds one worker per fast physical core, kept to those cores' CPUs,
+and each front end calls `threads::prefer_fast_cores` on the thread that drives the work: the CLI on
+its main thread, the GUI on its analysis, synthesis and map threads but never its UI thread.
+`RAYON_NUM_THREADS` turns all of it off. The report prints the pool size, because a machine at 30%
+CPU looks like a bug unless it says why. Peak memory went *down*, 194 MB to 182 MB on 3 s: fewer
+threads mean fewer forked correlators.
+
+**Detection is sysfs, and one field lies.** This kernel reports `cpu_capacity = 1024` on every CPU,
+efficiency cores included; trusting it counted 16 fast cores. `threads` uses whichever of capacity or
+`cpuinfo_max_freq` actually differs between CPUs — 5.3/5.4 GHz against 4.2 here — and reads the
+allowed CPUs from `/proc/self/status`, so a `taskset` mask narrows it.
+
+**What remains is memory traffic, not scheduling.** The refresh is at the 8-core throughput ceiling
+of its transforms, and refinement's batches of 8 at about 3 golden-section steps each. A homogeneous
+CPU with more memory channels should scale further on the same code. Changing what a frame costs
+would mean changing the transform or the accumulation order, and both move books.
+
 ### The low-alpha regime, and what `capture_tolerance` is worth
 
 The realistic configs in `data/config` reach down to `alpha = 1`: a 332k-sample support, a 337,500
@@ -887,7 +998,9 @@ with refinement on, set 0.5 for realistic material and expect the numbers above.
 **Splitting the refresh by frame instead of by block was slower**, 30% at every thread count from 4
 to 24, and chunking frames by block did not recover it. Same profile shape with more time in the
 FFT's load-heavy butterflies — bouncing threads across six differently sized envelopes and buffer
-sets. The block split's locality is worth more than its balance costs.
+sets. That was a split of *every* block. Cutting only the blocks whose pending work exceeds a
+thread's share, and leaving the rest whole, is what `refresh_frames` does now and it is faster: see
+*Where the cores go*.
 
 **The transform length is not the problem.** rustfft runs these lengths at ~1.1 ns/sample; a
 factorisation with a small odd cofactor (345600 = 2⁹·675 over 337500 = 2²·3³·5⁵) is 7–14% faster on
@@ -1050,6 +1163,11 @@ Run-to-run variance on this machine reaches ~5% (realfft is markedly less reprod
 17% spread at N=8192 across runs, against FFTW's 3.6%). **Treat sub-5% differences as unresolved**
 unless they reproduce across several runs. Criterion's within-run confidence intervals are much
 tighter than the true between-run spread and will overstate your confidence.
+
+**Compare interleaved, never across a session.** The same binary measured 1.50 s of refresh on 3 s
+of piano and, twenty minutes of benchmarking later, 1.95 s — with no thermal or power throttling,
+temperatures at 66–72 °C, and huge pages not in play. Something else on the desktop moves the
+baseline by tens of percent. Run A and B alternately, repeat, and compare only within a sweep.
 
 ## Design history
 

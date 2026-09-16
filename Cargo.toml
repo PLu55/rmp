@@ -21,6 +21,7 @@ rfofs = { path = "../rfofs" }
 
 realfft = "3.5"
 rayon = "1"
+libc = "0.2"
 
 # CLI, settings document, book serialisation, and soundfile I/O.
 clap = { version = "4", features = ["derive"] }

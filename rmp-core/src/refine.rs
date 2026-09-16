@@ -42,6 +42,15 @@
 //! peak by about 3.7 samples per sample of `sigma`, so the width search would really be a coupled
 //! width-and-onset search, badly conditioned in both. The `sigma` stage therefore holds the *centre*
 //! fixed and moves `t0` with it; the onset stage that follows is then a pure shift again.
+//!
+//! # The search scores several trials at once, and finds what a serial one would
+//!
+//! Golden section is sequential, but its next few probes are known before any is scored: one per
+//! path of comparison outcomes. `golden` scores that tree as a batch and follows the path the
+//! comparisons actually take, and `Objective` splits scoring from committing so the envelope cache's
+//! insertions and clears still happen in the serial order, for the serial search's probes only. The
+//! result is bit-identical at every width. An envelope shorter than `PARALLEL_SUPPORT` runs the
+//! plain serial search, which is also the reference the tests hold every wider search to.
 
 use crate::atom::Shape;
 use crate::cand::Candidate;
@@ -49,6 +58,7 @@ use crate::dict::Block;
 use crate::fit;
 use crate::fof::{Envelope, EnvelopeParams, ReleasePolicy};
 use crate::gauss::GaussianParams;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug)]
@@ -152,6 +162,9 @@ pub struct EnvelopeCache {
     budget: usize,
     /// The high-water mark over the cache's life, for `RMP_REFRESH_DETAIL`.
     peak_samples: usize,
+    /// Times the cache has been cleared. Entries leave only by a clear and are never overwritten,
+    /// so an unchanged count proves an entry read earlier is still the one a lookup returns.
+    clears: u64,
 }
 
 /// Envelope samples the cache may hold before it clears: 64 MB of `f32`.
@@ -187,6 +200,7 @@ impl EnvelopeCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.samples = 0;
+        self.clears += 1;
     }
 
     /// Render `shape`, or return `None` if it is out of bounds or unusable.
@@ -203,43 +217,57 @@ impl EnvelopeCache {
         sample_rate: f32,
         cfg: &RefineConfig,
     ) -> Option<&(Envelope, usize)> {
-        let in_bounds = match shape {
-            Shape::Fof(p) => {
-                p.alpha >= cfg.alpha_min
-                    && p.alpha <= cfg.alpha_max
-                    && p.beta >= cfg.beta_min
-                    && p.beta <= cfg.beta_max
-                    && p.alpha * p.beta <= cfg.alpha_beta_max
-            }
-            Shape::Gaussian(g) => g.sigma >= cfg.sigma_min && g.sigma <= cfg.sigma_max,
-        };
-        if !in_bounds {
+        if !in_bounds(shape, cfg) {
             return None;
         }
-
-        let max_len = cfg.max_atom_samples;
         let key = shape.cache_key();
         if !self.entries.contains_key(&key) {
-            let value = (|| {
-                let env = Envelope::render(shape, sample_rate).ok()?;
-                if env.support_len() > max_len {
-                    return None;
-                }
-                let cut = fit::fit_end(&env);
-                Some((env, cut))
-            })();
-            // The budget is enforced *before* the insertion, so the entry just rendered always
-            // survives it: a caller that asked for an envelope gets one back, whatever the ceiling.
-            let cost = value.as_ref().map_or(0, |(env, _)| env.support_len());
-            if self.samples + cost > self.budget {
-                self.clear();
-            }
-            self.samples += cost;
-            self.peak_samples = self.peak_samples.max(self.samples);
-            self.entries.insert(key, value);
+            self.insert(key, render_entry(shape, sample_rate, cfg.max_atom_samples));
         }
         self.entries[&key].as_ref()
     }
+
+    /// Store a render of a key the cache does not hold.
+    ///
+    /// The budget is enforced *before* the insertion, so the entry just rendered always survives
+    /// it: a caller that asked for an envelope gets one back, whatever the ceiling.
+    fn insert(&mut self, key: (u8, u32, u32), value: Option<(Envelope, usize)>) {
+        let cost = value.as_ref().map_or(0, |(env, _)| env.support_len());
+        if self.samples + cost > self.budget {
+            self.clear();
+        }
+        self.samples += cost;
+        self.peak_samples = self.peak_samples.max(self.samples);
+        self.entries.insert(key, value);
+    }
+}
+
+/// Whether refinement may consider `shape` at all.
+fn in_bounds(shape: Shape, cfg: &RefineConfig) -> bool {
+    match shape {
+        Shape::Fof(p) => {
+            p.alpha >= cfg.alpha_min
+                && p.alpha <= cfg.alpha_max
+                && p.beta >= cfg.beta_min
+                && p.beta <= cfg.beta_max
+                && p.alpha * p.beta <= cfg.alpha_beta_max
+        }
+        Shape::Gaussian(g) => g.sigma >= cfg.sigma_min && g.sigma <= cfg.sigma_max,
+    }
+}
+
+/// What the cache stores for a key it did not hold: the envelope and its fit-region length, or
+/// `None` for a shape that cannot be rendered or is longer than `max_len`.
+///
+/// A pure function of its arguments, which is what lets a speculative search render on any thread
+/// and still hand the cache exactly what [`EnvelopeCache::get`] would have rendered.
+fn render_entry(shape: Shape, sample_rate: f32, max_len: usize) -> Option<(Envelope, usize)> {
+    let env = Envelope::render(shape, sample_rate).ok()?;
+    if env.support_len() > max_len {
+        return None;
+    }
+    let cut = fit::fit_end(&env);
+    Some((env, cut))
 }
 
 /// The shape parameters being searched, per kind.
@@ -279,6 +307,22 @@ impl Family {
     }
 }
 
+/// Envelope samples below which a refinement scores its trials one at a time.
+///
+/// A rayon dispatch costs 15–20 µs and a trial on a 2000-sample envelope about 7, so below here a
+/// batch spends more waking the pool than it saves. Anywhere from 1024 to 4096 measured the same
+/// to within noise; the top of that range wastes the least speculative work. Where the line sits
+/// cannot change a result — see [`golden`] — only how long one takes.
+const PARALLEL_SUPPORT: usize = 1 << 12;
+
+/// The most trials one speculative batch may score.
+///
+/// A batch of `2^k - 1` trials settles `k` golden-section steps, so doubling the width buys one
+/// step per batch; 16 is the width at which the first batch, which carries both interior points,
+/// also settles four. Wider is no faster, since a batch waits for its slowest trial and past the
+/// machine's fast cores the extra trials land on slow ones or share a core.
+const MAX_WIDTH: usize = 16;
+
 /// Refine `cand` in place. Returns whether the parameters actually moved.
 pub fn refine(
     cand: &mut Candidate,
@@ -286,6 +330,23 @@ pub fn refine(
     residual: &[f32],
     cfg: &RefineConfig,
     cache: &mut EnvelopeCache,
+) -> bool {
+    let width = if block.support_len() >= PARALLEL_SUPPORT {
+        rayon::current_num_threads().clamp(1, MAX_WIDTH)
+    } else {
+        1
+    };
+    refine_at_width(cand, block, residual, cfg, cache, width)
+}
+
+/// [`refine`], scoring up to `width` trials at once. The result does not depend on `width`.
+fn refine_at_width(
+    cand: &mut Candidate,
+    block: &Block,
+    residual: &[f32],
+    cfg: &RefineConfig,
+    cache: &mut EnvelopeCache,
+    width: usize,
 ) -> bool {
     let sr = block.sample_rate();
     let (family, form) = match cand.atom.env {
@@ -309,6 +370,7 @@ pub fn refine(
         ),
     };
     let family = &family;
+    let search = Search { residual, sr, family, cfg, width };
 
     let seed = Params { form, f: cand.atom.f, t0: cand.atom.t0 };
 
@@ -337,8 +399,10 @@ pub fn refine(
             (cur.f - half).max(cfg.f_min) as f64,
             (cur.f + half).min(cfg.f_max) as f64,
         );
-        golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, |p, x| p.f = x as f32, |p| {
-            fit_score(*p, residual, sr, family, cfg, cache)
+        golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, |p, x| p.f = x as f32, &mut Trials {
+            search,
+            cache,
+            gram: None,
         });
 
         // The shape. Every scale parameter is searched in log space: they are all positive, so a
@@ -356,8 +420,10 @@ pub fn refine(
                         *alpha = x.exp() as f32;
                     }
                 };
-                golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, set, |p| {
-                    fit_score(*p, residual, sr, family, cfg, cache)
+                golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, set, &mut Trials {
+                    search,
+                    cache,
+                    gram: None,
                 });
 
                 let Form::Fof { beta, .. } = cur.form else { unreachable!() };
@@ -371,8 +437,10 @@ pub fn refine(
                         *beta = x.exp() as f32;
                     }
                 };
-                golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, set, |p| {
-                    fit_score(*p, residual, sr, family, cfg, cache)
+                golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, set, &mut Trials {
+                    search,
+                    cache,
+                    gram: None,
                 });
             }
             Family::Gaussian { cutoff_level } => {
@@ -391,8 +459,10 @@ pub fn refine(
                         p.t0 = centre - half(*sigma);
                     }
                 };
-                golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, set, |p| {
-                    fit_score(*p, residual, sr, family, cfg, cache)
+                golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, set, &mut Trials {
+                    search,
+                    cache,
+                    gram: None,
                 });
             }
         }
@@ -409,21 +479,26 @@ pub fn refine(
                 .get(family.shape(cur.form), sr, cfg)
                 .map(|(env, cut)| fit::gram(&env.samples[..*cut], omega))
         };
+        let mut onset = Trials { search, cache, gram: t0_gram };
         let (lo, hi) = (
             (cur.t0 - t0_radius as i64) as f64,
             (cur.t0 + t0_radius as i64) as f64,
         );
-        golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, |p, x| p.t0 = x.round() as i64, |p| {
-            fit_score_with(*p, residual, sr, family, cfg, cache, t0_gram)
-        });
-        // Golden section works on a real line; polish the integer it landed between.
-        for d in [-1i64, 1] {
-            let trial = Params { t0: cur.t0 + d, ..cur };
-            let s = fit_score_with(trial, residual, sr, family, cfg, cache, t0_gram);
-            if s > cur_score {
-                cur = trial;
-                cur_score = s;
-            }
+        golden(lo, hi, cfg.golden_iters, &mut cur, &mut cur_score, |p, x| p.t0 = x.round() as i64, &mut onset);
+
+        // Golden section works on a real line; polish the integer it landed between. One at a time
+        // that is `t0 - 1`, then `+ 1` from wherever the first left it — which is back at `t0` if
+        // `t0 - 1` won — so all three are scored together and committed in that order.
+        let near = [Params { t0: cur.t0 - 1, ..cur }, Params { t0: cur.t0 + 1, ..cur }, cur];
+        let mut batch = onset.speculate(&near);
+        let mut second = 1;
+        let s = onset.commit(&mut batch, &near, 0);
+        if s > cur_score {
+            (cur, cur_score, second) = (near[0], s, 2);
+        }
+        let s = onset.commit(&mut batch, &near, second);
+        if s > cur_score {
+            (cur, cur_score) = (near[second], s);
         }
 
         if cur_score <= round_start * (1.0 + cfg.score_tol) {
@@ -512,8 +587,23 @@ fn fit_score_with(
     let Some((env, cut)) = cache.get(family.shape(p.form), sr, cfg) else {
         return 0.0;
     };
+    region_score(p, residual, &env.samples[..*cut], sr, cfg, gram)
+}
+
+/// The fit-region score of `p` over an envelope already cut to its fit region.
+///
+/// The one definition, shared by the one-at-a-time path and the speculative one, so that a score
+/// computed ahead on another thread is the score the serial search would have computed.
+fn region_score(
+    p: Params,
+    residual: &[f32],
+    region: &[f32],
+    sr: f32,
+    cfg: &RefineConfig,
+    gram: Option<fit::Gram>,
+) -> f64 {
     let omega = std::f64::consts::TAU * p.f as f64 / sr as f64;
-    fit::accumulate_with(residual, &env.samples[..*cut], p.t0, omega, gram)
+    fit::accumulate_with(residual, region, p.t0, omega, gram)
         .and_then(|q| q.energy(cfg.rho_sq_max))
         .unwrap_or(0.0)
 }
@@ -531,55 +621,282 @@ fn full_score(
     fit::score(residual, env, p.t0, p.f, cfg.rho_sq_max)
 }
 
+/// A score golden section can evaluate many trials of at once.
+///
+/// Scoring and committing are separate so that a batch can be scored in any order and on any
+/// thread, while whatever scoring *changes* — the envelope cache's insertions and clears — still
+/// happens in the order a one-at-a-time search would have made it, and only for the trials that
+/// search would actually have made.
+trait Objective {
+    type Batch;
+    /// Trials one batch may hold. 1 is the one-at-a-time search.
+    fn width(&self) -> usize;
+    /// Score every trial, changing nothing.
+    fn speculate(&self, trials: &[Params]) -> Self::Batch;
+    /// The score a one-at-a-time search would have seen for `trials[i]`, making the changes to
+    /// shared state it would have made. Called in that search's order.
+    fn commit(&mut self, batch: &mut Self::Batch, trials: &[Params], i: usize) -> f64;
+}
+
+/// Everything a trial's score depends on besides its parameters and the cache.
+#[derive(Clone, Copy)]
+struct Search<'a> {
+    residual: &'a [f32],
+    sr: f32,
+    family: &'a Family,
+    cfg: &'a RefineConfig,
+    width: usize,
+}
+
+/// One search stage's objective: [`fit_score_with`] at a fixed Gram, or none.
+struct Trials<'a, 'c> {
+    search: Search<'a>,
+    cache: &'c mut EnvelopeCache,
+    gram: Option<fit::Gram>,
+}
+
+/// Where a speculative score's envelope came from, which decides whether it can be trusted.
+enum Source {
+    /// Out of bounds: scores zero, and the cache never sees it.
+    Refused,
+    /// The entry the cache held when the batch was scored.
+    Held,
+    /// The trial's own render of a key the cache did not hold — what a lookup would have inserted.
+    Rendered(Option<(Envelope, usize)>),
+}
+
+struct Batch {
+    scores: Vec<f64>,
+    /// Emptied to `Refused` as each trial is committed, which hands a render over to the cache.
+    sources: Vec<Source>,
+    /// The cache's clear count when the batch was scored.
+    clears: u64,
+}
+
+impl Objective for Trials<'_, '_> {
+    type Batch = Batch;
+
+    fn width(&self) -> usize {
+        self.search.width
+    }
+
+    fn speculate(&self, trials: &[Params]) -> Batch {
+        let Search { residual, sr, family, cfg, width } = self.search;
+        let cache = &*self.cache;
+        if width <= 1 {
+            // One at a time, each trial is scored as it is committed — the plain serial search,
+            // which is also the reference every wider search is held to.
+            return Batch { scores: Vec::new(), sources: Vec::new(), clears: cache.clears };
+        }
+        let score = |p: Params, entry: Option<&(Envelope, usize)>| {
+            entry.map_or(0.0, |(env, cut)| {
+                region_score(p, residual, &env.samples[..*cut], sr, cfg, self.gram)
+            })
+        };
+
+        // Render and score in one task per trial, so a batch waits for its slowest trial once
+        // rather than once per phase. Two trials of one key the cache lacks would both render it;
+        // within a batch only a clear can bring that about, and it costs time, not correctness.
+        let (scores, sources) = spread(trials.len(), |i| {
+            let p = trials[i];
+            let shape = family.shape(p.form);
+            if !in_bounds(shape, cfg) {
+                return (0.0, Source::Refused);
+            }
+            match cache.entries.get(&shape.cache_key()) {
+                Some(entry) => (score(p, entry.as_ref()), Source::Held),
+                None => {
+                    let value = render_entry(shape, sr, cfg.max_atom_samples);
+                    (score(p, value.as_ref()), Source::Rendered(value))
+                }
+            }
+        })
+        .into_iter()
+        .unzip();
+
+        Batch { scores, sources, clears: cache.clears }
+    }
+
+    fn commit(&mut self, batch: &mut Batch, trials: &[Params], i: usize) -> f64 {
+        let Search { residual, sr, family, cfg, width } = self.search;
+        if width <= 1 {
+            return fit_score_with(trials[i], residual, sr, family, cfg, self.cache, self.gram);
+        }
+        let key = family.shape(trials[i].form).cache_key();
+        let exact = match std::mem::replace(&mut batch.sources[i], Source::Refused) {
+            Source::Refused => true,
+            // Entries leave only by a clear and are never overwritten, so with no clear since the
+            // batch was scored this is still the entry a lookup returns. After one it may not be:
+            // a FOF key leaves out the release, and a re-render need not match what was held.
+            Source::Held => self.cache.clears == batch.clears,
+            // Either still missing, and this render is what the lookup would insert, or inserted
+            // since by an earlier trial of this batch — a render of this same shape either way,
+            // because a key is `Held` for every trial of a batch or for none.
+            Source::Rendered(value) => {
+                if !self.cache.entries.contains_key(&key) {
+                    self.cache.insert(key, value);
+                }
+                true
+            }
+        };
+        if exact {
+            return batch.scores[i];
+        }
+        fit_score_with(trials[i], residual, sr, family, cfg, self.cache, self.gram)
+    }
+}
+
+/// `(0..n).map(f)` across the pool, in order.
+fn spread<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync + Send) -> Vec<R> {
+    (0..n).into_par_iter().with_max_len(1).map(f).collect()
+}
+
+/// A golden-section bracket `[a, b]` and its two interior points.
+#[derive(Clone, Copy, Debug)]
+struct Section {
+    a: f64,
+    b: f64,
+    x1: f64,
+    x2: f64,
+}
+
+impl Section {
+    const R: f64 = 0.618_033_988_749_895;
+
+    fn new(a: f64, b: f64) -> Self {
+        Self { a, b, x1: b - Self::R * (b - a), x2: a + Self::R * (b - a) }
+    }
+
+    /// Shrink toward `a` when `left` — `x1` scored at least as well as `x2` — keeping `x1` as the
+    /// new `x2`; otherwise toward `b`, keeping `x2` as the new `x1`.
+    fn step(self, left: bool) -> Self {
+        if left {
+            let b = self.x2;
+            Self { a: self.a, b, x1: b - Self::R * (b - self.a), x2: self.x1 }
+        } else {
+            let a = self.x1;
+            Self { a, b: self.b, x1: self.x2, x2: a + Self::R * (self.b - a) }
+        }
+    }
+}
+
+/// A probe planned before the comparisons that lead to it were made.
+#[derive(Clone, Copy, Debug)]
+struct Probe {
+    /// The bracket after the step that placed this probe.
+    sec: Section,
+    /// Which way that step went, and so whether the probe is the new `x1` or the new `x2`.
+    left: bool,
+    /// The probes after it, indexed by the next comparison's outcome, `f1 >= f2`.
+    next: [usize; 2],
+}
+
+impl Probe {
+    fn x(&self) -> f64 {
+        if self.left { self.sec.x1 } else { self.sec.x2 }
+    }
+}
+
+/// Plan `levels` steps from `sec`, the first going `left`. Returns the first probe's index.
+fn plan(sec: Section, left: bool, levels: usize, probes: &mut Vec<Probe>) -> usize {
+    let sec = sec.step(left);
+    let i = probes.len();
+    probes.push(Probe { sec, left, next: [usize::MAX; 2] });
+    if levels > 1 {
+        let right = plan(sec, false, levels - 1, probes);
+        let left = plan(sec, true, levels - 1, probes);
+        probes[i].next = [right, left];
+    }
+    i
+}
+
 /// Golden-section maximization over `[lo, hi]`, adopting the result only if it beats `best_score`.
 ///
 /// The incumbent comparison is what makes a step unable to lose: the objective is only
 /// approximately unimodal, and near the bracket edges the maximum may be the starting point itself.
-fn golden<P, S>(
+///
+/// **Speculative, and exactly the one-at-a-time search.** Each step's probe is fixed by the bracket
+/// and one comparison, so every probe of the next `k` steps is known in advance — `2^k - 1` of them,
+/// one per path of outcomes — and a batch that scores them all at once settles `k` steps. The walk
+/// then follows the outcomes that actually occur and commits only the probes on that path, in step
+/// order. The points probed and the comparisons made are the serial search's, so the result is too,
+/// bit for bit, whatever the width: speculation decides how much is computed, never what is found.
+fn golden<P, O>(
     lo: f64,
     hi: f64,
     iters: usize,
     best: &mut Params,
     best_score: &mut f64,
-    mut set: P,
-    mut score: S,
+    set: P,
+    objective: &mut O,
 ) where
-    P: FnMut(&mut Params, f64),
-    S: FnMut(&Params) -> f64,
+    P: Fn(&mut Params, f64),
+    O: Objective,
 {
     let bracketed = hi > lo;
     if !bracketed {
         return;
     }
-    const R: f64 = 0.618_033_988_749_895;
-
-    let eval = |x: f64, base: &Params, set: &mut P, score: &mut S| {
-        let mut p = *base;
-        set(&mut p, x);
-        (p, score(&p))
-    };
 
     let base = *best;
-    let (mut a, mut b) = (lo, hi);
-    let (mut x1, mut x2) = (b - R * (b - a), a + R * (b - a));
-    let (mut p1, mut f1) = eval(x1, &base, &mut set, &mut score);
-    let (mut p2, mut f2) = eval(x2, &base, &mut set, &mut score);
+    let at = |x: f64| {
+        let mut p = base;
+        set(&mut p, x);
+        p
+    };
+    let width = objective.width().max(1);
 
-    for _ in 0..iters {
-        if f1 >= f2 {
-            b = x2;
-            x2 = x1;
-            p2 = p1;
-            f2 = f1;
-            x1 = b - R * (b - a);
-            (p1, f1) = eval(x1, &base, &mut set, &mut score);
-        } else {
-            a = x1;
-            x1 = x2;
-            p1 = p2;
-            f1 = f2;
-            x2 = a + R * (b - a);
-            (p2, f2) = eval(x2, &base, &mut set, &mut score);
+    let mut sec = Section::new(lo, hi);
+    let (mut p1, mut p2) = (at(sec.x1), at(sec.x2));
+    let (mut f1, mut f2) = (0.0, 0.0);
+    let mut done = 0;
+    let mut first = true;
+    let mut probes = Vec::new();
+    loop {
+        // The first batch carries both interior points, and no comparison has been made, so it
+        // plans below both outcomes; every later batch plans below the one outcome in hand.
+        let room = if first { width.saturating_sub(2) / 2 } else { width };
+        let levels = ((room + 1).ilog2() as usize).min(iters - done);
+        probes.clear();
+        let mut roots = [usize::MAX; 2];
+        for left in [false, true] {
+            if levels > 0 && (first || (f1 >= f2) == left) {
+                roots[left as usize] = plan(sec, left, levels, &mut probes);
+            }
+        }
+
+        let mut trials = Vec::with_capacity(2 + probes.len());
+        if first {
+            trials.extend([p1, p2]);
+        }
+        let offset = trials.len();
+        trials.extend(probes.iter().map(|q| at(q.x())));
+
+        let mut batch = objective.speculate(&trials);
+        if first {
+            f1 = objective.commit(&mut batch, &trials, 0);
+            f2 = objective.commit(&mut batch, &trials, 1);
+            first = false;
+        }
+        let mut i = roots[(f1 >= f2) as usize];
+        for level in 0..levels {
+            let q = probes[i];
+            let (p, f) = (trials[offset + i], objective.commit(&mut batch, &trials, offset + i));
+            if q.left {
+                (p2, f2) = (p1, f1);
+                (p1, f1) = (p, f);
+            } else {
+                (p1, f1) = (p2, f2);
+                (p2, f2) = (p, f);
+            }
+            sec = q.sec;
+            done += 1;
+            if level + 1 < levels {
+                i = q.next[(f1 >= f2) as usize];
+            }
+        }
+        if done >= iters {
+            break;
         }
     }
 
@@ -910,30 +1227,256 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
+    /// A pure function as an [`Objective`], recording the trials committed in order.
+    struct Pure<F> {
+        f: F,
+        width: usize,
+        committed: Vec<u64>,
+    }
+
+    impl<F: Fn(&Params) -> f64> Objective for Pure<F> {
+        type Batch = Vec<f64>;
+        fn width(&self) -> usize {
+            self.width
+        }
+        fn speculate(&self, trials: &[Params]) -> Vec<f64> {
+            trials.iter().map(&self.f).collect()
+        }
+        fn commit(&mut self, batch: &mut Vec<f64>, trials: &[Params], i: usize) -> f64 {
+            self.committed.push((trials[i].f as f64).to_bits());
+            batch[i]
+        }
+    }
+
+    fn pure<F: Fn(&Params) -> f64>(f: F, width: usize) -> Pure<F> {
+        Pure { f, width, committed: Vec::new() }
+    }
+
+    /// Golden section as it was written before it could speculate, verbatim: one probe per step,
+    /// scored the moment it is placed. The reference [`golden`] is held to at every width.
+    fn golden_reference(
+        lo: f64,
+        hi: f64,
+        iters: usize,
+        best: &mut Params,
+        best_score: &mut f64,
+        set: impl Fn(&mut Params, f64),
+        mut score: impl FnMut(&Params) -> f64,
+    ) {
+        if hi <= lo {
+            return;
+        }
+        const R: f64 = 0.618_033_988_749_895;
+        let base = *best;
+        let mut eval = |x: f64| {
+            let mut p = base;
+            set(&mut p, x);
+            (p, score(&p))
+        };
+        let (mut a, mut b) = (lo, hi);
+        let (mut x1, mut x2) = (b - R * (b - a), a + R * (b - a));
+        let (mut p1, mut f1) = eval(x1);
+        let (mut p2, mut f2) = eval(x2);
+        for _ in 0..iters {
+            if f1 >= f2 {
+                b = x2;
+                x2 = x1;
+                p2 = p1;
+                f2 = f1;
+                x1 = b - R * (b - a);
+                (p1, f1) = eval(x1);
+            } else {
+                a = x1;
+                x1 = x2;
+                p1 = p2;
+                f1 = f2;
+                x2 = a + R * (b - a);
+                (p2, f2) = eval(x2);
+            }
+        }
+        let (p, f) = if f1 >= f2 { (p1, f1) } else { (p2, f2) };
+        if f > *best_score {
+            *best = p;
+            *best_score = f;
+        }
+    }
+
     #[test]
     fn golden_section_finds_a_smooth_maximum_and_never_regresses() {
         // A quadratic peaking at 3.0, with the incumbent already at a worse point.
+        let quadratic = |p: &Params| -((p.f as f64 - 3.0).powi(2));
         let mut p = Params { form: Form::Fof { alpha: 0.0, beta: 0.0 }, f: 0.0, t0: 0 };
         let mut s = f64::NEG_INFINITY;
-        golden(0.0, 10.0, 40, &mut p, &mut s, |p, x| p.f = x as f32, |p| {
-            -((p.f as f64 - 3.0).powi(2))
-        });
+        golden(0.0, 10.0, 40, &mut p, &mut s, |p, x| p.f = x as f32, &mut pure(quadratic, 1));
         assert!((p.f - 3.0).abs() < 1e-3, "found {}", p.f);
 
         // An incumbent better than anything in the bracket must survive untouched.
         let mut p = Params { form: Form::Fof { alpha: 1.0, beta: 2.0 }, f: 42.0, t0: 7 };
         let keep = p;
         let mut s = 1e9;
-        golden(0.0, 10.0, 20, &mut p, &mut s, |p, x| p.f = x as f32, |p| {
-            -((p.f as f64 - 3.0).powi(2))
-        });
+        golden(0.0, 10.0, 20, &mut p, &mut s, |p, x| p.f = x as f32, &mut pure(quadratic, 1));
         assert_eq!(p, keep);
         assert_eq!(s, 1e9);
 
         // A degenerate bracket is a no-op, not a panic.
         let mut p = keep;
         let mut s = 0.0;
-        golden(5.0, 5.0, 10, &mut p, &mut s, |p, x| p.f = x as f32, |_| 1.0);
+        golden(5.0, 5.0, 10, &mut p, &mut s, |p, x| p.f = x as f32, &mut pure(|_: &Params| 1.0, 1));
         assert_eq!(p, keep);
+    }
+
+    /// Speculation decides how much is computed, never what is found: at every width the search
+    /// commits the same trials in the same order and lands on the same bits.
+    ///
+    /// The objective is deliberately bumpy, so the walk takes both branches many times rather
+    /// than sliding down one side, and the iteration counts cover a batch ending mid-tree.
+    #[test]
+    fn golden_section_is_the_same_search_at_every_width() {
+        let bumpy = |p: &Params| {
+            let x = p.f as f64;
+            (3.0 * x).sin() + 0.3 * (11.0 * x).cos() - 0.02 * (x - 6.0).powi(2)
+        };
+        let start = Params { form: Form::Fof { alpha: 1.0, beta: 1.0 }, f: 0.0, t0: 0 };
+        let set = |p: &mut Params, x: f64| p.f = x as f32;
+        for iters in [0, 1, 2, 3, 7, 10, 23] {
+            let reference = {
+                let (mut p, mut s, mut probed) = (start, f64::NEG_INFINITY, Vec::new());
+                golden_reference(0.5, 12.0, iters, &mut p, &mut s, set, |p| {
+                    probed.push((p.f as f64).to_bits());
+                    bumpy(p)
+                });
+                (p, s.to_bits(), probed)
+            };
+            assert_eq!(reference.2.len(), iters + 2);
+            for width in [1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 64] {
+                let (mut p, mut s) = (start, f64::NEG_INFINITY);
+                let mut obj = pure(bumpy, width);
+                golden(0.5, 12.0, iters, &mut p, &mut s, set, &mut obj);
+                assert_eq!((p, s.to_bits(), obj.committed), reference, "iters {iters}, width {width}");
+            }
+        }
+    }
+
+    /// The one case where a score computed ahead is *not* the serial score: the entry it read was
+    /// cleared out before the trial was committed, and a lookup now would render afresh.
+    ///
+    /// Only a stale entry makes that matter, so the fixture plants one. The key leaves out the
+    /// release, so a render under a long release — too long for `max_atom_samples`, and so stored
+    /// as `None` — sits under the same key a short-release search then probes. Committing the trial
+    /// before it inserts enough to clear the cache, and the serial search, looking up afresh, finds
+    /// an envelope where the speculative one read `None`.
+    #[test]
+    fn a_held_entry_is_not_trusted_across_a_clear() {
+        let sig = plant(
+            &AtomParams {
+                t0: 2_000,
+                f: 1_000.0,
+                env: EnvelopeParams::new(328.0, 0.001).into(),
+                phi: 0.3,
+                amp: 1.0,
+            },
+            12_000,
+        );
+        let release = |dur: f32| {
+            Family::Fof(ReleasePolicy {
+                fade_level: 1e-3,
+                fade_dur_scale: dur * 328.0,
+                fade_dur_min: dur,
+                fade_dur_max: dur,
+            })
+        };
+        let (short, long) = (release(0.001), release(0.08));
+        let cfg = RefineConfig { max_atom_samples: 3_000, ..RefineConfig::default() };
+        let form = |alpha| Form::Fof { alpha, beta: 0.001 };
+        let at = |alpha| Params { form: form(alpha), f: 1_000.0, t0: 2_000 };
+        let len = |family: &Family, alpha| {
+            render_entry(family.shape(form(alpha)), SR, usize::MAX).unwrap().0.support_len()
+        };
+        assert!(len(&long, 328.0) > cfg.max_atom_samples, "the long release must be refused");
+
+        // Full after one short envelope; the second insertion clears it.
+        let budget = len(&short, 300.0) + len(&short, 360.0) - 1;
+        let prepared = || {
+            let mut cache = EnvelopeCache::with_budget(budget);
+            assert!(cache.get(short.shape(form(300.0)), SR, &cfg).is_some());
+            assert!(cache.get(long.shape(form(328.0)), SR, &cfg).is_none());
+            cache
+        };
+        let trials = [at(360.0), at(328.0)];
+
+        let run = |width| {
+            let mut cache = prepared();
+            let search = Search { residual: &sig, sr: SR, family: &short, cfg: &cfg, width };
+            let mut obj = Trials { search, cache: &mut cache, gram: None };
+            let mut batch = obj.speculate(&trials);
+            let scores: Vec<u64> =
+                (0..trials.len()).map(|i| obj.commit(&mut batch, &trials, i).to_bits()).collect();
+            (scores, cache.len(), cache.usage(), cache.clears)
+        };
+        let serial = run(1);
+        assert_eq!(serial.3, 1, "committing the first trial must clear the cache");
+        assert!(f64::from_bits(serial.0[1]) > 0.0, "the serial search must find the envelope");
+        assert_eq!(run(2), serial);
+    }
+
+    /// The same, end to end: refinement at any width selects the same atom, and leaves the cache
+    /// in the same state, as refinement one trial at a time.
+    ///
+    /// The cache is where speculation could go wrong, so the budgets are small enough to clear
+    /// mid-search — which is what exposes a speculative score taken from an entry that a clear has
+    /// since removed. The candidates alternate between two releases on one `(alpha, beta)`, because
+    /// the key leaves the release out: a stale entry and a fresh render then genuinely differ, the
+    /// release decides whether a render fits under `max_atom_samples`, and a wrongly trusted score
+    /// shows up as a different atom rather than hiding behind identical envelopes.
+    #[test]
+    fn refinement_is_the_same_at_every_width() {
+        let dict = voice();
+        let truth = AtomParams {
+            t0: 6_211,
+            f: 1_337.0,
+            env: EnvelopeParams::new(410.0, 0.0017).into(),
+            phi: 0.83,
+            amp: 0.7,
+        };
+        let mut sig = plant(&truth, 30_000);
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        for x in &mut sig {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x += 0.05 * ((s >> 40) as f32 / 8_388_608.0 - 1.0);
+        }
+
+        let bi = dict
+            .blocks
+            .iter()
+            .position(|b| b.env.params == EnvelopeParams::new(328.0, 0.001).into())
+            .unwrap();
+        let block = &dict.blocks[bi];
+        let short = seed_at(&dict, bi, &truth, &sig);
+        let mut long = short;
+        if let Shape::Fof(e) = &mut long.atom.env {
+            e.fade_dur = 0.08;
+        }
+        let support = block.support_len();
+        let cfg = RefineConfig { max_atom_samples: support + 2_000, ..RefineConfig::default() };
+
+        for budget in [1, support, 3 * support, 20 * support, ENVELOPE_CACHE_SAMPLES] {
+            let run = |width| {
+                let mut cache = EnvelopeCache::with_budget(budget);
+                let mut out = Vec::new();
+                for seed in [short, long, short, short, long, long, short] {
+                    let mut cand = seed;
+                    let moved = refine_at_width(&mut cand, block, &sig, &cfg, &mut cache, width);
+                    out.push((moved, cand.atom, cand.mp_score.to_bits()));
+                }
+                (out, cache.len(), cache.usage(), cache.clears)
+            };
+            let serial = run(1);
+            assert!(serial.0.iter().any(|&(moved, ..)| moved), "budget {budget}: nothing refined");
+            for width in [3, 7, 16] {
+                assert!(run(width) == serial, "budget {budget}, width {width}");
+            }
+        }
     }
 }

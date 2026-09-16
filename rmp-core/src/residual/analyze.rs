@@ -6,7 +6,7 @@
 //!
 //! **The result is bit-identical at any thread count.** Each band's arithmetic is a fixed sequence
 //! that no other band can interleave with, and the columns are gathered in band order by an indexed
-//! `collect`. That is the same standard `mp::for_each_block` and `tfmap` are held to, and
+//! `collect`. That is the same standard `mp::refresh_frames` and `tfmap` are held to, and
 //! `the_parallel_bank_matches_a_serial_reference` is what keeps it honest.
 
 use rayon::prelude::*;

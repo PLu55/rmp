@@ -112,6 +112,15 @@ impl Correlator {
         }
     }
 
+    /// A second correlator for the same block, sharing the FFT plan and owning its own buffers.
+    pub fn fork(&self) -> Self {
+        Self {
+            fft: self.fft.fork(),
+            windowed: vec![0.0; self.windowed.len()],
+            spectrum: vec![Complex32::new(0.0, 0.0); self.spectrum.len()],
+        }
+    }
+
     /// Correlate the frame of `signal` starting at `onset` against every bin of `block`.
     ///
     /// Reads past the end of `signal` as zeros, so trailing frames need no padding by the caller.

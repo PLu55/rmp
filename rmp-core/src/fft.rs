@@ -33,6 +33,12 @@ pub trait RealFft: Send {
     /// long. The transform is unnormalized, using the standard forward sign convention
     /// `X[k] = sum_t x[t] * exp(-2i*pi*k*t/N)`.
     fn forward(&mut self, input: &mut [f32], output: &mut [Complex32]);
+
+    /// Another instance of the same transform, with scratch of its own.
+    ///
+    /// Shares the plan, so it computes exactly what `self` does and costs only the scratch; that is
+    /// what lets one block's frames be transformed on several threads at once.
+    fn fork(&self) -> Box<dyn RealFft>;
 }
 
 /// Builds [`RealFft`] plans. One planner per thread; construct plans up front.
@@ -55,6 +61,10 @@ impl RealFft for RealFftPlan {
         self.fft
             .process_with_scratch(input, output, &mut self.scratch)
             .expect("FFT buffer length mismatch");
+    }
+
+    fn fork(&self) -> Box<dyn RealFft> {
+        Box::new(RealFftPlan { fft: Arc::clone(&self.fft), scratch: self.fft.make_scratch_vec() })
     }
 }
 

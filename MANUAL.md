@@ -98,7 +98,7 @@ in.wav: 29.07 s, 48000 Hz, 2 channel(s)
 dictionary: 24 blocks (24 fof) in 13.68ms
   note: 8 of 24 blocks are longer than refine.max_atom_samples (150000), so their
         atoms stay on the grid unrefined; longest support 332053 samples (fof alpha 1.000 beta 0.30 ms)
-analysis: 1528 atoms, 35.0 dB in 12.64s (init 13.68ms, 4.2x realtime)
+analysis: 1528 atoms, 35.0 dB in 12.64s (init 13.68ms, 4.2x realtime, 8 threads)
   refined: 1291/1528 atoms moved off the grid (84%)
   refresh: 1266438 frames bounded, 416712 recomputed (32.9%)
 residual: -35.0 dB rms, -30.3 dB peak relative to input
@@ -106,6 +106,9 @@ residual: -35.0 dB rms, -30.3 dB peak relative to input
 ```
 
 - **`4.2x realtime`** is wall clock over audio duration. Below 1.0 is faster than realtime.
+- **`8 threads`** — the size of the thread pool. By default that is one thread per physical core of
+  the machine's fastest core type, not one per hardware thread; see *Using fewer cores than the
+  machine has* in §11.
 - **`refined: N/M`** — how many atoms moved off the grid. Well under 100% with refinement enabled
   means `max_atom_samples` is blocking blocks; see §6.
 - **`kinds:`** — printed only when the dictionary holds both families: how many atoms of each kind
@@ -302,8 +305,11 @@ input needs about 12× more atoms than on-grid input to reach the same SNR, beca
 patched with a cluster of partial atoms instead of being represented by one. With it, that falls to
 about 3×, and 99% of selected atoms move.
 
-Refinement is now the *expensive* part of an iteration — about 2.8 ms per atom against 1.5 ms
-without — because the refresh around it was parallelised and refinement was not.
+Refinement is the *expensive* part of an iteration — about 2.8 ms per atom against 1.5 ms without,
+measured when only the refresh around it ran in parallel. It now scores several trials of its search
+at once on any block whose support is 4096 samples or more, which about halves it on long atoms and
+changes no result. Shorter atoms are refined one trial at a time, because there waking the thread
+pool costs more than a trial does.
 
 ### `enabled` — default `true`
 
@@ -741,6 +747,7 @@ comparable. The dictionary reaches `alpha = 1`.
 - **Too slow?** Raise `capture_tolerance` toward 0.5 first (biggest lever, mild quality cost), then
   drop your lowest `alphas` rung (large lever, real quality cost on sustained material), then raise
   `fade_level`. Do not reach for `golden_iters`.
+- **Cores sitting idle?** That is deliberate; see below.
 - **Not enough detail?** Raise `target_snr_db` before touching anything else. Then check the
   `refined:` line is near 100% — if it is not, `max_atom_samples` is the problem, not the dictionary.
 - **Bad transients?** Watch the residual *peak*, not the rms. A peak much worse than the rms means
@@ -750,6 +757,25 @@ comparable. The dictionary reaches `alpha = 1`.
 
 **Without refinement**, none of the above applies: set `capture_tolerance = 0.95`, use a dense
 `alphas` ladder (ratio ~1.6), and expect roughly 12× the atoms.
+
+### Using fewer cores than the machine has
+
+On Linux, `rmp` and the GUI run one thread per physical core of the machine's fastest core type,
+and keep those threads and the one driving the analysis on those cores. On a hybrid CPU with
+hyperthreading most hardware threads then sit idle during an analysis, and that is faster, not a
+waste. The large transforms are limited by memory traffic rather than arithmetic, and a hyperthread
+sibling or an efficiency core adds more contention than it does work. On an i7-13700KF (8
+performance cores with hyperthreading, 8 efficiency cores, 24 hardware threads):
+
+| | 24 threads, anywhere | 8 threads, performance cores |
+| --- | --- | --- |
+| 3 s of piano, `chopin-nocturne-2.toml` | 4.3 s | 3.5 s |
+| 10 s of piano, same | 35.3 s | 29.8 s |
+| 2 s, `lux-eterna-1-gaussian.toml` | 8.4 s | 6.4 s |
+
+The book is identical either way. Set `RAYON_NUM_THREADS` to choose the thread count yourself; doing
+so also leaves the threads wherever the scheduler puts them. Running several analyses side by side,
+give each process its own cores with `taskset`, which the automatic choice respects.
 
 ---
 
