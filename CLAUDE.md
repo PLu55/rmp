@@ -162,7 +162,8 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   hint, the `Open…` in the strip being the one way in. A tab's settings are a **document**, loaded,
   edited and saved as a TOML file — `settings::SettingsDoc` — with a `?` beside them opening
   `MANUAL.md` itself in a window of its own (`help`). `task` runs a decomposition off the UI thread;
-  the result panels inside a tab are stubs naming the `rmp-core` call each is a view of.
+  `view/` holds the three result tabs, each a view of a call in `rmp-core` and never its own
+  arithmetic.
 
 ### Invariants that are not locally obvious
 
@@ -358,6 +359,25 @@ the word ambiguous.
   how much energy the atoms took. Two combinations are worth naming — atoms + measured residual
   reconstructs the origin exactly by construction, and atoms + synthesised residual is the
   resynthesis.
+
+**The result tabs recompute nothing.** `view/summary` is `stats::summarize`, `view/distribution`
+is `stats::histogram`, `view/timefreq` is `tfmap::compute` — the same calls `rmpstat` drives, so
+the window and the charts report one set of numbers rather than two that agree by luck. Two things
+moved into `rmp-core` to keep it that way: `Quantity::ALL`, because a front end offering the
+quantities has to enumerate them and the only list was a hand-written one inside `rmpstat`'s own
+test that had been missing `Sigma` since the Gaussian atom landed; and `tfmap::heat`, the map's
+colour ramp, which now sits beside `TfMap::to_db` because the scaling and the colouring are one
+decision about how to read a map and a diagnostic that coloured differently in a chart than in a
+window would be worth less than none. `Timing::realtime_factor` went the same way for the same
+reason — `init + pursuit` over the excerpt, deliberately *not* the dictionary, which is built once
+per settings rather than once per second of audio.
+
+**Both plot tabs cache against the options that produced them.** A histogram renders envelopes for
+`support` and `periods`; a map is 0.13 s for 5000 atoms at 1200x800 and the grid size is a setting,
+so its cost is whatever is asked for. Neither can run per frame. The map is built on a worker
+(`task::spawn_tfmap`) and uploaded as **one texture** — a useful grid is ~10^6 cells, so per-cell
+rectangles are not an option — and its grid size stays a *setting* rather than the panel's pixel
+size, or every drag of a window edge would recompute the whole map.
 
 **The GUI embeds the residual into the book it writes, and keeps it embedded in memory.** That is
 what `rmp` does when `--residual-book` names no separate file, and it means the file written and

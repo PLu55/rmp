@@ -663,8 +663,82 @@ pub fn compute(book: &Book, grid: MapGrid, opts: &MapOptions) -> Result<TfMap, F
     })
 }
 
+/// The heat ramp a pseudo-Wigner map is read through: a normalised level to RGB.
+///
+/// `u` runs 0 at the display floor to 1 at the reference — `(db + floor) / floor` over
+/// [`TfMap::to_db`]'s output — and is clamped, so a caller need not.
+///
+/// Here rather than in a front end because both of them draw the same map, and a diagnostic that
+/// coloured differently in a chart than in a window would be worth less than one that did not exist.
+/// It lives beside `to_db` for the same reason: the map's scaling and its colouring are one
+/// decision about how to read it, not two.
+///
+/// Black through violet and orange to a pale yellow — a spectrogram ramp anchored at true black,
+/// so silence reads as empty rather than as the coloured field viridis's dark blue would give.
+/// Piecewise-linear through five stops, and **monotone in luminance**, which is the property that
+/// makes a level readable off the map at all and what `the_heat_ramp_is_monotone_in_luminance`
+/// pins.
+pub fn heat(u: f64) -> [u8; 3] {
+    const STOPS: [(f64, f64, f64, f64); 5] = [
+        (0.00, 0.0, 0.0, 0.0),
+        (0.30, 40.0, 20.0, 110.0),
+        (0.55, 150.0, 30.0, 110.0),
+        (0.80, 240.0, 110.0, 40.0),
+        (1.00, 255.0, 255.0, 210.0),
+    ];
+    let u = u.clamp(0.0, 1.0);
+    let mut i = 0;
+    while i + 2 < STOPS.len() && u > STOPS[i + 1].0 {
+        i += 1;
+    }
+    let (u0, r0, g0, b0) = STOPS[i];
+    let (u1, r1, g1, b1) = STOPS[i + 1];
+    let t = ((u - u0) / (u1 - u0)).clamp(0.0, 1.0);
+    [
+        (r0 + (r1 - r0) * t) as u8,
+        (g0 + (g1 - g0) * t) as u8,
+        (b0 + (b1 - b0) * t) as u8,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// The property that makes a level readable off the map: brighter always means more.
+    #[test]
+    fn the_heat_ramp_is_monotone_in_luminance() {
+        let lum = |c: [u8; 3]| 0.2126 * c[0] as f64 + 0.7152 * c[1] as f64 + 0.0722 * c[2] as f64;
+        assert_eq!(heat(0.0), [0, 0, 0]);
+        let mut prev = -1.0;
+        for i in 0..=64 {
+            let l = lum(heat(i as f64 / 64.0));
+            assert!(l > prev, "luminance fell at {i}");
+            prev = l;
+        }
+    }
+
+    /// The ramp moved here from `rmpstat`'s renderer, and these are the bytes the five-stop table
+    /// gave *before* the move — computed from it independently, so this checks the move rather than
+    /// merely re-testing whatever arrived.
+    #[test]
+    fn the_heat_ramp_is_the_one_rmpstat_had() {
+        assert_eq!(heat(0.00), [0, 0, 0]);
+        assert_eq!(heat(0.15), [20, 10, 55]);
+        assert_eq!(heat(0.30), [40, 20, 110]);
+        assert_eq!(heat(0.55), [150, 30, 110]);
+        assert_eq!(heat(0.80), [240, 110, 40]);
+        assert_eq!(heat(1.00), [255, 255, 210]);
+    }
+
+    /// Clamped at both ends, so a caller handing it an out-of-range level gets the end colour
+    /// rather than a wrapped byte.
+    #[test]
+    fn the_heat_ramp_clamps_rather_than_wrapping() {
+        assert_eq!(heat(-0.5), heat(0.0));
+        assert_eq!(heat(1.5), heat(1.0));
+        assert_eq!(heat(f64::NAN), [0, 0, 0], "NaN clamps to the floor, not to a random colour");
+    }
+
     use super::*;
     use crate::fof::{AtomParams, EnvelopeParams};
 

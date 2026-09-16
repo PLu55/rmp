@@ -13,9 +13,11 @@
 use crate::audio::Audio;
 use crate::help::Help;
 use crate::playback::{self, Available, Sources, Which};
+use crate::view::distribution::DistributionView;
+use crate::view::summary::SummaryView;
+use crate::view::timefreq::TimeFreqView;
 use crate::settings::SettingsDoc;
 use crate::task::{self, Outcome, Progress, Running, Update};
-use rmp_core::signal::{db_fs, rms_of};
 use std::path::PathBuf;
 
 /// What a tab's results area is showing.
@@ -30,19 +32,16 @@ enum View {
     Distribution,
     /// `rmp_core::tfmap::TfMap` — the atom-based pseudo-Wigner map, as `rmpstat wv`.
     TimeFrequency,
-    /// `rmp_synthesis::render` — resynthesis, and writing it out.
-    Synthesis,
 }
 
 impl View {
-    const ALL: [View; 4] = [View::Summary, View::Distribution, View::TimeFrequency, View::Synthesis];
+    const ALL: [View; 3] = [View::Summary, View::Distribution, View::TimeFrequency];
 
     fn label(self) -> &'static str {
         match self {
             View::Summary => "Summary",
             View::Distribution => "Distributions",
             View::TimeFrequency => "Time-frequency",
-            View::Synthesis => "Synthesis",
         }
     }
 }
@@ -86,6 +85,11 @@ struct Session {
     outcome: Option<Box<Outcome>>,
     log: Vec<String>,
     view: View,
+    /// The result tabs' own state: what each has computed, and under which options. Invalidated
+    /// together when a run finishes, since all three are views of one book.
+    summary_view: SummaryView,
+    distribution_view: DistributionView,
+    timefreq_view: TimeFreqView,
 }
 
 impl Session {
@@ -108,6 +112,9 @@ impl Session {
             outcome: None,
             log: Vec::new(),
             view: View::Summary,
+            summary_view: SummaryView::default(),
+            distribution_view: DistributionView::default(),
+            timefreq_view: TimeFreqView::default(),
         }
     }
 
@@ -137,6 +144,9 @@ impl Session {
             outcome: None,
             log: Vec::new(),
             view: self.view,
+            summary_view: SummaryView::default(),
+            distribution_view: DistributionView::default(),
+            timefreq_view: TimeFreqView::default(),
         }
     }
 
@@ -184,6 +194,10 @@ impl Session {
                     // Recorded from the *finished* run, so a switch flipped afterwards cannot make
                     // Play offer a source this decomposition never produced.
                     self.available = Available::of(a, self.keep_residual);
+                    // Every result tab is a view of the book that just changed.
+                    self.summary_view.invalidate();
+                    self.distribution_view.invalidate();
+                    self.timefreq_view.invalidate();
                     // And anything already ticked that the run did not make is dropped, rather than
                     // left ticked and silently ignored.
                     for w in Which::ALL {
@@ -568,39 +582,12 @@ impl Session {
         }
         ui.separator();
 
-        let book = &outcome.analysis.book;
+        // Each tab is a view of a call in `rmp-core`; none of them recomputes anything, which is
+        // what keeps the window and `rmpstat` reporting one set of numbers.
         match self.view {
-            // TODO: rmp_core::stats::BookSummary::of(book) — the figures `rmpstat summary` prints.
-            // The three lines below are the shape of it, and the reason `Outcome` keeps the
-            // excerpt: the residual is only meaningful against the input it came from.
-            View::Summary => {
-                ui.monospace(format!("{} atoms, {:.1} dB", book.len(), book.snr_db()));
-                ui.monospace(format!(
-                    "excerpt: {} samples from {}",
-                    outcome.signal.len(),
-                    outcome.offset
-                ));
-                ui.monospace(format!(
-                    "residual: {:+.1} dB rms relative to input",
-                    db_fs(rms_of(&outcome.analysis.residual)) - db_fs(outcome.signal.rms())
-                ));
-                ui.label("rmp_core::stats::BookSummary goes here.");
-            }
-            // TODO: rmp_core::stats::Histogram over a chosen Quantity and Weight, drawn with
-            // egui_plot rather than through plotters — the charts are rmpstat's, the data is not.
-            View::Distribution => {
-                ui.label("rmp_core::stats::Histogram over alpha, bandwidth, f, sigma … goes here.");
-            }
-            // TODO: rmp_core::tfmap::TfMap::build, blitted as one egui::ColorImage. Never as
-            // per-cell rectangles: a useful grid is ~10^6 cells.
-            View::TimeFrequency => {
-                ui.label("rmp_core::tfmap::TfMap goes here.");
-            }
-            // TODO: rmp_synthesis::render_full_book / render_to_file, on a worker thread of its
-            // own — a long book takes seconds to render.
-            View::Synthesis => {
-                ui.label("rmp_synthesis::render goes here: atoms, residual, or both.");
-            }
+            View::Summary => self.summary_view.ui(ui, outcome),
+            View::Distribution => self.distribution_view.ui(ui, &outcome.analysis.book),
+            View::TimeFrequency => self.timefreq_view.ui(ui, &outcome.analysis.book),
         }
     }
 }

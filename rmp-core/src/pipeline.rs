@@ -91,6 +91,21 @@ pub struct Timing {
     pub residual: Duration,
 }
 
+impl Timing {
+    /// Wall clock per second of audio: below 1 is faster than realtime.
+    ///
+    /// `init + pursuit`, and deliberately *not* the dictionary — that is built once per settings
+    /// rather than once per second of audio, so folding it in would make the rate depend on how
+    /// short the excerpt was. Nor the residual analysis, which is 0.5 ms for 0.5 s of audio and
+    /// would not move the figure it appeared in.
+    ///
+    /// Here rather than in a front end because both of them report it, and a rate that meant one
+    /// thing in the terminal and another in the window would be worse than no rate at all.
+    pub fn realtime_factor(&self, seconds: f32) -> f32 {
+        (self.init + self.pursuit).as_secs_f32() / seconds.max(1e-9)
+    }
+}
+
 /// Lazy-refresh counters: frames given a bound, and frames that then had to be recomputed.
 #[derive(Debug, Clone, Default)]
 pub struct Refresh {
@@ -275,6 +290,38 @@ pub fn unrefinable_blocks<'a>(dict: &'a Dictionary, cfg: &MpConfig) -> Vec<&'a c
 
 #[cfg(test)]
 mod tests {
+
+    /// The realtime factor is `init + pursuit` over the excerpt, and nothing else.
+    ///
+    /// The dictionary is deliberately out: it is built once per settings rather than once per
+    /// second of audio, so counting it would make a short excerpt look slow and a long one fast for
+    /// no reason but its length. CLAUDE.md measures that build at 64 ms against 2.4 ms across two
+    /// configs of one piece of material — enough to dominate the figure on a one-second excerpt.
+    #[test]
+    fn the_realtime_factor_counts_the_pursuit_and_not_the_dictionary() {
+        let t = Timing {
+            dictionary: Duration::from_millis(500),
+            init: Duration::from_millis(100),
+            pursuit: Duration::from_millis(900),
+            residual: Duration::from_millis(50),
+        };
+        // 1.0 s of work over 2.0 s of audio.
+        assert!((t.realtime_factor(2.0) - 0.5).abs() < 1e-6, "got {}", t.realtime_factor(2.0));
+
+        // Neither of the excluded phases moves it.
+        let mut u = t;
+        u.dictionary = Duration::from_secs(60);
+        u.residual = Duration::from_secs(60);
+        assert_eq!(u.realtime_factor(2.0), t.realtime_factor(2.0));
+    }
+
+    /// A zero-length excerpt must not divide by zero and report infinity.
+    #[test]
+    fn the_realtime_factor_survives_an_empty_excerpt() {
+        let t = Timing { pursuit: Duration::from_millis(1), ..Timing::default() };
+        assert!(t.realtime_factor(0.0).is_finite());
+    }
+
     use super::*;
 
     /// A signal with something in it, and a dictionary small enough to analyse it in milliseconds.

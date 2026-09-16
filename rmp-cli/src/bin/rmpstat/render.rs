@@ -2,7 +2,7 @@
 
 use plotters::prelude::*;
 use rmp_core::stats::{Histogram, Summary};
-use rmp_core::tfmap::{Reference, TfMap};
+use rmp_core::tfmap::{self, Reference, TfMap};
 use std::path::Path;
 
 /// Width the bar column gets in a text histogram.
@@ -365,33 +365,6 @@ pub fn snr_chart(trace: &[f32], path: &Path, fmt: Image, size: (u32, u32)) -> Re
     })
 }
 
-/// Black through violet and orange to a pale yellow — a spectrogram ramp anchored at true black,
-/// so silence reads as empty rather than as the coloured field viridis's dark blue would give.
-fn heat(u: f64) -> RGBColor {
-    // Piecewise-linear through five stops, monotone in luminance, which is the property that makes
-    // a level readable off the map.
-    const STOPS: [(f64, f64, f64, f64); 5] = [
-        (0.00, 0.0, 0.0, 0.0),
-        (0.30, 40.0, 20.0, 110.0),
-        (0.55, 150.0, 30.0, 110.0),
-        (0.80, 240.0, 110.0, 40.0),
-        (1.00, 255.0, 255.0, 210.0),
-    ];
-    let u = u.clamp(0.0, 1.0);
-    let mut i = 0;
-    while i + 2 < STOPS.len() && u > STOPS[i + 1].0 {
-        i += 1;
-    }
-    let (u0, r0, g0, b0) = STOPS[i];
-    let (u1, r1, g1, b1) = STOPS[i + 1];
-    let t = ((u - u0) / (u1 - u0)).clamp(0.0, 1.0);
-    RGBColor(
-        (r0 + (r1 - r0) * t) as u8,
-        (g0 + (g1 - g0) * t) as u8,
-        (b0 + (b1 - b0) * t) as u8,
-    )
-}
-
 /// The pseudo-Wigner map as a heat map.
 ///
 /// The map is blitted as one image rather than drawn as rectangles. A grid of any useful size is
@@ -424,11 +397,9 @@ pub fn wv_chart(
     for j in 0..n_f {
         let y = n_f - 1 - j;
         for i in 0..n_t {
-            let c = heat((db[i * n_f + j] as f64 + floor_db as f64) / floor_db as f64);
+            let c = tfmap::heat((db[i * n_f + j] as f64 + floor_db as f64) / floor_db as f64);
             let o = (y * n_t + i) * 3;
-            rgb[o] = c.0;
-            rgb[o + 1] = c.1;
-            rgb[o + 2] = c.2;
+            rgb[o..o + 3].copy_from_slice(&c);
         }
     }
 
@@ -521,19 +492,4 @@ mod tests {
         assert_eq!(num(1.2e-5), "1.200e-5");
         assert_eq!(num(4.8e6), "4.800e6");
     }
-
-    /// The ramp starts at black and ends light, monotonically in luminance — the property that
-    /// makes a level readable off the picture.
-    #[test]
-    fn the_heat_ramp_is_monotone_in_luminance() {
-        let lum = |c: RGBColor| 0.2126 * c.0 as f64 + 0.7152 * c.1 as f64 + 0.0722 * c.2 as f64;
-        assert_eq!((heat(0.0).0, heat(0.0).1, heat(0.0).2), (0, 0, 0));
-        let mut prev = -1.0;
-        for i in 0..=64 {
-            let l = lum(heat(i as f64 / 64.0));
-            assert!(l > prev, "luminance fell at {i}");
-            prev = l;
-        }
-    }
-
 }

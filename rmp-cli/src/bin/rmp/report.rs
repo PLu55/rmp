@@ -150,7 +150,7 @@ impl Cli {
             "analysis: {} atoms, {:.1} dB in {pursuit:.2?} (init {init:.2?}, {:.1}x realtime)",
             book.len(),
             book.snr_db(),
-            (init + pursuit).as_secs_f32() / duration.max(1e-9)
+            a.timing.realtime_factor(duration)
         ));
         if a.cancelled {
             self.say("  interrupted: the book holds only what had been selected by then");

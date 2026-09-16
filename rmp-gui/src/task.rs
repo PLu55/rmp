@@ -414,6 +414,154 @@ fn describe_render(r: &rmp_synthesis::RenderReport) -> String {
     line
 }
 
+/// Building a pseudo-Wigner map off the UI thread.
+///
+/// The same shape as [`spawn_synthesis`]: one terminal message and no cancellation. Worth a thread
+/// for the same reason and more so — CLAUDE.md measures 0.13 s for 5000 atoms at 1200x800, and the
+/// grid size is a setting, so the cost is whatever the user asks for.
+///
+/// The worker returns *pixels*, not a `TfMap`. Turning cells into RGB is `to_db` and `heat`, both
+/// pure and both in `rmp-core`, so doing it here keeps a megabyte of f64 off the channel and the UI
+/// thread free of a loop over a million cells.
+pub struct MapJob {
+    pub book: rmp_core::book::Book,
+    pub options: crate::view::timefreq::Options,
+}
+
+/// A finished map, ready to upload.
+pub struct MapDone {
+    pub width: usize,
+    pub height: usize,
+    /// Row-major RGB, **top row the highest frequency** — how a spectrogram is read, and what
+    /// `rmpstat`'s own blit does.
+    pub rgb: Vec<u8>,
+    pub caption: String,
+    /// Each atom's `(t0 seconds, f Hz)`, for the overlay.
+    pub dots: Vec<(f64, f32)>,
+    pub t0: f64,
+    pub t1: f64,
+    pub f_edges: Vec<f32>,
+}
+
+pub enum MapUpdate {
+    Done(Box<MapDone>),
+    Failed(String),
+}
+
+pub struct Mapping {
+    updates: mpsc::Receiver<MapUpdate>,
+    finished: bool,
+}
+
+impl Mapping {
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn drain(&mut self) -> Vec<MapUpdate> {
+        let mut out = Vec::new();
+        while let Ok(u) = self.updates.try_recv() {
+            self.finished = true;
+            out.push(u);
+        }
+        out
+    }
+}
+
+pub fn spawn_tfmap(job: MapJob) -> Mapping {
+    let (tx, updates) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("rmp-tfmap".into())
+        .spawn(move || {
+            let msg = match build_map(&job) {
+                Ok(done) => MapUpdate::Done(Box::new(done)),
+                Err(e) => MapUpdate::Failed(e),
+            };
+            tx.send(msg).ok();
+        })
+        .expect("spawning the map thread");
+
+    Mapping { updates, finished: false }
+}
+
+fn build_map(job: &MapJob) -> Result<MapDone, String> {
+    use rmp_core::tfmap::{self, MapGrid, MapOptions};
+
+    let book = &job.book;
+    let o = job.options;
+    if book.is_empty() {
+        return Err("the book has no atoms".into());
+    }
+    let (n_t, n_f) = (o.n_t.max(1), o.n_f.max(1));
+
+    let mut grid = MapGrid::covering(book, n_t, n_f, o.log_freq).map_err(|e| e.to_string())?;
+    // `start`/`duration` narrow the time axis in seconds, as they do on `rmp` — and as `cmd_wv`
+    // does, by rebuilding the grid rather than by cropping the result.
+    if o.start.is_some() || o.duration.is_some() {
+        let sr = book.sample_rate as f64;
+        let t0 = o.start.map_or(grid.t_edges[0], |s| s * sr);
+        let t1 = o.duration.map_or(grid.t_edges[grid.n_t()], |d| t0 + d * sr);
+        if t1 <= t0 {
+            return Err("the time window is empty".into());
+        }
+        let (f0, f1) = (grid.f_edges[0], grid.f_edges[grid.n_f()]);
+        grid = if o.log_freq {
+            MapGrid::log_freq(t0..t1, n_t, f0..f1, n_f, book.sample_rate)
+        } else {
+            MapGrid::linear(t0..t1, n_t, f0..f1, n_f, book.sample_rate)
+        };
+    }
+
+    let opts = MapOptions { weight: o.weight, ..Default::default() };
+    let map = tfmap::compute(book, grid, &opts).map_err(|e| e.to_string())?;
+
+    let floor = o.floor_db;
+    let db = map.to_db(floor, o.reference);
+    let (n_t, n_f) = (map.grid.n_t(), map.grid.n_f());
+
+    let mut rgb = vec![0u8; n_t * n_f * 3];
+    for j in 0..n_f {
+        // Top row is the highest frequency, which is how a spectrogram is read.
+        let y = n_f - 1 - j;
+        for i in 0..n_t {
+            let c = tfmap::heat((db[i * n_f + j] as f64 + floor as f64) / floor as f64);
+            let at = (y * n_t + i) * 3;
+            rgb[at..at + 3].copy_from_slice(&c);
+        }
+    }
+
+    let accounted = map.deposited + map.clipped;
+    let caption = format!(
+        "{} atoms, {:.1}% of the removed energy on the grid — separable-marginal pseudo-Wigner, \
+         floor {:.0} dB",
+        map.atoms,
+        100.0 * map.deposited / accounted.max(f64::MIN_POSITIVE),
+        floor
+    );
+
+    let sr = map.grid.sample_rate as f64;
+    let dots = if o.overlay {
+        book.selections
+            .iter()
+            .map(|s| (s.atom.t0 as f64 / sr, s.atom.f))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(MapDone {
+        width: n_t,
+        height: n_f,
+        rgb,
+        caption,
+        dots,
+        t0: map.grid.t_edges[0] / sr,
+        t1: map.grid.t_edges[n_t] / sr,
+        f_edges: map.grid.f_edges.clone(),
+    })
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

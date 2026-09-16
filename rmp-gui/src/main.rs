@@ -14,6 +14,7 @@ mod help;
 mod playback;
 mod settings;
 mod task;
+mod view;
 
 /// Fonts with enough coverage for the manual, tried in order.
 ///

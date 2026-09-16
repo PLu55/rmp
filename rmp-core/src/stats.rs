@@ -115,6 +115,30 @@ pub enum Quantity {
 }
 
 impl Quantity {
+    /// Every quantity, for a front end that has to offer them all.
+    ///
+    /// Beside the enum so the two cannot drift: the only list before this one was hand-written
+    /// inside `rmpstat`'s `slugs_are_unique` test, and it had been missing [`Quantity::Sigma`] since
+    /// the Gaussian atom was added — so the one quantity describing Gaussians was the one quantity
+    /// nothing checked.
+    pub const ALL: [Quantity; 15] = [
+        Self::Alpha,
+        Self::Bandwidth,
+        Self::Sigma,
+        Self::Beta,
+        Self::AlphaBeta,
+        Self::Freq,
+        Self::AmpDb,
+        Self::EnergyDb,
+        Self::T0,
+        Self::SupportMs,
+        Self::FadeDurMs,
+        Self::Q,
+        Self::Rho,
+        Self::Periods,
+        Self::Block,
+    ];
+
     /// The column heading and unit a report should print.
     pub fn label(self) -> &'static str {
         match self {
@@ -691,6 +715,50 @@ pub fn diagnose(book: &Book, dict: &Dictionary, rho_sq_max: f32) -> Diagnostics 
 
 #[cfg(test)]
 mod tests {
+
+    /// `Quantity::ALL` really is all of them.
+    ///
+    /// The inner match is exhaustive, so adding a variant stops this compiling until it is listed
+    /// there — and the assertion then catches it missing from `ALL`. Without that pairing a new
+    /// quantity would simply be unreachable from every front end that enumerates them, which is
+    /// exactly how `Sigma` came to be absent from the only list there was.
+    #[test]
+    fn every_quantity_is_in_all() {
+        fn tag(q: Quantity) -> u8 {
+            match q {
+                Quantity::Alpha => 0,
+                Quantity::Bandwidth => 1,
+                Quantity::Sigma => 2,
+                Quantity::Beta => 3,
+                Quantity::AlphaBeta => 4,
+                Quantity::Freq => 5,
+                Quantity::AmpDb => 6,
+                Quantity::EnergyDb => 7,
+                Quantity::T0 => 8,
+                Quantity::SupportMs => 9,
+                Quantity::FadeDurMs => 10,
+                Quantity::Q => 11,
+                Quantity::Rho => 12,
+                Quantity::Periods => 13,
+                Quantity::Block => 14,
+            }
+        }
+        let mut tags: Vec<u8> = Quantity::ALL.iter().map(|&q| tag(q)).collect();
+        tags.sort_unstable();
+        let n = tags.len();
+        tags.dedup();
+        assert_eq!(tags.len(), n, "a quantity appears twice in ALL");
+        assert_eq!(tags, (0..15).collect::<Vec<u8>>(), "a quantity is missing from ALL");
+    }
+
+    /// Every quantity says what it is; a blank label would be a blank checkbox.
+    #[test]
+    fn every_quantity_has_a_label() {
+        for q in Quantity::ALL {
+            assert!(!q.label().is_empty(), "{q:?} has no label");
+        }
+    }
+
     use super::*;
     use crate::book::Selection;
     use crate::fof::{AtomParams, EnvelopeParams};

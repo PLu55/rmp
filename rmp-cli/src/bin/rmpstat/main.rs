@@ -834,22 +834,7 @@ mod tests {
     /// Every quantity has a distinct filename, or two histograms in one run would overwrite.
     #[test]
     fn slugs_are_unique() {
-        let all = [
-            Quantity::Alpha,
-            Quantity::Bandwidth,
-            Quantity::Beta,
-            Quantity::AlphaBeta,
-            Quantity::Freq,
-            Quantity::AmpDb,
-            Quantity::EnergyDb,
-            Quantity::T0,
-            Quantity::SupportMs,
-            Quantity::FadeDurMs,
-            Quantity::Q,
-            Quantity::Rho,
-            Quantity::Periods,
-            Quantity::Block,
-        ];
+        let all = Quantity::ALL;
         let mut seen: Vec<String> = all.iter().map(|&q| slug(q)).collect();
         seen.sort();
         let n = seen.len();
