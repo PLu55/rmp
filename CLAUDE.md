@@ -58,6 +58,7 @@ cargo run --release -p rmp-cli --example analyze [seconds] [max_atoms] [grains_p
 
 cargo bench -p rmp-core --bench fft          # FFTW planning = MEASURE (default)
 cargo bench -p rmp-core --bench pursuit      # per-stage cost of one decomposition
+cargo bench -p rmp-core --bench fit          # the scoring loop, per sample
 FFTW_PLAN=patient cargo bench -p rmp-core --bench fft
 ```
 
@@ -208,28 +209,58 @@ scan compares energies and the full projection is solved once, for the winner. `
 `fit::Quad::solve_z` exist so the energy-only and full paths cannot drift apart. The same trap is
 live in `refine`, whose 1-D searches read nothing but `.energy` a few hundred times per candidate.
 
-**`fit`'s sums run in four carrier lanes, and the lanes are the definition.** Sample `j` of a reseed
-chunk belongs to lane `j % 4`, which carries its own rotation — stepped by `4 omega` — and its own
-sums, totalled in lane order at the end. That is exactly one AVX2 `f64` vector per step: 0.58 ns a
-sample against 1.79 for the old one-rotation-per-sample loop, 3.0x, where the recurrence's latency
-chain had capped it. Eight lanes measured 2.6x, and the same four lanes written as plain Rust 1.5–2.2x,
-since LLVM would not vectorize it cleanly. Four things are load-bearing:
+**`fit`'s sums run in eight carrier lanes, and the lanes are the definition.** Sample `j` of a reseed
+chunk belongs to lane `j % 8`, which carries its own rotation — stepped by `8 omega` — and its own
+sums, totalled in lane order at the end. Each lane per sample is `u = E sin`, `v = E cos`, five fused
+sums (`<u,u>`, `<v,v>`, `<u,v>`, `<r,u>`, `<r,v>`) and one rotation; the data-only walk drops the
+first three sums. `benches/fit.rs` measures the loop per sample:
+
+| loop | with `G` | data only |
+| --- | --- | --- |
+| one rotation per sample, `E^2` Gram (before lanes) | 1.79 ns | — |
+| 4 lanes, `E^2` Gram and a second rotation at `2 omega` | 0.51 | 0.44 |
+| 4 lanes, `u`/`v` Gram, fused sums | 0.44 | 0.45 |
+| **8 lanes, `u`/`v` Gram, fused sums** | **0.32** | **0.25** |
+| 8 lanes, unfused sums | 0.36 | 0.26 |
+| 12 / 16 lanes, fused | 0.35 / 0.42 | 0.24 / 0.24 |
+
+**The rotation is the latency floor, and that decides everything.** Each lane's rotation is a chain the
+next step waits on, so one AVX2 vector advanced four samples per link however little else it did: at
+four lanes the data-only walk, with half the operations, was no faster than the full one. Two vectors
+are two chains advancing side by side. Past eight, the full walk has more operations per step than the
+core can schedule. The Gram was summed from `E^2` with a second rotation at twice the frequency —
+one loop instead of three before lanes existed. Under lanes it was a second chain and more
+operations, so it is `u`/`v` now; `on_grid_score_matches_the_block_gram` holds its sign convention to
+`dict::Block::new`'s. Five things are load-bearing:
 
 - **`walk_sums_lanes` is the definition and `walk_sums_avx2` its vectorisation**: the same operations
-  on each lane, in the same order, with no fused multiply-add. So the bits do not depend on the
-  machine. `the_vector_walk_is_the_lane_walk_to_the_bit` covers chunk shapes, offsets and reseeds,
-  and fails for a reordered multiply, an `fnmadd`, and a remainder sample on the wrong lane.
+  on each lane, in the same order, `fmadd` exactly where the scalar path has `mul_add` and nowhere
+  else, so the bits do not depend on the machine. The vector path needs AVX2 *and* FMA.
+  `the_vector_walk_is_the_lane_walk_to_the_bit` covers chunk shapes around `LANES` and `RESEED`,
+  offsets and reseeds. It fails for an unfused sum, a fused rotation, and a second vector reading the
+  first vector's samples.
+- **Only the sums fuse, never the rotation.** A fused rotation would put one input through a multiply
+  *and* the fused operation, lengthening the chain that is the floor; now both multiplies run in
+  parallel ahead of a short add. Fusing the sums is worth 12% to the full walk.
 - **`gram_range` walks the same lanes**, or the onset sweep's cached Gram would stop matching the one
   computed inline — `a_cached_gram_matches_a_recomputed_one` fails otherwise.
 - **Seeding is one exact `sin_cos` per chunk.** The other lanes are rotated one sample on from the
-  first. Eight exact seeds per chunk were a quarter of the loop's time at a 512-sample reseed, which
-  is now 2048: 512 steps per lane, the same drift bound as before.
-- **This moved books, and only their recorded scores.** Summing in lanes changes the last bits of every
-  fit score. On seven runs — `chopin-nocturne-2.toml` at 3 s and 10 s, `mp_1.toml`, both
-  `lux-eterna-1` Gaussian configurations, HRMP on, `zyklus-mp-1.toml` — every atom's parameters,
-  every `energy_removed` and `residual_energy`, and every residual WAV stayed byte-identical.
-  `projected_energy` and `hr_score` differ, by at most 1.0e-12 relative. A different atom is
-  possible in principle, on a comparison that close; none happened.
+  first, and `RESEED` is `512 * LANES`: 512 steps per lane, the drift bound the one-rotation loop had
+  at 512 samples.
+- **Each change of arithmetic moved books, and only their recorded scores.** Going to four lanes, and
+  again to eight with the `u`/`v` Gram and fused sums, changed the last bits of every fit score. Both
+  times, on seven runs — `chopin-nocturne-2.toml` at 3 s and 10 s, `mp_1.toml`, both `lux-eterna-1`
+  Gaussian configurations, HRMP on, `zyklus-mp-1.toml` — every atom's parameters, every
+  `energy_removed` and `residual_energy`, and every residual WAV stayed byte-identical.
+  `projected_energy` and `hr_score` differ, by at most 1.0e-12 and 7.3e-13 relative. A different
+  atom is possible in principle, on a comparison that close; none happened.
+
+End to end the second step bought less than the loop's 1.6–1.8x, because refinement's trials run in
+parallel batches and the rest of each iteration did not change: `zyklus-mp-1.toml` 2.95 → 2.69 s,
+`lux-eterna-1-gaussian.toml` 3.77 → 3.47 s, 10 s of piano 22.0 → 20.6 s, 3 s of piano 2.49 → 2.39 s,
+HRMP unchanged at 1.0 s. Not taken: precomputing each `omega`'s seeds once per refinement stage. The
+per-call `sin_cos` costs 6–7% of a 1,671-sample trial and nothing on long ones, not worth an API
+through `refine`.
 
 **A frame's refresh depends only on the residual and its block, and that is load-bearing for
 speed.** Each block owns its frame table and a correlator; the only shared thing is the residual,
@@ -665,9 +696,10 @@ so a kernel change that moves one fails loudly instead of leaving a test of noth
 `Envelope::render` 5–8%, which refinement's probes paid for and never read — it is now
 `Envelope::energy()`, computed when asked, and a `Block` keeps its own. The FFT refresh was 5%. After the lanes, the vector `exp` and the lazy energy: 6.55 s
 → 3.64 s on that run, and 1.01 s → 0.49 s on the Gaussian-only arm of `mp_1.toml`, the same atoms and
-residual throughout. What remains is shared with FOF analysis: `fit`'s sums (23%), the refresh (13%),
-and rayon workers spinning while the pursuit is briefly serial, which costs CPU rather than wall clock
-— raising refinement's `PARALLEL_SUPPORT` to stop it measured slower.
+residual throughout. Eight lanes then took it to 3.47 s. What remains is `fit`'s sums (16.5%), the
+envelope render (13%), the refresh (~13%), and rayon workers spinning while the pursuit is briefly
+serial, which costs CPU rather than wall clock — raising refinement's `PARALLEL_SUPPORT` to stop it
+measured slower.
 
 **The `sigma` stage holds the centre, not `t0`.** `t0` is the first sample of the support for both
 kinds, but a Gaussian's peak sits `half_len(sigma)` later. Searching `sigma` at a fixed `t0` would move
@@ -1028,7 +1060,7 @@ allowed CPUs from `/proc/self/status`, so a `taskset` mask narrows it.
 of its transforms, and refinement's batches of 8 at about 3 golden-section steps each. A homogeneous
 CPU with more memory channels should scale further on the same code. Changing what a frame costs
 would mean changing the transform, which moves books; `fit`'s accumulation order has since changed
-(see *`fit`'s sums run in four carrier lanes*), moving only the recorded scores.
+(see *`fit`'s sums run in eight carrier lanes*), moving only the recorded scores.
 
 ### The low-alpha regime, and what `capture_tolerance` is worth
 

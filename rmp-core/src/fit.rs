@@ -8,18 +8,23 @@
 //! It is separate from `refine` because `hrmp` needs [`Quad::energy_at`] without needing an
 //! optimizer.
 //!
-//! # The Gram comes from `E^2`, not from `u` and `v`
+//! # The Gram is summed from `u` and `v`
 //!
-//! With `u = E*sin(wt)` and `v = E*cos(wt)`, and
+//! With `u = E*sin(wt)` and `v = E*cos(wt)`, `G` is `<u,u>`, `<u,v>` and `<v,v>`, summed as they
+//! stand. [`crate::dict::Block::new`] reads the same quantities out of one FFT of `E^2`, through
+//! the product-to-sum identities
 //!
 //! ```text
 //! P = sum E^2      C = sum E^2 cos(2wt)      S = sum E^2 sin(2wt)
+//! <u,u> = (P-C)/2      <v,v> = (P+C)/2      <u,v> = S/2
 //! ```
 //!
-//! the product-to-sum identities give `<u,u> = (P-C)/2`, `<v,v> = (P+C)/2`, `<u,v> = S/2`. That is
-//! one loop over `E^2` instead of three over `u` and `v`, and it is the same algebra
-//! [`crate::dict::Block::new`] already reads out of one FFT — so the sign convention is inherited
-//! rather than re-derived, which is the only way to be sure the two paths agree.
+//! and this module used to sum `P`, `C` and `S` too, so the sign convention was inherited rather than
+//! re-derived. That cost a second carrier rotation at twice the frequency, which under the vector
+//! lanes of [`walk_sums`] is a second latency chain and more operations than the three products it
+//! saved. The two definitions agree in sign and to within rounding, which is what
+//! `on_grid_score_matches_the_block_gram` holds them to; summing `<u,u>` directly also avoids
+//! `P - C` cancelling near DC.
 //!
 //! **`G` does not depend on `t0`** for an atom lying wholly inside the signal, so a caller sweeping
 //! `t0` at fixed `(alpha, beta, f)` computes it once and passes it to [`accumulate_with`]. That is
@@ -64,13 +69,13 @@ pub struct Quad {
 /// Samples between exact re-seeds of the carrier recurrence.
 ///
 /// The rotation drifts by about `k * eps` over `k` steps. Each of the [`LANES`] steps once per
-/// `LANES` samples, so 2048 samples are 512 steps per lane and ~1.1e-13 rad — seven orders below the
-/// ~1e-4 ripple rfofs's own polynomial/LUT carrier already carries. It must stay f64: an f32 rotation
-/// would drift 3.6e-3 rad across a 30000-sample support.
+/// `LANES` samples, so a chunk is 512 steps per lane and ~1.1e-13 rad — seven orders below the ~1e-4
+/// ripple rfofs's own polynomial/LUT carrier already carries. It must stay f64: an f32 rotation would
+/// drift 3.6e-3 rad across a 30000-sample support.
 ///
-/// It was 512 when every sample stepped one rotation, for the same drift. Seeding costs `sin_cos`
-/// calls, and at 512 they were a quarter of the scoring loop's time once the loop went to lanes.
-const RESEED: usize = 2048;
+/// It was 512 samples when every sample stepped one rotation, for the same drift. Seeding costs a
+/// `sin_cos` call, and at 512 samples with four lanes seeding was a quarter of the loop's time.
+const RESEED: usize = 512 * LANES;
 
 /// The envelope-and-carrier half of the fit statistics.
 ///
@@ -212,77 +217,97 @@ fn accumulate_reseed(
 /// Carrier lanes. Sample `j` of a reseed chunk belongs to lane `j % LANES`, and each lane carries
 /// its own rotation, stepped by `LANES * omega` per visit and accumulated into its own sums.
 ///
-/// Four lanes are one AVX2 `f64` vector. The lanes are what the arithmetic *is* — the scalar path
-/// walks them one sample at a time and the vector path four at a time, performing the same
-/// operations on each lane in the same order — so both give the same bits, whatever the machine.
-const LANES: usize = 4;
+/// The lanes are what the arithmetic *is* — the scalar path walks them one sample at a time and the
+/// vector path [`VECTORS`] AVX2 vectors at a time, performing the same operations on each lane in
+/// the same order — so both give the same bits, whatever the machine.
+///
+/// **Eight, because the rotation is the loop's latency floor.** Each lane's rotation is a chain the
+/// next step waits on, so with one vector the loop advanced four samples per link however little
+/// else it did: at four lanes the data-only walk ran at 0.44 ns a sample, no faster than the full
+/// one. Two vectors are two chains advancing side by side. Measured by `benches/fit.rs`, in ns a
+/// sample with the Gram and without:
+///
+/// | lanes | with `G` | data only |
+/// | --- | --- | --- |
+/// | 4 | 0.44 | 0.45 |
+/// | **8** | **0.32** | **0.25** |
+/// | 12 | 0.35 | 0.24 |
+/// | 16 | 0.42 | 0.24 |
+///
+/// Past eight the full walk has more operations per step than the core can schedule and slows again.
+const LANES: usize = 8;
+
+/// AVX2 vectors the lanes occupy, four lanes to a vector.
+const VECTORS: usize = LANES / 4;
 
 /// Each lane's running sums.
 #[derive(Clone, Copy, Default)]
 struct LaneSums {
-    p: [f64; LANES],
-    cc: [f64; LANES],
-    ss: [f64; LANES],
+    uu: [f64; LANES],
+    vv: [f64; LANES],
+    uv: [f64; LANES],
     d_u: [f64; LANES],
     d_v: [f64; LANES],
 }
 
-/// Each lane's carrier at the doubled frequency (for `G`) and at the carrier frequency (for `d`).
+/// Each lane's carrier, `sin` and `cos` of `omega t`.
 #[derive(Clone, Copy)]
 struct LaneCarriers {
-    s1: [f64; LANES],
-    c1: [f64; LANES],
-    s2: [f64; LANES],
-    c2: [f64; LANES],
+    s: [f64; LANES],
+    c: [f64; LANES],
 }
 
 impl LaneCarriers {
     /// Carriers at local atom times `t .. t + LANES`: the first lane exact, each later one rotated a
-    /// single sample on from the lane before — two `sin_cos` calls per seed rather than eight.
-    fn seed(omega: f64, t: usize, with_gram: bool, step: &LaneStep) -> Self {
-        let mut c = Self { s1: [0.0; LANES], c1: [0.0; LANES], s2: [0.0; LANES], c2: [0.0; LANES] };
-        (c.s1[0], c.c1[0]) = (omega * t as f64).sin_cos();
-        if with_gram {
-            (c.s2[0], c.c2[0]) = (2.0 * omega * t as f64).sin_cos();
-        }
+    /// single sample on from the lane before — one `sin_cos` call per seed.
+    fn seed(omega: f64, t: usize, step: &LaneStep) -> Self {
+        let mut car = Self { s: [0.0; LANES], c: [0.0; LANES] };
+        (car.s[0], car.c[0]) = (omega * t as f64).sin_cos();
         for k in 1..LANES {
-            c.s1[k] = c.s1[k - 1] * step.cw1_one + c.c1[k - 1] * step.sw1_one;
-            c.c1[k] = c.c1[k - 1] * step.cw1_one - c.s1[k - 1] * step.sw1_one;
-            if with_gram {
-                c.s2[k] = c.s2[k - 1] * step.cw2_one + c.c2[k - 1] * step.sw2_one;
-                c.c2[k] = c.c2[k - 1] * step.cw2_one - c.s2[k - 1] * step.sw2_one;
-            }
+            car.s[k] = car.s[k - 1] * step.cw_one + car.c[k - 1] * step.sw_one;
+            car.c[k] = car.c[k - 1] * step.cw_one - car.s[k - 1] * step.sw_one;
         }
-        c
+        car
     }
 }
 
-/// One lane's rotation per visit — `LANES * omega` at the carrier and twice that for `G` — and the
-/// single-sample rotations that seed the lanes from the first.
+/// One lane's rotation per visit, `LANES * omega`, and the single-sample rotation that seeds the
+/// lanes from the first.
 #[derive(Clone, Copy)]
 struct LaneStep {
-    sw1: f64,
-    cw1: f64,
-    sw2: f64,
-    cw2: f64,
-    sw1_one: f64,
-    cw1_one: f64,
-    sw2_one: f64,
-    cw2_one: f64,
+    sw: f64,
+    cw: f64,
+    sw_one: f64,
+    cw_one: f64,
 }
 
 impl LaneStep {
     fn new(omega: f64) -> Self {
-        let (sw1, cw1) = (LANES as f64 * omega).sin_cos();
-        let (sw2, cw2) = (2.0 * LANES as f64 * omega).sin_cos();
-        let (sw1_one, cw1_one) = omega.sin_cos();
-        let (sw2_one, cw2_one) = (2.0 * omega).sin_cos();
-        Self { sw1, cw1, sw2, cw2, sw1_one, cw1_one, sw2_one, cw2_one }
+        let (sw, cw) = (LANES as f64 * omega).sin_cos();
+        let (sw_one, cw_one) = omega.sin_cos();
+        Self { sw, cw, sw_one, cw_one }
     }
 }
 
-/// Fold one sample into lane `k` and advance that lane's carriers. The single definition of the
+/// `acc + a * b` as one fused multiply-add: fewer operations per step than a multiply and an add,
+/// which is worth 12% to the full walk at eight lanes, and exactly specified by IEEE 754, so the same
+/// bits on every machine. Only the sums fuse; see [`lane_sample`] for why the rotation does not.
+#[inline(always)]
+fn acc_add(acc: f64, a: f64, b: f64) -> f64 {
+    a.mul_add(b, acc)
+}
+
+/// Fold one sample into lane `k` and advance that lane's carrier. The single definition of the
 /// per-sample arithmetic: the vector loop performs exactly these operations, four lanes at a time.
+///
+/// The Gram is summed from `u = E sin` and `v = E cos` directly. It used to come from `E^2` and a
+/// second rotation at twice the frequency, which was one loop over `E^2` instead of three over `u`
+/// and `v`; under lanes that second rotation is a second latency chain and more operations than the
+/// three products it replaced.
+///
+/// **The rotation stays a multiply, a multiply and an add.** It is the chain the loop waits on, and
+/// fusing it would lengthen that chain: one input would pass through a multiply *and* the fused
+/// operation, where now both multiplies run in parallel ahead of a short add.
 #[inline(always)]
 fn lane_sample<const WITH_GRAM: bool>(
     e: f64,
@@ -292,33 +317,27 @@ fn lane_sample<const WITH_GRAM: bool>(
     car: &mut LaneCarriers,
     step: &LaneStep,
 ) {
+    let u = e * car.s[k];
+    let v = e * car.c[k];
     if WITH_GRAM {
-        let e2 = e * e;
-        sums.p[k] += e2;
-        sums.cc[k] += e2 * car.c2[k];
-        sums.ss[k] += e2 * car.s2[k];
+        sums.uu[k] = acc_add(sums.uu[k], u, u);
+        sums.vv[k] = acc_add(sums.vv[k], v, v);
+        sums.uv[k] = acc_add(sums.uv[k], u, v);
     }
-    let re = r * e;
-    sums.d_u[k] += re * car.s1[k];
-    sums.d_v[k] += re * car.c1[k];
+    sums.d_u[k] = acc_add(sums.d_u[k], r, u);
+    sums.d_v[k] = acc_add(sums.d_v[k], r, v);
 
-    let n1 = car.s1[k] * step.cw1 + car.c1[k] * step.sw1;
-    car.c1[k] = car.c1[k] * step.cw1 - car.s1[k] * step.sw1;
-    car.s1[k] = n1;
-    if WITH_GRAM {
-        let n2 = car.s2[k] * step.cw2 + car.c2[k] * step.sw2;
-        car.c2[k] = car.c2[k] * step.cw2 - car.s2[k] * step.sw2;
-        car.s2[k] = n2;
-    }
+    let next = car.s[k] * step.cw + car.c[k] * step.sw;
+    car.c[k] = car.c[k] * step.cw - car.s[k] * step.sw;
+    car.s[k] = next;
 }
 
 /// The lanes summed in lane order, and `G` from them.
 fn lane_totals(sums: &LaneSums) -> ((f64, f64), Gram) {
     let total = |a: &[f64; LANES]| a.iter().fold(0.0, |acc, &x| acc + x);
-    let (p, cc, ss) = (total(&sums.p), total(&sums.cc), total(&sums.ss));
     (
         (total(&sums.d_u), total(&sums.d_v)),
-        Gram { g_uu: (p - cc) * 0.5, g_uv: ss * 0.5, g_vv: (p + cc) * 0.5 },
+        Gram { g_uu: total(&sums.uu), g_uv: total(&sums.uv), g_vv: total(&sums.vv) },
     )
 }
 
@@ -343,8 +362,8 @@ fn walk_sums<const WITH_GRAM: bool>(
     reseed: usize,
 ) -> ((f64, f64), Gram) {
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: AVX2 was detected on this machine just now.
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: AVX2 and FMA were detected on this machine just now.
         return unsafe { walk_sums_avx2::<WITH_GRAM>(residual, env, e_start, r_start, n, omega, reseed) };
     }
     walk_sums_lanes::<WITH_GRAM>(residual, env, e_start, r_start, n, omega, reseed)
@@ -365,7 +384,7 @@ fn walk_sums_lanes<const WITH_GRAM: bool>(
     let mut i = 0;
     while i < n {
         let chunk = reseed.min(n - i);
-        let mut car = LaneCarriers::seed(omega, e_start + i, WITH_GRAM, &step);
+        let mut car = LaneCarriers::seed(omega, e_start + i, &step);
         for j in 0..chunk {
             let e = env[e_start + i + j] as f64;
             let r = residual[r_start + i + j] as f64;
@@ -376,15 +395,15 @@ fn walk_sums_lanes<const WITH_GRAM: bool>(
     lane_totals(&sums)
 }
 
-/// [`walk_sums`] four lanes at a time in AVX2: the same operations on each lane, in the same order,
-/// as [`walk_sums_lanes`], so the same bits. No fused multiply-add anywhere, since the scalar path
-/// has none.
+/// [`walk_sums`] in AVX2, [`LANES`] at a time in [`VECTORS`] four-wide vectors: the same operations
+/// on each lane, in the same order, as [`walk_sums_lanes`] — `fmadd` exactly where it uses
+/// `mul_add`, and nowhere else — so the same bits.
 ///
 /// # Safety
 ///
-/// The CPU must support AVX2.
+/// The CPU must support AVX2 and FMA.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn walk_sums_avx2<const WITH_GRAM: bool>(
     residual: &[f32],
     env: &[f32],
@@ -398,58 +417,62 @@ unsafe fn walk_sums_avx2<const WITH_GRAM: bool>(
     assert!(e_start + n <= env.len() && r_start + n <= residual.len());
 
     let step = LaneStep::new(omega);
-    let (sw1, cw1) = (_mm256_set1_pd(step.sw1), _mm256_set1_pd(step.cw1));
-    let (sw2, cw2) = (_mm256_set1_pd(step.sw2), _mm256_set1_pd(step.cw2));
-    // SAFETY: a lane array is exactly one 4-wide `f64` vector's worth of memory.
-    let load = |a: &[f64; LANES]| unsafe { _mm256_loadu_pd(a.as_ptr()) };
-    let store = |v: __m256d, a: &mut [f64; LANES]| unsafe { _mm256_storeu_pd(a.as_mut_ptr(), v) };
+    let (sw, cw) = (_mm256_set1_pd(step.sw), _mm256_set1_pd(step.cw));
+    // SAFETY: vector `h` of a lane array is lanes `4h .. 4h + 4`, inside the array.
+    let load = |a: &[f64; LANES], h: usize| unsafe { _mm256_loadu_pd(a.as_ptr().add(4 * h)) };
+    let store =
+        |v: __m256d, a: &mut [f64; LANES], h: usize| unsafe { _mm256_storeu_pd(a.as_mut_ptr().add(4 * h), v) };
+    let acc = |acc: __m256d, a: __m256d, b: __m256d| _mm256_fmadd_pd(a, b, acc);
 
     let mut sums = LaneSums::default();
     let mut i = 0;
     while i < n {
         let chunk = reseed.min(n - i);
-        let mut car = LaneCarriers::seed(omega, e_start + i, WITH_GRAM, &step);
+        let mut car = LaneCarriers::seed(omega, e_start + i, &step);
         let full = chunk / LANES * LANES;
         if full > 0 {
-            let (mut p, mut cc, mut ss) = (load(&sums.p), load(&sums.cc), load(&sums.ss));
-            let (mut d_u, mut d_v) = (load(&sums.d_u), load(&sums.d_v));
-            let (mut s1, mut c1) = (load(&car.s1), load(&car.c1));
-            let (mut s2, mut c2) = (load(&car.s2), load(&car.c2));
+            let zero = _mm256_setzero_pd();
+            let (mut uu, mut vv, mut uv) = ([zero; VECTORS], [zero; VECTORS], [zero; VECTORS]);
+            let (mut d_u, mut d_v) = ([zero; VECTORS], [zero; VECTORS]);
+            let (mut s, mut c) = ([zero; VECTORS], [zero; VECTORS]);
+            for h in 0..VECTORS {
+                (uu[h], vv[h], uv[h]) = (load(&sums.uu, h), load(&sums.vv, h), load(&sums.uv, h));
+                (d_u[h], d_v[h]) = (load(&sums.d_u, h), load(&sums.d_v, h));
+                (s[h], c[h]) = (load(&car.s, h), load(&car.c, h));
+            }
             let mut j = 0;
             while j < full {
-                // SAFETY: `j + LANES <= full <= chunk` and `i + chunk <= n`, and both slices were
-                // checked above to hold `n` samples from their starts.
-                let e = _mm256_cvtps_pd(unsafe { _mm_loadu_ps(env.as_ptr().add(e_start + i + j)) });
-                let r = _mm256_cvtps_pd(unsafe { _mm_loadu_ps(residual.as_ptr().add(r_start + i + j)) });
-                if WITH_GRAM {
-                    let e2 = _mm256_mul_pd(e, e);
-                    p = _mm256_add_pd(p, e2);
-                    cc = _mm256_add_pd(cc, _mm256_mul_pd(e2, c2));
-                    ss = _mm256_add_pd(ss, _mm256_mul_pd(e2, s2));
-                }
-                let re = _mm256_mul_pd(r, e);
-                d_u = _mm256_add_pd(d_u, _mm256_mul_pd(re, s1));
-                d_v = _mm256_add_pd(d_v, _mm256_mul_pd(re, c1));
+                for h in 0..VECTORS {
+                    let at = i + j + 4 * h;
+                    // SAFETY: `at + 4 <= i + full <= i + chunk <= n`, and both slices were checked
+                    // above to hold `n` samples from their starts.
+                    let e = _mm256_cvtps_pd(unsafe { _mm_loadu_ps(env.as_ptr().add(e_start + at)) });
+                    let r = _mm256_cvtps_pd(unsafe { _mm_loadu_ps(residual.as_ptr().add(r_start + at)) });
+                    let u = _mm256_mul_pd(e, s[h]);
+                    let v = _mm256_mul_pd(e, c[h]);
+                    if WITH_GRAM {
+                        uu[h] = acc(uu[h], u, u);
+                        vv[h] = acc(vv[h], v, v);
+                        uv[h] = acc(uv[h], u, v);
+                    }
+                    d_u[h] = acc(d_u[h], r, u);
+                    d_v[h] = acc(d_v[h], r, v);
 
-                let n1 = _mm256_add_pd(_mm256_mul_pd(s1, cw1), _mm256_mul_pd(c1, sw1));
-                c1 = _mm256_sub_pd(_mm256_mul_pd(c1, cw1), _mm256_mul_pd(s1, sw1));
-                s1 = n1;
-                if WITH_GRAM {
-                    let n2 = _mm256_add_pd(_mm256_mul_pd(s2, cw2), _mm256_mul_pd(c2, sw2));
-                    c2 = _mm256_sub_pd(_mm256_mul_pd(c2, cw2), _mm256_mul_pd(s2, sw2));
-                    s2 = n2;
+                    let next = _mm256_add_pd(_mm256_mul_pd(s[h], cw), _mm256_mul_pd(c[h], sw));
+                    c[h] = _mm256_sub_pd(_mm256_mul_pd(c[h], cw), _mm256_mul_pd(s[h], sw));
+                    s[h] = next;
                 }
                 j += LANES;
             }
-            store(p, &mut sums.p);
-            store(cc, &mut sums.cc);
-            store(ss, &mut sums.ss);
-            store(d_u, &mut sums.d_u);
-            store(d_v, &mut sums.d_v);
-            store(s1, &mut car.s1);
-            store(c1, &mut car.c1);
-            store(s2, &mut car.s2);
-            store(c2, &mut car.c2);
+            for h in 0..VECTORS {
+                store(uu[h], &mut sums.uu, h);
+                store(vv[h], &mut sums.vv, h);
+                store(uv[h], &mut sums.uv, h);
+                store(d_u[h], &mut sums.d_u, h);
+                store(d_v[h], &mut sums.d_v, h);
+                store(s[h], &mut car.s, h);
+                store(c[h], &mut car.c, h);
+            }
         }
         for j in full..chunk {
             let e = env[e_start + i + j] as f64;
@@ -472,7 +495,7 @@ fn gram_range(env: &[f32], e_start: usize, n: usize, omega: f64, reseed: usize) 
     let mut i = 0;
     while i < n {
         let chunk = reseed.min(n - i);
-        let mut car = LaneCarriers::seed(omega, e_start + i, true, &step);
+        let mut car = LaneCarriers::seed(omega, e_start + i, &step);
         for j in 0..chunk {
             let e = env[e_start + i + j] as f64;
             lane_sample::<true>(e, 0.0, j % LANES, &mut sums, &mut car, &step);
@@ -651,14 +674,15 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_vector_walk_is_the_lane_walk_to_the_bit() {
-        if !std::arch::is_x86_feature_detected!("avx2") {
+        if !(std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")) {
             return;
         }
         let residual = noise(30_000, 0xa5a5);
         let env: Vec<f32> = noise(30_000, 0x5a5a).iter().map(|x| x.abs()).collect();
-        for n in [0usize, 1, 3, 4, 5, 7, 2_047, 2_048, 2_049, 9_999] {
+        let edges = [LANES - 1, LANES, LANES + 1, RESEED - 1, RESEED, RESEED + 1];
+        for n in [0usize, 1, 3, 4, 5, 7, 9, 9_999].into_iter().chain(edges) {
             for (e_start, r_start) in [(0usize, 0usize), (3, 1_001), (17, 5)] {
-                for reseed in [1usize, 3, 4, 6, RESEED] {
+                for reseed in [1usize, 3, 4, 6, LANES + 2, RESEED] {
                     for omega in [0.001, 0.37, 2.9] {
                         let args = (&residual[..], &env[..], e_start, r_start, n, omega, reseed);
                         let (r, e, es, rs, n, w, k) = args;
