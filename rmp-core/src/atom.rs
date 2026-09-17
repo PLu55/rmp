@@ -204,8 +204,6 @@ pub struct Envelope {
     pub sample_rate: f32,
     /// The envelope, truncated to its support. `samples.len() == support_len`.
     pub samples: Vec<f32>,
-    /// `sum(E^2)`, accumulated in f64.
-    pub energy: f64,
 }
 
 impl Envelope {
@@ -216,13 +214,17 @@ impl Envelope {
             Shape::Fof(p) => crate::fof::render_probe(*p, sample_rate)?,
             Shape::Gaussian(g) => g.render_envelope(sample_rate)?,
         };
-        let energy = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
-        Ok(Self {
-            params,
-            sample_rate,
-            samples,
-            energy,
-        })
+        Ok(Self { params, sample_rate, samples })
+    }
+
+    /// `sum(E^2)`, accumulated in f64 in sample order.
+    ///
+    /// Computed when asked rather than on every render. Refinement renders tens of envelopes per
+    /// atom and reads the energy of none of them, and the sum was 8% of a Gaussian analysis — a
+    /// sequential f64 addition over supports that reach 214,000 samples. A [`crate::dict::Block`]
+    /// computes it once and keeps it.
+    pub fn energy(&self) -> f64 {
+        self.samples.iter().map(|&s| (s as f64) * (s as f64)).sum()
     }
 
     pub fn support_len(&self) -> usize {

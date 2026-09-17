@@ -55,6 +55,8 @@ impl Default for BlockConfig {
 #[derive(Clone, Debug)]
 pub struct Block {
     pub env: Envelope,
+    /// [`Envelope::energy`], computed once.
+    pub energy: f64,
     /// Transform length: `support_len` rounded up to an even 5-smooth number.
     pub fft_len: usize,
     /// Frame spacing in samples.
@@ -101,7 +103,8 @@ impl Block {
         let mut spectrum = vec![Complex32::new(0.0, 0.0); fft.complex_len()];
         fft.forward(&mut squared, &mut spectrum);
 
-        let p = env.energy; // == Y[0].re, but summed in f64
+        let energy = env.energy();
+        let p = energy; // == Y[0].re, but summed in f64
         let n = k_hi - k_lo + 1;
         let (mut inv_uu, mut inv_uv, mut inv_vv, mut rho) =
             (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]);
@@ -128,6 +131,7 @@ impl Block {
 
         Ok(Self {
             env,
+            energy,
             fft_len,
             hop,
             k_lo,

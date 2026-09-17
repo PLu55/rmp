@@ -253,7 +253,7 @@ impl<'a> Mp<'a> {
                     .live_bins()
                     .filter_map(|k| block.rho(k))
                     .fold(0.0f32, f32::max) as f64;
-                let lambda_min = 0.5 * block.env.energy * (1.0 - max_rho);
+                let lambda_min = 0.5 * block.energy * (1.0 - max_rho);
 
                 BlockState {
                     dirty: vec![false; frames],

@@ -422,7 +422,7 @@ mod tests {
     fn envelope_is_zero_outside_support_and_ends_nonzero() {
         let env = Envelope::render(EnvelopeParams::new(251.0, 0.002), SR).unwrap();
         assert_ne!(*env.samples.last().unwrap(), 0.0, "support_len is too long");
-        assert!(env.energy > 0.0);
+        assert!(env.energy() > 0.0);
     }
 
     #[test]

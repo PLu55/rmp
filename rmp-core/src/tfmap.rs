@@ -432,7 +432,7 @@ pub fn atom_kernel(
     let weight = match opts.weight {
         Weight::EnergyRemoved => sel.energy_removed,
         Weight::HrScore => sel.hr_score.unwrap_or(sel.energy_removed),
-        Weight::AtomEnergy => (sel.atom.amp as f64).powi(2) * env.energy,
+        Weight::AtomEnergy => (sel.atom.amp as f64).powi(2) * env.energy(),
     };
     // Rejects NaN as well as zero — a book can be hand-edited, and a NaN weight would
     // poison every cell it touched.
@@ -752,7 +752,7 @@ mod tests {
             phi: 0.3,
             amp,
         };
-        let energy = Envelope::render(atom.env, SR).unwrap().energy * (amp as f64).powi(2);
+        let energy = Envelope::render(atom.env, SR).unwrap().energy() * (amp as f64).powi(2);
         Selection {
             atom,
             block: 0,

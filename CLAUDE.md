@@ -208,6 +208,29 @@ scan compares energies and the full projection is solved once, for the winner. `
 `fit::Quad::solve_z` exist so the energy-only and full paths cannot drift apart. The same trap is
 live in `refine`, whose 1-D searches read nothing but `.energy` a few hundred times per candidate.
 
+**`fit`'s sums run in four carrier lanes, and the lanes are the definition.** Sample `j` of a reseed
+chunk belongs to lane `j % 4`, which carries its own rotation — stepped by `4 omega` — and its own
+sums, totalled in lane order at the end. That is exactly one AVX2 `f64` vector per step: 0.58 ns a
+sample against 1.79 for the old one-rotation-per-sample loop, 3.0x, where the recurrence's latency
+chain had capped it. Eight lanes measured 2.6x, and the same four lanes written as plain Rust 1.5–2.2x,
+since LLVM would not vectorize it cleanly. Four things are load-bearing:
+
+- **`walk_sums_lanes` is the definition and `walk_sums_avx2` its vectorisation**: the same operations
+  on each lane, in the same order, with no fused multiply-add. So the bits do not depend on the
+  machine. `the_vector_walk_is_the_lane_walk_to_the_bit` covers chunk shapes, offsets and reseeds,
+  and fails for a reordered multiply, an `fnmadd`, and a remainder sample on the wrong lane.
+- **`gram_range` walks the same lanes**, or the onset sweep's cached Gram would stop matching the one
+  computed inline — `a_cached_gram_matches_a_recomputed_one` fails otherwise.
+- **Seeding is one exact `sin_cos` per chunk.** The other lanes are rotated one sample on from the
+  first. Eight exact seeds per chunk were a quarter of the loop's time at a 512-sample reseed, which
+  is now 2048: 512 steps per lane, the same drift bound as before.
+- **This moved books, and only their recorded scores.** Summing in lanes changes the last bits of every
+  fit score. On seven runs — `chopin-nocturne-2.toml` at 3 s and 10 s, `mp_1.toml`, both
+  `lux-eterna-1` Gaussian configurations, HRMP on, `zyklus-mp-1.toml` — every atom's parameters,
+  every `energy_removed` and `residual_energy`, and every residual WAV stayed byte-identical.
+  `projected_energy` and `hr_score` differ, by at most 1.0e-12 relative. A different atom is
+  possible in principle, on a comparison that close; none happened.
+
 **A frame's refresh depends only on the residual and its block, and that is load-bearing for
 speed.** Each block owns its frame table and a correlator; the only shared thing is the residual,
 read-only during a refresh. `mp::refresh_frames` runs the work on rayon, which is why `Correlator`
@@ -594,7 +617,7 @@ equals the atom's `t0` only until refinement can move it.
 
 `amp * g[n] * sin(phi + omega n)`, `g[n] = exp(-(n-h)^2 / 2 s^2)` over `n = 0..2h`, with the peak
 exactly 1 and the support cut where `g` falls below `cutoff_level`. Settings are
-`[dictionary.gaussian] sigmas_ms` (empty by default) and `[refine] sigma_*`. Seven facts that are not
+`[dictionary.gaussian] sigmas_ms` (empty by default) and `[refine] sigma_*`. Nine facts that are not
 obvious from the code:
 
 **rmp owns the definition, so the rule "derive by rendering, never by formula" does not apply.**
@@ -612,6 +635,39 @@ every book ever produced.
 index is both what a book records and the selection tie-break, so appending the Gaussian blocks
 leaves every FOF block where it was. Verified: re-analysing the `mp_1.toml` piano reference after the
 change gives a byte-identical book and residual.
+
+**Rendering is vectorised, and still exactly the formula.** A Gaussian analysis renders an envelope
+for every `sigma` refinement probes, over supports up to 214,000 samples, and one glibc `exp` per
+sample was 16% of `lux-eterna-1-gaussian.toml`'s time. Two things removed that without moving a bit of
+any render:
+
+- **Half the support.** `g[h - d]` and `g[h + d]` are one expression of one `d^2`, so each is
+  evaluated once, and the vector loop stores each set of four both after the peak and, reversed,
+  before it.
+- **A fast `exp` kept only where it cannot differ.** `gauss::exp_fast` is `2^k` times a degree-13
+  Taylor polynomial in Estrin's form — 20% faster than Horner's rule, which chains thirteen
+  multiply-adds per lane — and lands within 4.3e-16 of glibc. Every render is f32, so a fast value is
+  kept only when all of `y * (1 ± 1e-13)` rounds to one f32. The exact value is inside that interval,
+  so the f32 is the exact computation's — a margin of 230 over the measured error. A few samples in
+  a million are near enough to a rounding boundary to be computed again the slow way. The atom render applies the same guard to the whole
+  product with the exact `sin`.
+
+The guard needed fixtures found by search, because no ordinary envelope reliably exercises it. Two
+cases matter. The fast `exp` rounding to the other f32 happens about once in a billion samples. The
+value an *unguarded* loop would store, `y * (1 - 1e-13)` rounded, differing from the exact f32 happens
+about once in a million. The second fixture was needed because a loop that ignored the guard passed
+on the first alone: the value it stored happened to round the exact way.
+`the_guard_holds_on_the_samples_where_it_matters` asserts each fixture's premise before using it,
+so a kernel change that moves one fails loudly instead of leaving a test of nothing.
+
+**What made Gaussian analysis slow, and what it measures now.** Profiled on
+`lux-eterna-1-gaussian.toml` over 2 s: `fit`'s sums 43%, glibc `exp` 16%, and the f64 energy sum in
+`Envelope::render` 5–8%, which refinement's probes paid for and never read — it is now
+`Envelope::energy()`, computed when asked, and a `Block` keeps its own. The FFT refresh was 5%. After the lanes, the vector `exp` and the lazy energy: 6.55 s
+→ 3.64 s on that run, and 1.01 s → 0.49 s on the Gaussian-only arm of `mp_1.toml`, the same atoms and
+residual throughout. What remains is shared with FOF analysis: `fit`'s sums (23%), the refresh (13%),
+and rayon workers spinning while the pursuit is briefly serial, which costs CPU rather than wall clock
+— raising refinement's `PARALLEL_SUPPORT` to stop it measured slower.
 
 **The `sigma` stage holds the centre, not `t0`.** `t0` is the first sample of the support for both
 kinds, but a Gaussian's peak sits `half_len(sigma)` later. Searching `sigma` at a fixed `t0` would move
@@ -971,7 +1027,8 @@ allowed CPUs from `/proc/self/status`, so a `taskset` mask narrows it.
 **What remains is memory traffic, not scheduling.** The refresh is at the 8-core throughput ceiling
 of its transforms, and refinement's batches of 8 at about 3 golden-section steps each. A homogeneous
 CPU with more memory channels should scale further on the same code. Changing what a frame costs
-would mean changing the transform or the accumulation order, and both move books.
+would mean changing the transform, which moves books; `fit`'s accumulation order has since changed
+(see *`fit`'s sums run in four carrier lanes*), moving only the recorded scores.
 
 ### The low-alpha regime, and what `capture_tolerance` is worth
 

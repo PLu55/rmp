@@ -198,21 +198,21 @@ the residual shows a floor at that level.
 ### What a Gaussian family is worth, measured
 
 The first 3 s of `data/audio/chopin-nocturne-2.wav` at `mp_1.toml`'s settings, every arm driven to
-the same 35 dB. One run each, so treat differences under 5% as noise.
+the same 35 dB, on an 8-performance-core machine. Two runs each, agreeing to within 2%.
 
 | dictionary | blocks | atoms | wall | residual peak |
 | --- | --- | --- | --- | --- |
-| FOF only — `mp_1.toml` as shipped | 24 | 833 | 5.53 s | −32.2 dB |
-| FOF + `sigmas_ms = [1, 2.5, 6, 15, 40]` | 29 | 832 | 5.70 s | −31.4 dB |
-| Gaussian only — the same ladder, `alphas = []` | 5 | 862 | 1.61 s | −33.8 dB |
+| FOF only — `mp_1.toml` as shipped | 24 | 833 | 2.40 s | −32.2 dB |
+| FOF + `sigmas_ms = [1, 2.5, 6, 15, 40]` | 29 | 832 | 2.46 s | −31.4 dB |
+| Gaussian only — the same ladder, `alphas = []` | 5 | 862 | 0.49 s | −33.8 dB |
 
 **Adding the family to a FOF dictionary changed nothing measurable here.** The pursuit took 110
 Gaussians, carrying 2% of the removed energy, for the same atom count and wall clock: piano partials
 have a sharp attack and an exponential tail, which is a FOF's shape, so the FOFs win the competition.
 
-**A Gaussian-only dictionary is the surprise.** It reached the same SNR with 3.5% more atoms, 3.4×
+**A Gaussian-only dictionary is the surprise.** It reached the same SNR with 3.5% more atoms, 4.9×
 faster and with a better residual peak — its longest block is a 14,000-sample transform against the
-FOF family's 332,000. On this material that makes it a serious fast arm rather than an add-on. It is
+FOF family's 332,000, and its envelopes and refinement scores are computed in vector arithmetic. On this material that makes it a serious fast arm rather than an add-on. It is
 one excerpt of one instrument, so measure it on yours before relying on it.
 
 `rmpstat diag` flagged 37% of the Gaussian seeds on the 1 ms and 40 ms rungs, and refinement walked
