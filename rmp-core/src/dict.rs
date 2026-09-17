@@ -20,9 +20,16 @@
 //! make cross-block ranking unfair.
 
 use crate::atom::Shape;
+use crate::decimate::Decimator;
 use crate::fft::{RealFftPlanner, next_fast_len};
 use crate::fof::{Envelope, EnvelopeParams, FofError, ReleasePolicy};
 use realfft::num_complex::Complex32;
+
+/// Natural transform length from which a FOF block is correlated decimated, when decimation is on.
+///
+/// Below it the transform is cheap enough that the filter's per-atom update and the longer hop
+/// grid are not worth it; at the shipped configs it catches the `alpha = 1, 2, 4` rungs.
+pub const DECIMATE_MIN_FFT: usize = 1 << 16;
 
 /// Tuning for block construction.
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +44,8 @@ pub struct BlockConfig {
     pub rho_sq_max: f32,
     /// Fixed for the whole analysis, and shared with resynthesis.
     pub release: ReleasePolicy,
+    /// Correlate the long FOF blocks from a decimated residual — see [`crate::decimate`].
+    pub decimate: bool,
 }
 
 impl Default for BlockConfig {
@@ -47,6 +56,7 @@ impl Default for BlockConfig {
             f_max: 10_000.0,
             rho_sq_max: 1.0 - 1e-4,
             release: ReleasePolicy::default(),
+            decimate: true,
         }
     }
 }
@@ -71,6 +81,12 @@ pub struct Block {
     inv_vv: Vec<f32>,
     /// `rho_k`, the u/v coherence. Recorded for diagnostics.
     rho: Vec<f32>,
+    /// 1, or the factor this block's frames are correlated at from the decimated residual. Its
+    /// `fft_len` is then divisible by it, and so is its `hop`.
+    pub decimation: usize,
+    /// `decimation * E[m * decimation]`: the envelope as a decimated frame reads it, gain included.
+    /// Empty when `decimation` is 1.
+    pub env_decimated: Vec<f32>,
 }
 
 impl Block {
@@ -82,8 +98,24 @@ impl Block {
         cfg: &BlockConfig,
     ) -> Result<Self, FofError> {
         let env = Envelope::render(params, sample_rate)?;
-        let fft_len = next_fast_len(env.support_len());
-        let hop = measure_hop(&env.samples, fft_len, cfg.capture_tol);
+        let natural = next_fast_len(env.support_len());
+        // FOF blocks only. A Gaussian's widest blocks are few and its refresh a small share of its
+        // analysis: measured, decimating them bought 5% and nothing worth the approximation.
+        let decimation = if cfg.decimate && env.params.as_fof().is_some() && natural >= DECIMATE_MIN_FFT {
+            Decimator::factor_for(sample_rate, cfg.f_max).unwrap_or(1)
+        } else {
+            1
+        };
+        // A decimated frame is `fft_len / decimation` points, so the length has to divide.
+        let mut fft_len = natural;
+        while !fft_len.is_multiple_of(decimation) {
+            fft_len = next_fast_len(fft_len + 1);
+        }
+        let mut hop = measure_hop(&env.samples, fft_len, cfg.capture_tol);
+        if decimation > 1 {
+            // Onsets on the decimated grid. A finer hop, so the capture tolerance still holds.
+            hop = (hop / decimation * decimation).max(decimation);
+        }
 
         // Bin range. k = 0 and k = fft_len/2 are excluded unconditionally: at omega = 0 and
         // omega = pi the sine basis vector is identically zero, so G is exactly rank-1 there.
@@ -129,6 +161,15 @@ impl Block {
             }
         }
 
+        let env_decimated = if decimation > 1 {
+            assert!(k_hi < fft_len / (2 * decimation), "f_max past the decimated Nyquist");
+            (0..env.support_len().div_ceil(decimation))
+                .map(|m| decimation as f32 * env.samples[m * decimation])
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             env,
             energy,
@@ -140,6 +181,8 @@ impl Block {
             inv_uv,
             inv_vv,
             rho,
+            decimation,
+            env_decimated,
         })
     }
 
@@ -297,6 +340,8 @@ fn envelope_capture(env: &[f32], delta: usize, fft_len: usize) -> f64 {
 pub struct Dictionary {
     pub blocks: Vec<Block>,
     pub sample_rate: f32,
+    /// The filter the decimated blocks read through, when any block is decimated.
+    pub decimator: Option<Decimator>,
 }
 
 impl Dictionary {
@@ -339,9 +384,14 @@ impl Dictionary {
         if blocks.is_empty() {
             return Err(FofError::Invalid("dictionary has no usable blocks"));
         }
+        let decimator = blocks
+            .iter()
+            .any(|b| b.decimation > 1)
+            .then(|| Decimator::design(sample_rate, cfg.f_max).expect("a block was given a factor"));
         Ok(Self {
             blocks,
             sample_rate,
+            decimator,
         })
     }
 
@@ -372,6 +422,33 @@ mod tests {
     use std::f64::consts::TAU;
 
     const SR: f32 = 48_000.0;
+
+    /// What `decimate` does to a block: a long FOF block takes the factor `f_max` allows, with a
+    /// transform length and a hop it divides; a short one, a Gaussian, or `decimate = false` stays at
+    /// the full rate.
+    #[test]
+    fn only_long_fof_blocks_are_decimated() {
+        let mut planner = Planner::new();
+        let cfg = BlockConfig { f_max: 3000.0, capture_tol: 0.5, ..BlockConfig::default() };
+        let long = Block::new(EnvelopeParams::new(2.0, 0.001), SR, &mut planner, &cfg).unwrap();
+        assert_eq!(long.decimation, 6);
+        assert!(long.fft_len.is_multiple_of(6) && long.hop.is_multiple_of(6));
+        assert_eq!(long.env_decimated.len(), long.support_len().div_ceil(6));
+        assert_eq!(long.env_decimated[1], 6.0 * long.env.samples[6]);
+
+        let short = Block::new(EnvelopeParams::new(256.0, 0.001), SR, &mut planner, &cfg).unwrap();
+        assert_eq!(short.decimation, 1);
+        let wide_gaussian = Block::new(GaussianParams::new(0.6), SR, &mut planner, &cfg).unwrap();
+        assert!(wide_gaussian.fft_len >= DECIMATE_MIN_FFT);
+        assert_eq!(wide_gaussian.decimation, 1);
+        let off = BlockConfig { decimate: false, ..cfg };
+        assert_eq!(Block::new(EnvelopeParams::new(2.0, 0.001), SR, &mut planner, &off).unwrap().decimation, 1);
+
+        let d = Dictionary::from_grid(&[(2.0, 0.001), (256.0, 0.001)], SR, &mut planner, &cfg).unwrap();
+        assert_eq!(d.decimator.as_ref().map(|dec| dec.factor), Some(6));
+        let full = Dictionary::from_grid(&[(256.0, 0.001)], SR, &mut planner, &cfg).unwrap();
+        assert!(full.decimator.is_none(), "no filter without a decimated block");
+    }
 
     fn gauss_block(sigma: f32) -> Block {
         let mut planner = Planner::new();

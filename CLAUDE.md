@@ -120,6 +120,8 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
 - **`dict`** — blocks, one per envelope shape of either kind. Owns the Gram tables and the hop.
 - **`corr`** — one envelope-windowed FFT per frame yields correlations against every frequency at
   once, then a closed-form 2-D projection.
+- **`decimate`** — a low-passed copy of the residual kept every `D`th sample, and the filter that
+  makes it. The long FOF blocks correlate from it at `1/D` the transform length; `[blocks] decimate`.
 - **`fit`** — the same exact projection *off* the grid, by direct f64 summation. Refinement and
   HRMP both need a score where no precomputed Gram exists.
 - **`cand`** — coarse discovery: local time-frequency maxima, merged across blocks.
@@ -598,10 +600,11 @@ load-bearing:
 - **`golden_section_is_the_same_search_at_every_width` compares against `golden_reference`**, the
   pre-speculation loop kept verbatim in the tests, for the same reason.
 
-**A signal too large for the frame-table budget is windowed, and that is the one thing in the crate
-that changes which atoms are selected.** `mp::WindowPlan` sizes a *core* from `max_memory_mb` and the
-dictionary's own per-sample cost, plus a *guard* of one longest atom — the longest block support, or
-`refine.max_atom_samples` when refinement is on. `mp::run_windowed` runs `Mp::with_core` over each,
+**A signal too large for the frame-table budget is windowed, and that changes which atoms are
+selected** — one of the two approximations in the pursuit, *Decimated correlation* being the other.
+`mp::WindowPlan` sizes a *core* from `max_memory_mb` and the dictionary's own per-sample cost, plus a
+*guard* of one longest atom — the longest block support, or `refine.max_atom_samples` when
+refinement is on. `mp::run_windowed` runs `Mp::with_core` over each,
 writes the window's residual back before the next reads it, and translates onsets and the running
 residual energy into global coordinates. Four things that are load-bearing:
 
@@ -643,6 +646,58 @@ recompute 70% of what they bound. What remains for those blocks is the number of
 (`add_at`, `subtract_at`), scoring it (`fit::accumulate`) and invalidating the frames it touched
 (`refresh_stale`) all go through it. `refresh_stale` used to be passed the seed's frame onset, which
 equals the atom's `t0` only until refinement can move it.
+
+### Decimated correlation
+
+`[blocks] decimate`, on by default. A FOF block whose natural transform is at least
+`dict::DECIMATE_MIN_FFT` (65,536 points) correlates from `Mp::lowpassed` — the residual through a
+90 dB Kaiser-windowed sinc, kept every `D`th sample — at `fft_len / D` points. `D` is the largest of
+8, 6, 5, 4, 3, 2 that keeps every alias of `[0, f_max]` in the stopband: 6 at 3 kHz, 4 at 5 kHz, 2
+at the default 10 kHz. `decimate.rs`'s module doc holds the derivation and the accuracy
+measurements. `MANUAL.md` §5 holds the end-to-end ones: on piano 1.75× at 3 s and 2× at 10 and 25 s
+at `f_max = 3000`, 1.2× at 10 kHz, and no atom-count or residual-peak difference beyond run-to-run
+noise, judged over shifted starts (see *Measurement discipline*). With `decimate = false` a book is
+byte-identical to one made before the setting existed. Seven facts that are not obvious from the
+code:
+
+**The filter runs once over the signal, not once per frame.** Tens of taps per output sample over a
+332,000-sample frame costs more than the transform it shortens. After each subtraction
+`Decimator::update` recomputes the decimated samples whose taps reach the changed stretch —
+recomputed, not incremented, so nothing drifts — and
+`a_partial_update_equals_filtering_everything_again` holds it to a full `apply` bit for bit. Each
+window builds its own copy in `Mp::with_core`.
+
+**Bins and Gram tables do not change.** Bin `k` of a `N/D` transform at rate `fs/D` is frequency
+`k·fs/N`, the same as bin `k` at full rate, so a decimated block keeps its bin range and its Gram
+rows. The frame is `r_D[onset/D + m] · D·E[mD]`, precomputed as `Block::env_decimated`.
+
+**Onsets must land on the decimated grid, which bends two lengths.** The hop is rounded *down* to a
+multiple of `D`, a finer grid still inside the capture tolerance. `fft_len` is searched upward for a
+fast length divisible by `D`, and that search is why the factors are 5-smooth: `next_fast_len` only
+produces 5-smooth lengths, so a factor of 7 would never divide one and the loop would not end.
+
+**The approximation only chooses where to look.** A decimated seed is rescored by `fit::score` on
+the full-rate residual at the bin it found, before it becomes a candidate, so every amplitude, phase
+and energy that reaches refinement or a book is exact. A seed with nothing there is demoted, for the
+reason a rejected HRMP candidate is.
+
+**A decimated bound needs a wider margin, and an undercut is counted rather than asserted.** The
+algebra bounds the exact projection; a decimated value can sit above it by the approximation's
+error. `DECIMATED_BOUND_MARGIN` is 1e-2 against 1e-4 for rounding, and `resolve` counts decimated
+frames recomputed above their bound in `Mp::bound_undercuts`, reported under
+`RMP_REFRESH_DETAIL`. It was zero on every run measured. An undercut would leave a frame unresolved
+that should not have been, not produce a wrong atom.
+
+**FOF blocks only, by measurement.** On `lux-eterna-1-gaussian.toml` two Gaussian blocks qualify,
+and decimating them bought 5% of wall clock for 3.0% ± 2.1% more atoms. `mixed` and `zyklus` have no
+Gaussian block long enough, so the restriction changes nothing on them.
+
+**None of the existing gates sees it.** Every test fixture's blocks are below 65,536 points, so
+every oracle and bit-identity test runs at full rate whatever the default. The tests that exercise
+decimation build their dictionaries with `decimate` set explicitly.
+`decimated_correlation_tracks_the_full_rate_one` compares every frame against `correlate` and
+requires argmax agreement only at the planted atom: on white noise two bins can tie to within the
+error, and there the check is that the decimated choice loses under 1e-3 at full rate.
 
 ### Gaussian atoms
 
@@ -1059,8 +1114,9 @@ allowed CPUs from `/proc/self/status`, so a `taskset` mask narrows it.
 **What remains is memory traffic, not scheduling.** The refresh is at the 8-core throughput ceiling
 of its transforms, and refinement's batches of 8 at about 3 golden-section steps each. A homogeneous
 CPU with more memory channels should scale further on the same code. Changing what a frame costs
-would mean changing the transform, which moves books; `fit`'s accumulation order has since changed
-(see *`fit`'s sums run in eight carrier lanes*), moving only the recorded scores.
+would mean changing the transform, which moves books — and *Decimated correlation* does exactly
+that, by default; `fit`'s accumulation order has since changed too (see *`fit`'s sums run in eight
+carrier lanes*), moving only the recorded scores.
 
 ### The low-alpha regime, and what `capture_tolerance` is worth
 
@@ -1257,6 +1313,13 @@ tighter than the true between-run spread and will overstate your confidence.
 of piano and, twenty minutes of benchmarking later, 1.95 s — with no thermal or power throttling,
 temperatures at 66–72 °C, and huge pages not in play. Something else on the desktop moves the
 baseline by tens of percent. Run A and B alternately, repeat, and compare only within a sweep.
+
+**One decomposition cannot resolve a quality difference of a few percent.** Moving an excerpt's
+start by 0.1 ms, with nothing else changed, is a different greedy path: fifteen such starts on
+`lux-eterna-1-gaussian.toml` gave 2787 to 3685 atoms to the same SNR, and on `mp_1.toml` a residual
+peak anywhere from −21.5 to −30.3 dB. A change that moves books by more than rounding has to be
+judged on means over shifted starts (`-s 5.0000`, `-s 5.0001`, …), with their standard errors, A
+and B interleaved per start. A single-run comparison of a few percent is noise.
 
 ## Design history
 

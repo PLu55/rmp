@@ -63,6 +63,16 @@ impl Reporter for Cli {
                         longest.env.params.describe(),
                     ));
                 }
+
+                // Said because it changes what a book contains: `decimate = false` reproduces the
+                // books made before it existed.
+                if let Some(dec) = &dict.decimator {
+                    let count = dict.blocks.iter().filter(|b| b.decimation > 1).count();
+                    self.say(&format!(
+                        "  decimated: {count} FOF blocks correlated at 1/{} the rate ([blocks] decimate)",
+                        dec.factor
+                    ));
+                }
             }
 
             Event::Windows { plan } => {
@@ -185,12 +195,20 @@ impl Cli {
                 100.0 * resolved as f64 / marked as f64
             ));
             if std::env::var_os("RMP_REFRESH_DETAIL").is_some() {
+                if let Some(dec) = &a.dict.decimator {
+                    self.say(&format!(
+                        "    decimation: {}x through a {}-tap filter ({:.0} dB, pass {:.0} Hz, stop {:.0} Hz); {} bound undercuts",
+                        dec.factor, dec.taps.len(), dec.attenuation_db, dec.f_pass, dec.f_stop,
+                        a.refresh.undercuts
+                    ));
+                }
                 for (bi, &(m, r)) in a.refresh.per_block.iter().enumerate() {
                     let b = &a.dict.blocks[bi];
+                    let transform = b.fft_len / b.decimation;
                     self.say(&format!(
                         "    block {bi:>2} {:<30} fft {:>7}: {m:>8} bounded {r:>8} recomputed ({:>5.1}%)  ~{:.0} Msamples",
-                        b.env.params.describe(), b.fft_len, 100.0 * r as f64 / m.max(1) as f64,
-                        (r * b.fft_len) as f64 / 1e6
+                        b.env.params.describe(), transform, 100.0 * r as f64 / m.max(1) as f64,
+                        (r * transform) as f64 / 1e6
                     ));
                 }
             }

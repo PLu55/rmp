@@ -112,6 +112,8 @@ pub struct Refresh {
     pub marked: usize,
     pub resolved: usize,
     pub per_block: Vec<(usize, usize)>,
+    /// Decimated frames recomputed above their bound; see `[blocks] decimate`.
+    pub undercuts: usize,
 }
 
 /// Everything one analysis produced.
@@ -216,7 +218,12 @@ pub fn analyse(
         residual_book,
         dict,
         timing,
-        refresh: Refresh { marked: run.marked, resolved: run.resolved, per_block: run.per_block },
+        refresh: Refresh {
+            marked: run.marked,
+            resolved: run.resolved,
+            per_block: run.per_block,
+            undercuts: run.undercuts,
+        },
         cancelled: report.cancelled(),
     })
 }

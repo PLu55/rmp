@@ -171,6 +171,11 @@ pub struct Mp<'a> {
     spares: Vec<Vec<Correlator>>,
     states: Vec<BlockState>,
     residual: Vec<f32>,
+    /// The residual through [`Dictionary::decimator`], kept current after every subtraction, when
+    /// any block is decimated.
+    lowpassed: Option<Vec<f32>>,
+    /// Decimated frames recomputed above the bound they replaced — see [`DECIMATED_BOUND_MARGIN`].
+    undercuts: usize,
     /// Envelopes rendered during refinement, reused across candidates and iterations.
     cache: EnvelopeCache,
     /// Frames bounded rather than recomputed, and frames recomputed on demand, over the run.
@@ -220,6 +225,8 @@ impl<'a> Mp<'a> {
         // Correlating every frame of every block is the one unavoidable up-front cost, and the
         // blocks are independent, so it goes wide.
         let samples = &signal.samples;
+        let lowpassed = dict.decimator.as_ref().map(|d| d.apply(samples));
+        let low = lowpassed.as_deref();
         let states: Vec<BlockState> = corrs
             .par_iter_mut()
             .zip(dict.blocks.par_iter())
@@ -228,7 +235,7 @@ impl<'a> Mp<'a> {
                 let mut energy = vec![f64::NEG_INFINITY; frames];
                 let mut bin = vec![0u32; frames];
                 for n in 0..frames {
-                    let (k, p) = scan_frame(corr, block, samples, block.frame_onset(n));
+                    let (k, p) = scan_frame(corr, block, samples, low, block.frame_onset(n));
                     energy[n] = p.energy;
                     bin[n] = k as u32;
                 }
@@ -280,7 +287,9 @@ impl<'a> Mp<'a> {
             corrs,
             states,
             residual: signal.samples.clone(),
+            lowpassed,
             cache: EnvelopeCache::new(),
+            undercuts: 0,
             marked: 0,
             resolved: 0,
             per_block: vec![(0, 0); dict.blocks.len()],
@@ -414,6 +423,10 @@ impl<'a> Mp<'a> {
                 self.core_len,
             );
             (self.energy, self.core_energy) = (after, core_after);
+            if let (Some(dec), Some(low)) = (&self.dict.decimator, &mut self.lowpassed) {
+                let (lo, hi) = dec.affected(tau, tau + atom_len, low.len());
+                dec.update(&self.residual, low, lo, hi);
+            }
             book.selections.push(Selection {
                 atom: best.atom,
                 block: best.seed.block,
@@ -533,16 +546,26 @@ impl<'a> Mp<'a> {
             &mut self.corrs,
             &mut self.spares,
             &self.residual,
+            self.lowpassed.as_deref(),
             per_block,
         );
         for (bi, (frames, exact)) in per_block.iter().zip(exact).enumerate() {
             let state = &mut self.states[bi];
+            let decimated = self.dict.blocks[bi].decimation > 1;
             for (&n, (bin, energy)) in frames.iter().zip(exact) {
-                debug_assert!(
-                    energy <= state.energy[n],
-                    "block {bi} frame {n}: exact {energy} exceeds its bound {}",
-                    state.energy[n]
-                );
+                if decimated {
+                    // An approximate value against a bound derived for exact ones, so it is
+                    // counted rather than asserted: the count is how the margin was chosen.
+                    if energy > state.energy[n] {
+                        self.undercuts += 1;
+                    }
+                } else {
+                    debug_assert!(
+                        energy <= state.energy[n],
+                        "block {bi} frame {n}: exact {energy} exceeds its bound {}",
+                        state.energy[n]
+                    );
+                }
                 (state.energy[n], state.bin[n], state.dirty[n]) = (energy, bin, false);
             }
         }
@@ -567,6 +590,11 @@ impl<'a> Mp<'a> {
         &self.per_block
     }
 
+    /// Decimated frames that came out above their bound when recomputed.
+    pub fn bound_undercuts(&self) -> usize {
+        self.undercuts
+    }
+
     /// Score every seed and return the best.
     ///
     /// The frame table stores only energy and bin, so each seed's transform is recomputed here to
@@ -576,7 +604,20 @@ impl<'a> Mp<'a> {
         let mut out = Chosen { best: None, demote: Vec::new() };
         for &seed in seeds {
             let block = &self.dict.blocks[seed.block];
-            let (k, p) = scan_frame(&mut self.corrs[seed.block], block, &self.residual, seed.onset);
+            let (k, p) = if block.decimation > 1 {
+                // The table's value is an approximation; the candidate is built from the exact
+                // projection at the bin it found. A seed with nothing there is demoted, or the next
+                // iteration would promote it again and end the pursuit.
+                match fit::score(&self.residual, &block.env, seed.onset as i64, block.bin_hz(seed.bin), cfg.refine.rho_sq_max) {
+                    Some(p) if p.energy > 0.0 => (seed.bin, p),
+                    _ => {
+                        out.demote.push((seed.block, seed.frame, 0.0));
+                        continue;
+                    }
+                }
+            } else {
+                scan_frame(&mut self.corrs[seed.block], block, &self.residual, None, seed.onset)
+            };
             if p.energy <= 0.0 {
                 continue;
             }
@@ -721,7 +762,8 @@ impl<'a> Mp<'a> {
                 // The stored value may itself be a bound; compounding bounds is still a bound. The
                 // margin covers the f32 transform's rounding, which the algebra knows nothing of.
                 let old = st.energy[n].max(0.0);
-                let bound = (old.sqrt() + delta.sqrt()).powi(2) * (1.0 + 1e-4) + 1e-12;
+                let margin = if block.decimation > 1 { DECIMATED_BOUND_MARGIN } else { 1e-4 };
+                let bound = (old.sqrt() + delta.sqrt()).powi(2) * (1.0 + margin) + 1e-12;
                 st.energy[n] = bound;
                 st.dirty[n] = true;
                 marked += 1;
@@ -755,6 +797,7 @@ impl<'a> Mp<'a> {
             &mut self.corrs,
             &mut self.spares,
             &self.residual,
+            self.lowpassed.as_deref(),
             &every,
         );
         for (state, exact) in self.states.iter_mut().zip(exact) {
@@ -811,19 +854,21 @@ fn refresh_frames(
     corrs: &mut [Correlator],
     spares: &mut [Vec<Correlator>],
     residual: &[f32],
+    lowpassed: Option<&[f32]>,
     frames: &[Vec<usize>],
 ) -> Vec<Vec<(u32, f64)>> {
     let scan = |bi: usize, corr: &mut Correlator, list: &[usize]| -> Vec<(u32, f64)> {
         let block = &blocks[bi];
         list.iter()
             .map(|&n| {
-                let (k, p) = scan_frame(corr, block, residual, block.frame_onset(n));
+                let (k, p) = scan_frame(corr, block, residual, lowpassed, block.frame_onset(n));
                 (k as u32, p.energy)
             })
             .collect()
     };
 
-    let work: usize = frames.iter().zip(blocks).map(|(f, b)| f.len() * b.fft_len).sum();
+    let transform = |b: &crate::dict::Block| b.fft_len / b.decimation;
+    let work: usize = frames.iter().zip(blocks).map(|(f, b)| f.len() * transform(b)).sum();
     if work < PARALLEL_TRANSFORM_SAMPLES {
         return corrs.iter_mut().zip(frames).enumerate().map(|(bi, (c, f))| scan(bi, c, f)).collect();
     }
@@ -835,7 +880,7 @@ fn refresh_frames(
         if list.is_empty() {
             continue;
         }
-        let chunks = (list.len() * blocks[bi].fft_len).div_ceil(target).clamp(1, list.len().min(threads));
+        let chunks = (list.len() * transform(&blocks[bi])).div_ceil(target).clamp(1, list.len().min(threads));
         while spare.len() + 1 < chunks {
             spare.push(corr.fork());
         }
@@ -955,6 +1000,8 @@ pub struct WindowedRun {
     pub marked: usize,
     pub resolved: usize,
     pub per_block: Vec<(usize, usize)>,
+    /// [`Mp::bound_undercuts`], summed over the windows.
+    pub undercuts: usize,
     /// Time spent correlating every frame up front, summed over the windows.
     ///
     /// A windowed run pays this once per window rather than once, which is the cost of the whole
@@ -991,7 +1038,8 @@ pub fn run_windowed(
         let book = mp.run_with(cfg, cancel);
         let (marked, resolved) = mp.lazy_stats();
         let per_block = mp.lazy_stats_per_block().to_vec();
-        return WindowedRun { book, residual: mp.residual, marked, resolved, per_block, init };
+        let undercuts = mp.bound_undercuts();
+        return WindowedRun { book, residual: mp.residual, marked, resolved, per_block, undercuts, init };
     }
 
     let sr = signal.sample_rate;
@@ -1001,7 +1049,7 @@ pub fn run_windowed(
     // The book's `residual_energy` column is a global running total, not a per-window one: the SNR
     // curve `stats` and `rmpstat snr` read off it has to mean the same thing end to end.
     let mut running = signal.energy();
-    let (mut marked, mut resolved) = (0usize, 0usize);
+    let (mut marked, mut resolved, mut undercuts) = (0usize, 0usize, 0usize);
     let mut per_block = vec![(0usize, 0usize); dict.blocks.len()];
 
     let mut init = std::time::Duration::ZERO;
@@ -1028,6 +1076,7 @@ pub fn run_windowed(
         let (m, r) = mp.lazy_stats();
         marked += m;
         resolved += r;
+        undercuts += mp.bound_undercuts();
         for (acc, &(bm, br)) in per_block.iter_mut().zip(mp.lazy_stats_per_block()) {
             acc.0 += bm;
             acc.1 += br;
@@ -1048,7 +1097,7 @@ pub fn run_windowed(
         progress(w, plan.count, book.len());
     }
 
-    WindowedRun { book, residual, marked, resolved, per_block, init }
+    WindowedRun { book, residual, marked, resolved, per_block, undercuts, init }
 }
 
 /// Frames below which collecting the dirty frames stays on one thread: about 6 ns a frame against
@@ -1088,13 +1137,27 @@ fn stale_range_of(
     (n_lo <= n_hi).then_some((n_lo, n_hi))
 }
 
+/// A decimated frame's value is an approximation, so its bound needs more room than rounding does.
+///
+/// The bound holds for the exact projection, and a decimated value can sit above the exact one by
+/// the approximation's error: 8e-4 at worst on interior frames, 6e-3 on a frame the signal's end
+/// cuts to a sliver. 1e-2 covers both, and no undercut was counted on any of the reference runs
+/// (3 s to 25 s of piano, `mp_1`, `lux-eterna-1` mixed, HRMP). An undercut would not be a wrong
+/// book, only a frame left unresolved that should have been.
+const DECIMATED_BOUND_MARGIN: f64 = 1e-2;
+
 fn scan_frame(
     corr: &mut Correlator,
     block: &crate::dict::Block,
     signal: &[f32],
+    lowpassed: Option<&[f32]>,
     onset: usize,
 ) -> (usize, crate::corr::Projection) {
-    corr.correlate(block, signal, onset);
+    if block.decimation > 1 {
+        corr.correlate_decimated(block, lowpassed.expect("a decimated block needs the lowpassed residual"), onset);
+    } else {
+        corr.correlate(block, signal, onset);
+    }
     corr.best_bin(block)
 }
 
@@ -1297,7 +1360,7 @@ mod tests {
                             continue;
                         }
                         let (_, p) =
-                            scan_frame(&mut corr, block, &mp.residual, block.frame_onset(n));
+                            scan_frame(&mut corr, block, &mp.residual, None, block.frame_onset(n));
                         assert!(
                             p.energy <= mp.states[bi].energy[n],
                             "{name} step {step} block {bi} frame {n}: exact {} above bound {}",
@@ -1481,7 +1544,7 @@ mod tests {
                 let mut c = Correlator::new(b, &mut planner);
                 list.iter()
                     .map(|&n| {
-                        let (k, p) = scan_frame(&mut c, b, &sig.samples, b.frame_onset(n));
+                        let (k, p) = scan_frame(&mut c, b, &sig.samples, None, b.frame_onset(n));
                         (k as u32, p.energy)
                     })
                     .collect()
@@ -1491,7 +1554,7 @@ mod tests {
         let mut corrs: Vec<Correlator> = d.blocks.iter().map(|b| Correlator::new(b, &mut planner)).collect();
         let mut spares: Vec<Vec<Correlator>> = d.blocks.iter().map(|_| Vec::new()).collect();
         for pass in 0..2 {
-            let got = refresh_frames(&d.blocks, &mut corrs, &mut spares, &sig.samples, &frames);
+            let got = refresh_frames(&d.blocks, &mut corrs, &mut spares, &sig.samples, None, &frames);
             assert_eq!(got.len(), expected.len());
             for (bi, (g, e)) in got.iter().zip(&expected).enumerate() {
                 assert_eq!(g.len(), e.len(), "pass {pass}, block {bi}");
@@ -1540,6 +1603,96 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Two dictionaries of the same long shapes, decimated and not, over a band a factor of 6 fits.
+    fn decimation_pair(grid: &[(f32, f32)]) -> (Dictionary, Dictionary) {
+        let mut planner = Planner::new();
+        let cfg = BlockConfig { f_min: 100.0, f_max: 3000.0, capture_tol: 0.5, ..BlockConfig::default() };
+        let on = Dictionary::from_grid(grid, SR, &mut planner, &BlockConfig { decimate: true, ..cfg }).unwrap();
+        let off = Dictionary::from_grid(grid, SR, &mut planner, &BlockConfig { decimate: false, ..cfg }).unwrap();
+        (on, off)
+    }
+
+    /// A decimated frame reads almost exactly what the full-rate one does — on white noise, the
+    /// worst case for a low-pass filter, since half its power is out of band.
+    ///
+    /// On noise the best bin is often a near-tie, so the decimated best bin is only required to be
+    /// as good at full rate as the true best, to within the tolerance. Where a planted atom makes the
+    /// winner clear, the bins must agree outright.
+    ///
+    /// A frame reaching past the end of the signal by most of its window is held to a looser bound:
+    /// measured, the one frame with 344 samples of signal left was 6e-3 off, every other frame 8e-4
+    /// or better. The signal's end is a hard edge the low-pass filter smears, and a sliver of noise
+    /// has little energy to set the error against.
+    #[test]
+    fn decimated_correlation_tracks_the_full_rate_one() {
+        const TOL: f64 = 1e-3;
+        const SLIVER_TOL: f64 = 1e-2;
+        let (on, off) = decimation_pair(&[(2.0, 0.0003), (4.0, 0.003)]);
+        assert!(on.blocks.iter().all(|b| b.decimation == 6), "both shapes must decimate");
+        let mut sig = noise(200_000, 0x5eed_0001);
+        let planted = on_grid(&off, 1, 3_000, 0, 20.0, 0.4);
+        crate::signal::add_at(&mut sig.samples, &planted.render(SR).unwrap(), 0);
+
+        let low = on.decimator.as_ref().unwrap().apply(&sig.samples);
+        let mut planner = Planner::new();
+        let (mut worst, mut worst_sliver, mut worst_choice) = (0.0f64, 0.0f64, 0.0f64);
+        for (bi, (b_on, b_off)) in on.blocks.iter().zip(&off.blocks).enumerate() {
+            assert_eq!(b_on.fft_len, b_off.fft_len);
+            let (mut c_on, mut c_off) = (Correlator::new(b_on, &mut planner), Correlator::new(b_off, &mut planner));
+            let energy = |c: &Correlator, b: &crate::dict::Block, k| {
+                let (du, dv) = c.at(k);
+                crate::corr::project_energy(b, k, du, dv)
+            };
+            for n in 0..b_on.frame_count(sig.len()) {
+                let onset = b_on.frame_onset(n);
+                c_off.correlate(b_off, &sig.samples, onset);
+                let (k, full) = c_off.best_bin(b_off);
+                c_on.correlate_decimated(b_on, &low, onset);
+                let (k_dec, _) = c_on.best_bin(b_on);
+                if bi == 1 && onset == 0 {
+                    assert_eq!(k_dec, k, "the planted atom's bin");
+                }
+                let rel = (energy(&c_on, b_on, k) - full.energy).abs() / full.energy;
+                let sliver = (sig.len() - onset) * 10 < b_on.support_len();
+                if sliver {
+                    worst_sliver = worst_sliver.max(rel);
+                } else {
+                    worst = worst.max(rel);
+                }
+                worst_choice = worst_choice.max((full.energy - energy(&c_off, b_off, k_dec)) / full.energy);
+            }
+        }
+        println!(
+            "worst relative energy error {worst:.2e} ({worst_sliver:.2e} on slivers), \
+             worst loss from the decimated choice {worst_choice:.2e}"
+        );
+        assert!(worst < TOL, "worst relative energy error {worst:.2e}");
+        assert!(worst_sliver < SLIVER_TOL, "worst relative energy error on a sliver {worst_sliver:.2e}");
+        assert!(worst_choice < TOL, "the decimated best bin loses {worst_choice:.2e} at full rate");
+    }
+
+    /// On a clean planted signal the decimated pursuit selects what the full-rate one does.
+    #[test]
+    fn a_decimated_pursuit_selects_the_planted_atoms() {
+        let (on, off) = decimation_pair(&[(4.0, 0.003), (256.0, 0.0003)]);
+        assert_eq!((on.blocks[0].decimation, on.blocks[1].decimation), (6, 1));
+        let short_onset = 30_000 / on.blocks[1].hop * on.blocks[1].hop;
+        let atoms = [
+            on_grid(&off, 0, 2_000, 0, 1.0, 0.3),
+            on_grid(&off, 1, 40, short_onset as i64, 0.8, 1.1),
+        ];
+        let sig = Signal::from_atoms(&atoms, 120_000, SR).unwrap();
+        let cfg = MpConfig { max_atoms: 2, target_snr_db: f32::INFINITY, ..Default::default() };
+        let (book_on, _) = run(&on, &sig, &cfg);
+        let (book_off, _) = run(&off, &sig, &cfg);
+        let key = |b: &Book| b.selections.iter().map(|s| (s.block, s.onset, s.bin)).collect::<Vec<_>>();
+        assert_eq!(key(&book_on), key(&book_off));
+        assert_eq!(key(&book_on), vec![(0, 0, 2_000), (1, short_onset, 40)]);
+        for (a, b) in book_on.selections.iter().zip(&book_off.selections) {
+            assert!((a.energy_removed - b.energy_removed).abs() <= 1e-6 * b.energy_removed);
         }
     }
 

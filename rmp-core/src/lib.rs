@@ -8,6 +8,7 @@ pub mod book;
 pub mod cand;
 pub mod config;
 pub mod corr;
+pub mod decimate;
 pub mod dict;
 pub mod fft;
 pub mod fit;

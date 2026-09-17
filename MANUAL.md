@@ -95,17 +95,20 @@ at 2.5 s in the source's timeline — or at zero with `--trim-to-excerpt`.
 in.wav: 29.07 s, 48000 Hz, 2 channel(s)
   analysing 5.000-8.000 s (144000 samples from 240000)
   downmixed to mono; out-of-phase content between channels partially cancels
-dictionary: 24 blocks (24 fof) in 13.68ms
+dictionary: 24 blocks (24 fof) in 66.23ms
   note: 8 of 24 blocks are longer than refine.max_atom_samples (150000), so their
-        atoms stay on the grid unrefined; longest support 332053 samples (fof alpha 1.000 beta 0.30 ms)
-analysis: 1528 atoms, 35.0 dB in 12.64s (init 13.68ms, 4.2x realtime, 8 threads)
-  refined: 1291/1528 atoms moved off the grid (84%)
-  refresh: 1266438 frames bounded, 416712 recomputed (32.9%)
-residual: -35.0 dB rms, -30.3 dB peak relative to input
-  absolute: -73.1 dBFS rms, -57.2 dBFS peak (input -38.1 dBFS rms, -26.9 dBFS peak)
+        atoms stay on the grid unrefined; longest support 332053 samples (fof alpha 1.000 beta 12.00 ms)
+  decimated: 12 FOF blocks correlated at 1/6 the rate ([blocks] decimate)
+analysis: 1525 atoms, 35.0 dB in 3.07s (init 10.80ms, 1.0x realtime, 8 threads)
+  refined: 1282/1525 atoms moved off the grid (84%)
+  refresh: 1786661 frames bounded, 642951 recomputed (36.0%)
+residual: -35.0 dB rms, -25.5 dB peak relative to input
+  absolute: -72.5 dBFS rms, -49.0 dBFS peak (input -37.5 dBFS rms, -23.5 dBFS peak)
 ```
 
-- **`4.2x realtime`** is wall clock over audio duration. Below 1.0 is faster than realtime.
+- **`decimated:`** — how many blocks correlate from the low-passed residual, and at what fraction
+  of the rate; see `decimate` in §5. Absent when nothing qualifies or the setting is off.
+- **`1.0x realtime`** is wall clock over audio duration. Below 1.0 is faster than realtime.
 - **`8 threads`** — the size of the thread pool. By default that is one thread per physical core of
   the machine's fastest core type, not one per hardware thread; see *Using fewer cores than the
   machine has* in §11.
@@ -116,9 +119,16 @@ residual: -35.0 dB rms, -30.3 dB peak relative to input
 - **`refresh: bounded/recomputed`** — the lazy update's hit rate. Lower recomputed % is faster; it
   is diagnostic, not a setting.
 - **`-35.0 dB rms`** is the negated SNR, so it restates the line above.
-- **`-30.3 dB peak`** is the one that adds information. It is where the decomposition is *worst*
+- **`-25.5 dB peak`** is the one that adds information. It is where the decomposition is *worst*
   rather than where it is on average, and it is the most useful single quality number in the report:
   a badly-placed atom shows up here and nowhere else.
+
+**One run cannot compare two settings closely.** The pursuit is greedy, so a small change early on
+sends it down a different path. Fifteen starts 0.1 ms apart, with nothing else changed, took 2787 to
+3685 atoms on 2 s of `lux-eterna-1-gaussian.toml`, and left a residual peak anywhere from −21.5 to
+−30.3 dB on 3 s of `mp_1.toml`. To
+tell whether a setting costs 2% of atoms or 0.5 dB of peak, run both settings at several starts a
+fraction of a millisecond apart and compare the averages.
 
 ---
 
@@ -285,6 +295,57 @@ bins on content the dictionary handles badly.
 
 DC and Nyquist are excluded unconditionally whatever you set: the sine basis vector is identically
 zero there, so the projection is exactly rank-1.
+
+`f_max` also sets how much `decimate`, below, can save: the lower it is, the further the long
+blocks can be decimated.
+
+### `decimate` — default `true`
+
+Correlates the long FOF blocks at a reduced sample rate. The residual is low-pass filtered once and
+kept every `D`th sample, and each FOF block with a transform of 65,536 points or more (at 48 kHz,
+roughly `alpha ≤ 4`) correlates from that copy with a transform `D` times shorter. `D` is the largest
+factor that keeps the filter's aliases clear of `f_max`:
+
+| `f_max` at 48 kHz | `D` | filter |
+| --- | --- | --- |
+| 3000 Hz | 6 | 163 taps |
+| 5000 Hz | 4 | 163 taps |
+| 10000 Hz (the default) | 2 | 77 taps |
+| above 11,450 Hz | — | nothing is decimated |
+
+**Result.** An approximation, so books change: a different sequence of atoms, not just different
+last digits. It is close. Only the choice of where to look uses the decimated correlation; every
+candidate is then scored exactly at full rate before it is refined or kept, so no amplitude, phase
+or energy in a book comes from it. Against a full-rate correlation on every frame of 10 s of piano,
+the best frequency agreed in all 406 frames and the energy was within 0.07%.
+
+Gaussian blocks are never decimated. On `lux-eterna-1-gaussian.toml` it bought 5% of speed for about
+3% more atoms.
+
+**Cost.** Faster; the gain depends on `f_max` and on how much of the run the long blocks take.
+Measured on piano, every arm to the same 35 dB. Where there are several runs, the start of the
+excerpt was moved by 0.1 ms between them and the figure is the mean difference ± its standard
+error. That matters, because a 0.1 ms shift alone moves the atom count by several percent and the
+residual peak by several dB (see §2), which is more than the setting does:
+
+| run | `f_max` | runs | atoms, on vs off | residual peak, on vs off | speed |
+| --- | --- | --- | --- | --- | --- |
+| `chopin-nocturne-2.toml`, 3 s | 3000 | 8 | −0.1% ± 0.5% | 1.2 ± 0.9 dB better | 1.75× |
+| `mp_1.toml`, 3 s | 3000 | 15 | −1.1% ± 0.4% | 0.5 ± 1.1 dB better | 1.77× |
+| `lux-eterna-1-mixed.toml`, 2 s | 5000 | 8 | −0.0% ± 0.5% | 0.7 ± 0.8 dB worse | 1.45× |
+| `chopin-nocturne-2.toml`, 10 s | 3000 | 1 | same SNR | | 1.96× |
+| `chopin-nocturne-2.toml`, 25 s | 3000 | 1 | same SNR | | 1.99× |
+| `chopin-nocturne-2.toml`, 3 s | 10000 | 8 | −0.3% ± 0.6% | 0.6 ± 0.6 dB better | 1.17× |
+| `mp_1.toml`, 3 s | 10000 | 8 | +0.0% ± 0.2% | 0.9 ± 0.9 dB better | 1.17× |
+| `chopin-nocturne-2.toml`, 10 s | 10000 | 3 | +0.2% ± 0.4% | 0.7 ± 0.9 dB better | 1.23× |
+
+Only one difference is larger than its standard error: `mp_1.toml` at 3 kHz, where decimation
+needed about 1% *fewer* atoms. The gain grows with the clip: the
+`alpha = 1` blocks span seven seconds, so they take a larger share of a longer run. At the default
+10 kHz a transform is only halved, and everything else in the run is unchanged. If the material has
+little above a few kHz, lowering `f_max` is worth more here than it is in the bin count.
+
+Set it to `false` to reproduce a book made before the setting existed.
 
 ### `rho_sq_max` — default `0.9999`
 
@@ -746,7 +807,8 @@ comparable. The dictionary reaches `alpha = 1`.
 
 - **Too slow?** Raise `capture_tolerance` toward 0.5 first (biggest lever, mild quality cost), then
   drop your lowest `alphas` rung (large lever, real quality cost on sustained material), then raise
-  `fade_level`. Do not reach for `golden_iters`.
+  `fade_level`. Do not reach for `golden_iters`. If the material allows a low `f_max`, set it: with
+  `decimate` on, 3 kHz instead of 10 kHz makes the long blocks' transforms 6× shorter instead of 2×.
 - **Cores sitting idle?** That is deliberate; see below.
 - **Not enough detail?** Raise `target_snr_db` before touching anything else. Then check the
   `refined:` line is near 100% — if it is not, `max_atom_samples` is the problem, not the dictionary.

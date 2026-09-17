@@ -157,6 +157,9 @@ pub struct BlockSettings {
     pub f_max: f32,
     /// Bins whose `rho^2` exceeds this are disabled as ill-conditioned.
     pub rho_sq_max: f32,
+    /// Correlate the long FOF blocks from a low-passed, decimated residual, at a factor `f_max`
+    /// allows. Faster, and a close approximation rather than bit-identical to `false`.
+    pub decimate: bool,
 }
 
 impl Default for BlockSettings {
@@ -167,6 +170,7 @@ impl Default for BlockSettings {
             f_min: d.f_min,
             f_max: d.f_max,
             rho_sq_max: d.rho_sq_max,
+            decimate: d.decimate,
         }
     }
 }
@@ -181,6 +185,7 @@ impl From<&BlockSettings> for BlockConfig {
             f_max: s.f_max,
             rho_sq_max: s.rho_sq_max,
             release: ReleasePolicy::default(),
+            decimate: s.decimate,
         }
     }
 }
@@ -744,6 +749,13 @@ pub const DEFAULT_CONFIG_HEADER: &str = "\
 #   f_min, f_max       frequency range represented, in Hz.
 #   rho_sq_max         disables bins where the sine and cosine basis vectors are
 #                      nearly parallel and the projection is ill-conditioned.
+#   decimate           correlate the long FOF blocks (transforms of 65536 points
+#                      and up) from a low-passed residual kept every Dth sample,
+#                      D set by f_max: 6 at 3000 Hz, 4 at 5000, 2 at 10000. On
+#                      piano at 3000 Hz about 1.75x faster at 3 s and 2x at 10 s,
+#                      at 10000 Hz 1.2x, with the same atoms and residual peak to
+#                      within run-to-run noise. An approximation: set false to
+#                      reproduce books made before it existed.
 #
 # [pursuit]
 #   max_atoms      hard cap on atoms selected.
@@ -906,6 +918,17 @@ mod tests {
         assert_eq!(cfg.dictionary_shapes().len(), 22);
         assert!(cfg.dictionary_shapes().iter().all(|s| s.as_fof().is_some()));
         assert_eq!(cfg.pursuit.target_snr_db, MpConfig::default().target_snr_db);
+    }
+
+    /// On unless a document says otherwise, and the document's word reaches the dictionary.
+    #[test]
+    fn decimation_defaults_on_and_can_be_turned_off() {
+        let default = Config::from_toml("").unwrap();
+        assert!(default.blocks.decimate && default.block_config().decimate);
+        let off = Config::from_toml("[blocks]\ndecimate = false\n").unwrap();
+        assert!(!off.blocks.decimate && !off.block_config().decimate);
+        let written = Config::from_toml(&off.to_toml()).unwrap();
+        assert!(!written.blocks.decimate, "the setting survives a write and a read");
     }
 
     #[test]

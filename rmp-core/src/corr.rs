@@ -102,8 +102,10 @@ pub struct Correlator {
 
 impl Correlator {
     pub fn new(block: &Block, planner: &mut dyn crate::fft::RealFftPlanner) -> Self {
-        let fft = planner.plan(block.fft_len);
-        let windowed = vec![0.0; block.fft_len];
+        // A decimated block transforms `fft_len / decimation` points; bin `k` is the same frequency.
+        let len = block.fft_len / block.decimation;
+        let fft = planner.plan(len);
+        let windowed = vec![0.0; len];
         let spectrum = vec![Complex32::new(0.0, 0.0); fft.complex_len()];
         Self {
             fft,
@@ -125,6 +127,7 @@ impl Correlator {
     ///
     /// Reads past the end of `signal` as zeros, so trailing frames need no padding by the caller.
     pub fn correlate(&mut self, block: &Block, signal: &[f32], onset: usize) {
+        debug_assert_eq!(block.decimation, 1, "a decimated block reads the decimated residual");
         let env = &block.env.samples;
         let avail = signal.len().saturating_sub(onset).min(env.len());
         // Write the window first and zero only what follows it. The transform scrambles the input,
@@ -132,6 +135,23 @@ impl Correlator {
         // overwriting most of it writes the leading `avail` samples twice.
         for i in 0..avail {
             self.windowed[i] = signal[onset + i] * env[i];
+        }
+        self.windowed[avail..].fill(0.0);
+        self.fft.forward(&mut self.windowed, &mut self.spectrum);
+    }
+
+    /// [`Correlator::correlate`] for a decimated block, from the decimated residual `low`.
+    ///
+    /// The frame is `low[onset / D + m] * D * E[m D]`, whose transform at bin `k` approximates the
+    /// full-rate one at bin `k`: see [`crate::decimate`]. `onset` is on the block's hop grid, which
+    /// is a multiple of `D`.
+    pub fn correlate_decimated(&mut self, block: &Block, low: &[f32], onset: usize) {
+        debug_assert!(block.decimation > 1 && onset.is_multiple_of(block.decimation));
+        let env = &block.env_decimated;
+        let start = onset / block.decimation;
+        let avail = low.len().saturating_sub(start).min(env.len());
+        for i in 0..avail {
+            self.windowed[i] = low[start + i] * env[i];
         }
         self.windowed[avail..].fill(0.0);
         self.fft.forward(&mut self.windowed, &mut self.spectrum);
