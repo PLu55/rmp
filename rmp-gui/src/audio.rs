@@ -27,8 +27,17 @@ pub struct Audio {
 impl Audio {
     /// Open the default output device.
     pub fn open() -> Result<Self, String> {
-        let device = rodio::DeviceSinkBuilder::open_default_sink()
+        let mut device = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|e| format!("no audio output: {e}"))?;
+        // rodio prints "Dropping DeviceSink, audio playing through this sink will stop" on drop, as
+        // a development aid: it catches a sink dropped by accident while something is still
+        // sounding. Here the only drop is the window closing, where stopping the audio is the whole
+        // point — so it fired on every quit-while-playing and said nothing true about this program.
+        //
+        // Safe to silence *because* of how the sink is held: `Audio` owns it for the life of the
+        // app and hands out no copy, so there is no path by which it goes early. Were it ever moved
+        // somewhere it could, the warning would be worth having back.
+        device.log_on_drop(false);
         let player = rodio::Player::connect_new(device.mixer());
         Ok(Self { _device: device, player, active: false })
     }
@@ -83,7 +92,7 @@ mod tests {
     use super::*;
 
     /// A second of quiet noise, as a `Signal` — which is the form Play hands over.
-    fn a_signal() -> rmp_core::signal::Signal {
+    pub(super) fn a_signal() -> rmp_core::signal::Signal {
         let samples: Vec<f32> =
             rmp_core::residual::pseudo_noise(48_000).iter().map(|s| s * 0.05).collect();
         rmp_core::signal::Signal::new(samples, 48_000.0)
@@ -121,5 +130,47 @@ mod tests {
         audio.stop();
         audio.play_samples(&a_signal());
         assert!(audio.playing(), "the player was stopped and never came back");
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    /// Quitting while a sound is playing must not print rodio's development warning.
+    ///
+    /// The whole test is the *absence* of output, so it runs the case in a child process and reads
+    /// its stderr — inside this one, the harness captures nothing rodio writes with `eprintln!`
+    /// straight to fd 2.
+    #[test]
+    fn dropping_while_playing_says_nothing() {
+        if std::env::var_os("RMP_AUDIO_DROP_CHILD").is_some() {
+            // The child: open, play, and fall off the end with the sound still going.
+            if let Ok(mut audio) = Audio::open() {
+                audio.play_samples(&super::tests::a_signal());
+                assert!(audio.playing());
+                // Says on stdout that it got as far as playing, so the parent can tell an absent
+                // warning from an absent sound card.
+                println!("PLAYED");
+            }
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "audio::drop_tests::dropping_while_playing_says_nothing", "--nocapture"])
+            .env("RMP_AUDIO_DROP_CHILD", "1")
+            .output()
+            .expect("running the child");
+
+        if !String::from_utf8_lossy(&out.stdout).contains("PLAYED") {
+            eprintln!("no audio device in the child; skipping");
+            return;
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !err.contains("Dropping DeviceSink"),
+            "rodio's drop warning reached stderr:\n{err}"
+        );
     }
 }

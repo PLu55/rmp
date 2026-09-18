@@ -497,6 +497,16 @@ did, and so refused every residual render including the mixed one, which made it
 do nothing at all whatever the analysis had measured. Synthesize now judges against
 `playback::Available`, the same record of what the run produced that Play uses.
 
+`Audio::open` calls rodio's `log_on_drop(false)`. The warning it silences is a development aid —
+it catches a `MixerDeviceSink` dropped by accident while something is still sounding — but the only
+drop here is the window closing, where stopping the audio is the point, so it fired on every
+quit-while-playing and said nothing true about this program. Silencing it is safe *because* of how
+the sink is held: `Audio` owns it for the life of the app and hands out no copy, so there is no
+path by which it goes early. `dropping_while_playing_says_nothing` runs the case in a child process
+and reads its stderr, since the absence of an `eprintln!` to fd 2 is not something the test harness
+can see; the child prints a marker once it is actually playing, so a machine with no sound card
+skips rather than passing for nothing.
+
 **Play mixes from memory; it does not replay what Synthesize wrote.** Going through a file would
 mean naming and saving something before you could hear it, and the comparisons worth making are
 between *sources*. `playback::mix` builds the sum and `Audio::play_samples` sounds it from a
