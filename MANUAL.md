@@ -4,8 +4,8 @@
 Gaussian atoms by Matching Pursuit, and writes them as a *book*. A book's FOF atoms replay through
 the `rfofs` synthesizer unchanged; its Gaussian atoms are rmp's own.
 
-Three binaries: `rmp` analyses, `rmpsynth` renders a book — its atoms, its stochastic residual, or
-both (§10) — and `rmpstat` reports on it.
+Four binaries: `rmp` analyses, `rmpsynth` renders a book — its atoms, its stochastic residual, or
+both (§10) — `rmpstat` reports on it, and `rmpstruct` derives longer-lived structure from it (§11).
 
 This manual covers the command line, every setting, and what each one costs. For the design and its
 internals see `CLAUDE.md`; for the algorithm see `notes.md`.
@@ -111,7 +111,7 @@ residual: -35.0 dB rms, -25.5 dB peak relative to input
 - **`1.0x realtime`** is wall clock over audio duration. Below 1.0 is faster than realtime.
 - **`8 threads`** — the size of the thread pool. By default that is one thread per physical core of
   the machine's fastest core type, not one per hardware thread; see *Using fewer cores than the
-  machine has* in §11.
+  machine has* in §12.
 - **`refined: N/M`** — how many atoms moved off the grid. Well under 100% with refinement enabled
   means `max_atom_samples` is blocking blocks; see §6.
 - **`kinds:`** — printed only when the dictionary holds both families: how many atoms of each kind
@@ -791,7 +791,112 @@ bit-identical samples and the block size cannot reach the output.
 
 ---
 
-## 11. Tuning recipes
+## 11. Structural analysis — `rmpstruct`
+
+`rmpstruct` reads a finished book and derives a coarser description of it: **persistent partials**,
+each a slowly varying frequency and level trajectory standing in for the many atoms behind it.
+Grouping partials into **stems** is the next stage and is not built yet; its settings are already
+accepted, and ignored.
+
+```bash
+rmpstruct partials book.json.gz                     # writes book.partials.json.gz beside it
+rmpstruct partials book.json.gz -c structure.toml -o p.partials.json.gz -n 20
+rmpstruct show     book.partials.json.gz -n 20      # provenance and the strongest partials
+rmpstruct --write-config > structure.toml
+```
+
+The book is never modified; `rmpstruct` refuses an output path that names it. The settings are a
+document of their own, under `[structure.partials]` and `[structure.stems]`, with the same rules as
+rmp's: every field optional, unknown keys rejected. They are kept apart from rmp's settings on
+purpose, because they describe a different computation. The GUI's **Structure** tab shows the same
+analysis at the default settings.
+
+**How a partial is found.** Every atom deposits its energy onto a coarse time-frequency grid, spread
+over a small area by kernels sized from the atom's own duration and bandwidth. Peaks of each frame
+are linked into ridges, and a ridge that lasts long enough and is present in enough of its frames
+becomes a partial. Nothing is thresholded before the energy is summed. That is what lets forty weak
+atoms along one frequency make a partial that no one of them would, while one loud, short atom makes
+none. Each atom is then given to the partial passing nearest it, if any passes close enough;
+`supporting_atoms` lists them, and a partial's `energy` is their sum.
+
+**Cost.** Milliseconds. 5000 atoms (`data/books/book1.json`) give 249 partials in 7 ms; 4399 atoms
+of 18 s of piano give 537 in 18 ms; 14,652 Gaussian atoms give 650 in 23 ms. The share of atoms that
+end up supporting some partial is a useful single figure: 65%, 90% and 96% on those three books. The
+rest is detail the partial level throws away by design.
+
+**Reading `rmpstruct show`.** `persist` is the fraction of its lifetime a partial was actually
+found; `energy%` its supporting atoms' share of the book's energy; `signif` the product of the two,
+the default ranking. `std c` is the spread of its frequency in cents: a few cents is a steady tone,
+tens of cents a vibrato or a glide. On a fixed-pitch instrument there are no glides, and a partial
+that shows one is two notes joined; analyse such material with `max_drift_cents` (below), for which
+`data/config/structure-piano.toml` is ready-made.
+
+### `time_step_ms` — default `10.0` · `window_ms` — default `40.0`
+
+The grid's frame hop, and the analysis window each atom is blurred by in time. The window sets how
+short an event can look on the grid: an isolated atom occupies about `window_ms` plus its own
+duration. Keep it below `min_duration_ms`, or every transient is long enough to be a partial.
+
+### `frequency_scale` — default `"log-cents"` · `cents_per_bin` — default `20.0`
+
+The grid's frequency axis: `"log-cents"` (bins of `cents_per_bin`, counted from `reference_hz`,
+default 440), `"linear-hz"` (`bin_width_hz`, default 10) or `"erb"` (`bands_per_erb`, default 4).
+The axis only decides where energy is binned; tracking always works in cents, so the other settings
+keep their meaning whatever the scale. `f_min` / `f_max` (default 20 / 20000 Hz, the upper one
+capped at Nyquist) bound the grid. Atoms entirely outside it are counted under `outside grid`.
+
+### `max_jump_cents_per_frame` — default `50.0` · `max_gap_frames` — default `2`
+
+How far a ridge may move between frames, measured from where its own recent slope says it should
+be, and how many frames it may miss before it ends. The limit is per frame *whatever* was missed:
+a partial that comes back after a gap comes back where it was, and cannot resume on the next note.
+Following the slope is what keeps a ±80-cent vibrato as one partial. It also keeps crossing partials on their own tracks. Where two partials
+cross, their peaks merge into one for several frames. The partial that loses the merged peak is
+treated as hidden rather than missing, for up to 100 ms, and resumes on its own slope.
+
+### `max_drift_cents` — default `0` (no limit)
+
+How far a partial may wander from its own running mean. **Set it to `50` for a piano**, or any
+instrument whose notes do not bend: harp, mallets, plucked strings. `data/config/structure-piano.toml`
+does exactly this.
+
+Why it is needed. Where two notes overlap — one decaying, the next rising under it, a semitone
+apart — the grid can show them as a single peak whose position slides from one note to the other
+as the balance of energy shifts. Each step is small enough to pass `max_jump_cents_per_frame`, so
+nothing else can tell a slide from a glissando. For a fixed-pitch instrument there is no glissando to
+lose, and half a semitone is the natural bound: past it a partial is nearer the next note than its
+own. Measured on `chopin-nocturne-2-01-book.json.gz`:
+
+| | partials | std > 40 c | range > 100 c |
+| --- | --- | --- | --- |
+| defaults | 814 | 14 | 25 |
+| `max_drift_cents = 50` | 821 | 0 | 2 |
+
+What remains at 50 is wobble, not glides: faint partials, the loudest carrying 0.9% of the energy,
+whose frequency jitters up and down within the bound. 30 cents trims those too, at 8% more
+fragmentation. Leave it at `0` for voices, strings and winds, where 50 would cut every vibrato wider
+than a quarter tone into pieces.
+
+### `min_duration_ms` — default `100.0` · `min_persistence` — default `0.5`
+
+The two tests a ridge must pass. `min_duration_ms` is what rejects transients, and `min_persistence`
+(found frames over lifetime) rejects ridges that exist only now and then. Both are counted under
+`rejected short` and `rejected sparse`.
+
+### `min_relative_level_db` — default `-60.0`
+
+A peak more than this far below the grid's strongest cell is not considered. It is a floor on the
+whole grid, not on each atom, so a quiet but persistent partial 40 dB below the loudest survives.
+
+### `smoothing_frames` — default `3` · `frequency_simplify_cents` — default `5.0` · `amplitude_simplify_db` — default `0.5`
+
+How much detail a trajectory keeps. It is smoothed over `smoothing_frames` (1 turns smoothing off),
+then reduced to the fewest breakpoints that stay within the two tolerances. A steady tone becomes two
+points, and a vibrato keeps a point near each turn.
+
+---
+
+## 12. Tuning recipes
 
 Measured on 3 s of solo piano at 48 kHz, all driven to the same 35 dB so atoms and wall clock are
 comparable. The dictionary reaches `alpha = 1`.
@@ -841,7 +946,7 @@ give each process its own cores with `taskset`, which the automatic choice respe
 
 ---
 
-## 12. Diagnostics
+## 13. Diagnostics
 
 ```bash
 rmpstat summary book.json -c settings.toml   # atoms, energy, parameter spread
@@ -867,7 +972,7 @@ has no cross-terms. It is diagnostics only and plays no part in the pursuit.
 
 ---
 
-## 13. Things that will bite
+## 14. Things that will bite
 
 **A WAV written twice is not byte-identical.** libsndfile stamps a timestamp into the PEAK chunk of
 a float file. Exactly one byte differs and the audio is untouched — compare the book, or the data

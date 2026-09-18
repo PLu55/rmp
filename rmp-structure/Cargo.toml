@@ -1,0 +1,14 @@
+[package]
+name = "rmp-structure"
+version.workspace = true
+edition.workspace = true
+description = "Structural analysis of an rmp book: persistent partials, and (later) stems"
+
+[dependencies]
+rmp-core.workspace = true
+rayon.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

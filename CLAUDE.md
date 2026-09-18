@@ -12,12 +12,13 @@ Made Tractable"* (ICASSP 2006); `notes.md` holds the full bibliography.
 Analysis is the *inverse* of what `/home/plu/Projects/rfofs` does. rmp finds FOF parameters; rfofs
 synthesizes from them. A book's FOF atoms replay through rfofs unchanged; its Gaussian atoms have no
 rfofs representation and are defined and rendered by rmp itself. `rmp` only analyses — every render
-of a book, atoms and stochastic residual alike, is `rmpsynth`'s.
+of a book, atoms and stochastic residual alike, is `rmpsynth`'s. `rmpstruct` reads a finished book and
+derives structure from it — persistent partials now, stems later (`rmp_structure_spec.md`).
 
 ## Commands
 
 ```bash
-# a virtual workspace: these still act on all four crates from the root
+# a virtual workspace: these still act on all five crates from the root
 cargo build --release
 cargo test
 cargo test <test_name>                       # single test
@@ -50,6 +51,11 @@ RMP_RESIDUAL_DETAIL=1 ./target/release/rmp in.wav --residual-book bank.json.gz
 ./target/release/rmpstat snr     book.json -f svg -o snr.svg
 ./target/release/rmpstat wv      book.json -f png -o wv.png --log-freq --floor 65
 
+# structural analysis of a book: persistent partials (stems not built yet)
+./target/release/rmpstruct partials book.json.gz [-c structure.toml] [-o book.partials.json.gz] [-n 20]
+./target/release/rmpstruct show book.partials.json.gz -n 20
+./target/release/rmpstruct --write-config > structure.toml
+
 # the graphical front end (a scaffold)
 cargo run --release -p rmp-gui
 
@@ -72,21 +78,24 @@ right place for why the code is shaped as it is. Settings guidance added here sh
 
 ### Crate layout
 
-A four-crate workspace. The dependency direction is the boundary the split exists to enforce, and
+A five-crate workspace. The dependency direction is the boundary the split exists to enforce, and
 it points one way only:
 
 ```
 rmp-cli  ─┐
           ├─→  rmp-synthesis  ─→  rmp-core
-rmp-gui  ─┘                          ↑
-                                     └── (rmp-cli and rmp-gui also depend on it directly)
+rmp-gui  ─┤                          ↑
+          └─→  rmp-structure  ───────┘
+                                     (rmp-cli and rmp-gui also depend on rmp-core directly)
 ```
 
 - **`rmp-core`** — all analysis, and everything both front ends need: the atoms, the dictionary, the
   pursuit, the book format, the settings document, the statistics, the time-frequency map, the ERB
   residual analysis, and libsndfile I/O. No clap, no plotters, no synthesis.
 - **`rmp-synthesis`** — turning a book back into audio. Was `src/synth/`.
-- **`rmp-cli`** — the three binaries, and the only crate that knows about clap or plotters.
+- **`rmp-structure`** — structural analysis of a finished book: atoms → persistent partials, and
+  later stems. Reads books, never renders, so it depends on `rmp-core` alone.
+- **`rmp-cli`** — the four binaries, and the only crate that knows about clap or plotters.
 - **`rmp-gui`** — an eframe front end. A scaffold; see its own module docs.
 
 **Nothing points back up, and one test had to move to keep it that way.** `mp`'s HRMP gap fixture
@@ -153,6 +162,8 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   every line it prints and nothing else.
 - **`rmp-cli/src/bin/rmpsynth`** — the synthesis CLI. A file and configuration front end over
   `rmp-synthesis`; no DSP lives in it.
+- **`rmp-cli/src/bin/rmpstruct`** — the structural-analysis CLI. Reads a book, writes a partial
+  book beside it, prints the library's diagnostics; no analysis lives in it.
 - **`rmp-cli/src/bin/rmpstat`** — the statistics CLI: clap, `plotters`, and text tables. A thin
   shell, so everything worth an oracle lives in `stats`/`tfmap` where `cargo test` reaches it.
 - **`rmp-gui`** — the eframe front end. The window is a strip of tabs, each an independent
@@ -167,8 +178,8 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   hint, the `Open…` in the strip being the one way in. A tab's settings are a **document**, loaded,
   edited and saved as a TOML file — `settings::SettingsDoc` — with a `?` beside them opening
   `MANUAL.md` itself in a window of its own (`help`). `task` runs a decomposition off the UI thread;
-  `view/` holds the three result tabs, each a view of a call in `rmp-core` and never its own
-  arithmetic.
+  `view/` holds the result tabs, each a view of a call in `rmp-core` or `rmp-structure` and never
+  its own arithmetic.
 
 ### Invariants that are not locally obvious
 
@@ -439,7 +450,8 @@ the word ambiguous.
 
 **The result tabs recompute nothing.** `view/summary` is `stats::summarize`, `view/distribution`
 is `stats::histogram`, `view/function` is `Book::snr_trace` and its relatives, `view/timefreq` is
-`tfmap::compute` — the same calls `rmpstat` drives, so
+`tfmap::compute`, `view/structure` is `rmp_structure::analyze_partials` at default settings — the
+same calls `rmpstat` and `rmpstruct` drive, so
 the window and the charts report one set of numbers rather than two that agree by luck. Two things
 moved into `rmp-core` to keep it that way: `Quantity::ALL`, because a front end offering the
 quantities has to enumerate them and the only list was a hand-written one inside `rmpstat`'s own
@@ -811,6 +823,76 @@ residual) * gain` in f32, so at 0 dB an atoms-only render is the atom render to 
 output sample, including the silent ones before the excerpt, so a trimmed render is a different
 stretch of the same stream from a placed one. Both are correct realisations; they are not
 sample-comparable, and a test that compares them has to silence the residual.
+
+### Structural analysis (`rmp-structure`)
+
+`rmp_structure_spec.md` is the written specification; its §47 phases are the plan. Phases 1 and 2
+are built: atom normalisation (`observation`) and persistent partials (`partial/`, `PartialBook`).
+Stems (Phases 3–6: morphology, affinity graph, clustering, refinement) are not built yet, on purpose.
+§47 says partial extraction should be inspected on real books first. `output::stem_book` holds the
+stem format so it is settled early, and `[structure.stems]` parses and validates but nothing reads
+it. Its settings are a TOML document of its own (`StructureAnalysisConfig`, rooted at
+`[structure]`), not a section of `rmp_core::Config`. Structure settings do not change the
+decomposition, and keeping them out of `Config` means they cannot make a finished run look out of
+date. Eight facts that are not obvious from the code:
+
+**Every observation is defined on `E²(t)`, so the two kinds mean the same thing.** Centre is the
+energy centroid, duration is twice the RMS width, and bandwidth is the −3 dB width that
+`Shape::bandwidth_hz` already gives for both kinds. An RMS *bandwidth* was not an option: a FOF's
+spectrum has the Lorentzian skirt of an exponential, and its RMS width is infinite.
+
+**A FOF's moments are integrated from its definition, not rendered.** This does not break "derive
+supports by rendering". That rule protects support lengths from rfofs's rounding, and these are
+statistics for a deliberately coarse map. Rendering would be ruinous: refinement makes every shape
+distinct, and a low-`alpha` support is 332,000 samples. The decay and fade segments are closed forms
+and the attack a 64-point midpoint sum. `fof_moments_match_a_rendered_envelope` holds them to rfofs
+within 2% of the RMS width.
+
+**Every kernel is normalised over the cells it covers, so each atom deposits exactly its energy.**
+That is what makes the map accumulate *evidence* (§8 of the spec): nothing is thresholded before
+summing, and weak atoms that recur along one frequency outweigh one loud atom.
+
+**Kernels have their pedestal removed.** They are `max(0, g − g(edge))`, not `g` cut off. With hard
+cuts, the step at one kernel's edge lying on another's slope was a local maximum. On a
+three-note fixture it produced a 492 Hz "partial" between 440 and 523 Hz that not one atom
+supported. A pedestal-free kernel is continuous and unimodal, and its edges can only make minima.
+Time is cut at ±2σ, which is tight on purpose. On the grid, an isolated event is as long as its
+kernel, and at ±3σ a 20 ms transient blurs past the 100 ms minimum duration.
+
+**The map is bit-identical at any thread count.** Frames go in fixed chunks of 64, and each chunk
+adds the atoms that overlap it in book order, so every cell is one fixed sequence of f64 additions.
+`analysis_is_deterministic_across_thread_counts` compares 1, 5 and 16 threads. On a real book,
+`rmpstruct` output is byte-identical under `RAYON_NUM_THREADS=3` and the default.
+
+**A crossing is an occlusion, not a gap.** Tracks predict their next position from their own slope,
+which keeps crossing partials apart and a vibrato whole. But at a crossing the map has one peak for
+both partials for several frames, more than `max_gap_frames` allows. Without special handling the
+losing track was cut in two. It did not swap, but it broke. A track whose prediction lies on a peak
+another track took counts as occluded, not missing, for up to `MAX_OCCLUDED_FRAMES` (10), and
+resumes on its slope. Occluded frames are still unmatched and still lower persistence, so a track
+that only shadows another cannot pass as a partial.
+
+**The tracker never lets reach grow across a gap, and piano books are why.** The first design grew
+a track's reach by `max_jump_cents_per_frame` per missed frame (and per occluded one, up to ten).
+On `chopin-nocturne-2` that joined consecutive notes into glissandi — 170 of 537 partials wandered
+more than 40 cents, and 340 of the 408 large steps inside partials happened across a gap, which
+simplification then drew as a straight line. Reach is now one frame's worth after any gap. The one
+exception is an *occluded* track, whose reach grows by its own `|slope|` per frame occluded:
+crossings need that slack, because approaching peaks pull on each other and bend the slope, while a
+steady track gets none. Growing every occluded track's reach regardless brought 107 of the glissandi
+back, since a neighbouring note inside reach is enough to mark a steady track occluded.
+`a_track_does_not_resume_on_another_note_after_a_gap` and `crossing_partials_keep_their_identities`
+pin the two sides. What the per-frame limit cannot see is a slow slide: two overlapping notes a
+semitone apart merge into one peak that moves as their energies trade. `max_drift_cents` bounds a
+track to its running mean and is the fixed-pitch answer — 50 cents takes the nocturne from 14 such
+partials to 0 for 1% more partials — but it is off by default because it would also cut a vibrato.
+`overlapping_notes_are_not_joined_into_a_glide_when_drift_is_limited` asserts its own premise first,
+because at 5 ms atoms the two notes stay resolved and the test passed for nothing.
+
+**Short atoms cannot resolve close partials, and that is physics, not a bug.** A 4 ms Gaussian is
+66 Hz wide, so 523 Hz sat in the skirt of 440 Hz and was pulled into it. The polyphony fixture uses
+20 ms atoms (13 Hz), as a pursuit would for steady harmonics. A fixture of short atoms tests the
+atoms' resolution, not the tracker.
 
 ### Residual ERB analysis
 
@@ -1267,12 +1349,13 @@ Splitting the replay stream from the diagnostics is where the remaining 22× is,
 ## Build configuration — four things that will bite
 
 **The root manifest is virtual: it has a `[workspace]` and no `[package]`.** `cargo build`, `cargo
-test` and `cargo clippy --all-targets` from the root act on all four members, so the everyday
+test` and `cargo clippy --all-targets` from the root act on all five members, so the everyday
 commands are unchanged; anything that names a *target* needs the crate that owns it
 (`-p rmp-core --bench pursuit`, `-p rmp-cli --example analyze`).
 
-**None of the three binaries needs a `[[bin]]` section.** Cargo auto-discovers `src/bin/<name>/`
-directories, so `rmp`, `rmpstat` and `rmpsynth` are all found by their directory names.
+**None of the four binaries needs a `[[bin]]` section.** Cargo auto-discovers `src/bin/<name>/`
+directories, so `rmp`, `rmpstat`, `rmpsynth` and `rmpstruct` are all found by their directory
+names.
 
 **`cargo test` runs each crate with its own package root as the working directory, and
 `CARGO_MANIFEST_DIR` one level below the workspace root.** The `data/` fixtures are at the root, so

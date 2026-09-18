@@ -487,6 +487,67 @@ pub fn spawn_tfmap(job: MapJob) -> Mapping {
     Mapping { updates, finished: false }
 }
 
+/// Partial extraction over a finished book, for the Structure view.
+///
+/// The same shape as [`spawn_tfmap`]: one terminal message, no cancellation. It is milliseconds on
+/// the books measured so far, but it scales with the book and has settings of its own coming, and a
+/// view that could freeze the window is not one to build on. The intermediates are kept, since the
+/// view draws the atom cloud from the observations.
+pub struct StructureDone {
+    pub analysis: rmp_structure::PartialAnalysis,
+    pub seconds: f64,
+}
+
+pub enum StructureUpdate {
+    Done(Box<StructureDone>),
+    Failed(String),
+}
+
+pub struct Structuring {
+    updates: mpsc::Receiver<StructureUpdate>,
+    finished: bool,
+}
+
+impl Structuring {
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn drain(&mut self) -> Vec<StructureUpdate> {
+        let mut out = Vec::new();
+        while let Ok(u) = self.updates.try_recv() {
+            self.finished = true;
+            out.push(u);
+        }
+        out
+    }
+}
+
+pub fn spawn_structure(book: rmp_core::book::Book) -> Structuring {
+    let (tx, updates) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("rmp-structure".into())
+        .spawn(move || {
+            rmp_core::threads::prefer_fast_cores();
+            let cfg = rmp_structure::PartialAnalysisConfig {
+                keep_intermediates: true,
+                ..Default::default()
+            };
+            let started = std::time::Instant::now();
+            let msg = match rmp_structure::analyze_partials(&book, &cfg) {
+                Ok(analysis) => StructureUpdate::Done(Box::new(StructureDone {
+                    analysis,
+                    seconds: started.elapsed().as_secs_f64(),
+                })),
+                Err(e) => StructureUpdate::Failed(e.to_string()),
+            };
+            tx.send(msg).ok();
+        })
+        .expect("spawning the structure thread");
+
+    Structuring { updates, finished: false }
+}
+
 fn build_map(job: &MapJob) -> Result<MapDone, String> {
     use rmp_core::tfmap::{self, MapGrid, MapOptions};
 

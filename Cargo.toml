@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["rmp-core", "rmp-synthesis", "rmp-cli", "rmp-gui"]
+members = ["rmp-core", "rmp-synthesis", "rmp-structure", "rmp-cli", "rmp-gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,7 @@ edition = "2024"
 [workspace.dependencies]
 rmp-core = { path = "rmp-core" }
 rmp-synthesis = { path = "rmp-synthesis" }
+rmp-structure = { path = "rmp-structure" }
 
 # The FOF definition itself. Analysis atoms are rendered by the same code that synthesizes them, so
 # the two cannot drift apart.

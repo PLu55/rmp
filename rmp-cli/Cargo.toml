@@ -9,6 +9,7 @@ description = "The rmp command-line tools: rmp, rmpsynth and rmpstat"
 [dependencies]
 rmp-core.workspace = true
 rmp-synthesis.workspace = true
+rmp-structure.workspace = true
 clap.workspace = true
 serde.workspace = true
 toml.workspace = true

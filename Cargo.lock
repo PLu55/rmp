@@ -3549,6 +3549,7 @@ dependencies = [
  "clap",
  "plotters",
  "rmp-core",
+ "rmp-structure",
  "rmp-synthesis",
  "serde",
  "toml",
@@ -3582,8 +3583,20 @@ dependencies = [
  "egui_plot",
  "rfd",
  "rmp-core",
+ "rmp-structure",
  "rmp-synthesis",
  "rodio",
+]
+
+[[package]]
+name = "rmp-structure"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+ "rmp-core",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

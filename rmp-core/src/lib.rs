@@ -2,6 +2,9 @@
 //!
 //! See `CLAUDE.md` for the project overview and the design plan it references.
 
+/// This crate's version, for documents derived from a book to record what produced the book.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod atom;
 pub mod audio;
 pub mod book;

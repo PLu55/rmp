@@ -16,6 +16,7 @@ use crate::playback::{self, Available, Sources, Which};
 use crate::view::distribution::DistributionView;
 use crate::view::function::FunctionView;
 use crate::view::summary::SummaryView;
+use crate::view::structure::StructureView;
 use crate::view::timefreq::TimeFreqView;
 use crate::settings::SettingsDoc;
 use crate::task::{self, Outcome, Progress, Running, Update};
@@ -35,11 +36,18 @@ enum View {
     Function,
     /// `rmp_core::tfmap::TfMap` — the atom-based pseudo-Wigner map, as `rmpstat wv`.
     TimeFrequency,
+    /// `rmp_structure::analyze_partials` — persistent partials, as `rmpstruct partials`.
+    Structure,
 }
 
 impl View {
-    const ALL: [View; 4] =
-        [View::Summary, View::Distribution, View::Function, View::TimeFrequency];
+    const ALL: [View; 5] = [
+        View::Summary,
+        View::Distribution,
+        View::Function,
+        View::TimeFrequency,
+        View::Structure,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -47,6 +55,7 @@ impl View {
             View::Distribution => "Distributions",
             View::Function => "Functions",
             View::TimeFrequency => "Time-frequency",
+            View::Structure => "Structure",
         }
     }
 }
@@ -96,6 +105,7 @@ struct Session {
     distribution_view: DistributionView,
     function_view: FunctionView,
     timefreq_view: TimeFreqView,
+    structure_view: StructureView,
 }
 
 impl Session {
@@ -122,6 +132,7 @@ impl Session {
             distribution_view: DistributionView::default(),
             function_view: FunctionView::default(),
             timefreq_view: TimeFreqView::default(),
+            structure_view: StructureView::default(),
         }
     }
 
@@ -155,6 +166,7 @@ impl Session {
             distribution_view: DistributionView::default(),
             function_view: FunctionView::default(),
             timefreq_view: TimeFreqView::default(),
+            structure_view: StructureView::default(),
         }
     }
 
@@ -207,6 +219,7 @@ impl Session {
                     self.distribution_view.invalidate();
                     self.function_view.invalidate();
                     self.timefreq_view.invalidate();
+                    self.structure_view.invalidate();
                     // And anything already ticked that the run did not make is dropped, rather than
                     // left ticked and silently ignored.
                     for w in Which::ALL {
@@ -598,6 +611,7 @@ impl Session {
             View::Distribution => self.distribution_view.ui(ui, &outcome.analysis.book),
             View::Function => self.function_view.ui(ui, &outcome.analysis.book),
             View::TimeFrequency => self.timefreq_view.ui(ui, &outcome.analysis.book),
+            View::Structure => self.structure_view.ui(ui, &outcome.analysis.book),
         }
     }
 }

@@ -1,7 +1,7 @@
 //! The result tabs: what a finished analysis looks like.
 //!
-//! Each is a *view* of a call that already exists in `rmp-core` and is already tested —
-//! `stats::summarize`, `stats::histogram`, `tfmap::compute`. None of them recomputes anything, and
+//! Each is a *view* of a call that already exists in `rmp-core` or `rmp-structure` and is already
+//! tested — `stats::summarize`, `stats::histogram`, `tfmap::compute`, `analyze_partials`. None of them recomputes anything, and
 //! that is the rule this crate is built on: a panel that did its own arithmetic would be a second
 //! definition of a number `rmpstat` already prints, and the two would drift.
 //!
@@ -15,6 +15,7 @@
 
 pub mod distribution;
 pub mod function;
+pub mod structure;
 pub mod summary;
 pub mod timefreq;
 
@@ -111,6 +112,24 @@ mod tests {
         let top_left = &rgb[0..3];
         let expect = tfmap::heat((db[n_f - 1] as f64 + floor as f64) / floor as f64);
         assert_eq!(top_left, expect, "the top row is not the highest frequency");
+    }
+
+    /// The Structure view's call on the fixture book: it runs, and what it reports adds up.
+    #[test]
+    fn partial_extraction_runs_on_a_real_decomposition_and_its_counts_agree() {
+        let book = a_book();
+        let cfg = rmp_structure::PartialAnalysisConfig {
+            keep_intermediates: true,
+            ..Default::default()
+        };
+        let a = rmp_structure::analyze_partials(&book, &cfg).expect("the fixture analyses");
+        let d = &a.diagnostics;
+        assert_eq!(d.input_atoms, book.selections.len());
+        assert_eq!(d.observations + d.skipped.total(), d.input_atoms);
+        assert_eq!(d.supporting_atoms + d.unsupported_atoms, d.observations);
+        assert_eq!(d.accepted_partials, a.book.partials.len());
+        let i = a.intermediates.expect("the view draws the cloud from these");
+        assert_eq!(i.observations.len(), d.observations);
     }
 
     /// Cells below the floor are black, which is what makes silence read as empty.
