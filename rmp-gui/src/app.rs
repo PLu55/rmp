@@ -1109,6 +1109,14 @@ impl RmpApp {
         }
     }
 
+    /// The command-line entry point: `rmp-gui PROJECT` opens `dir` the moment the window has
+    /// something to draw into. No dialog and no dirty check — there is nothing open yet to lose —
+    /// so this goes straight to `do_open_project`, which already reports a missing directory or an
+    /// unreadable `project.toml` through `last_error` exactly as a menu-driven Open Project does.
+    pub(crate) fn open_project_at(&mut self, dir: PathBuf) {
+        self.do_open_project(dir);
+    }
+
     fn do_open_project(&mut self, dir: PathBuf) {
         match rmp_core::book::read_doc::<ProjectDoc>(&dir.join(project::PROJECT_FILE)) {
             Ok(doc) => {
@@ -2124,5 +2132,34 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&src_dir).ok();
+    }
+
+    /// `rmp-gui PROJECT` — a saved project opens straight into its tabs, no dialog involved.
+    #[test]
+    fn open_project_at_restores_a_saved_project() {
+        let dir = tmp_project_dir("cli-open-existing");
+        let mut first = RmpApp::default();
+        first.do_new_project(dir.clone());
+        first.open(PathBuf::from("/a/piano.wav"));
+        first.save_project();
+
+        let mut second = RmpApp::default();
+        second.open_project_at(dir.clone());
+        assert!(second.last_error.is_none());
+        assert_eq!(second.sessions.len(), 1);
+        assert!(second.project.is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A path that is not a project — missing outright, or a directory with no `project.toml` —
+    /// is reported through `last_error` rather than panicking or being silently ignored.
+    #[test]
+    fn open_project_at_reports_a_path_that_is_not_a_project() {
+        let mut app = RmpApp::default();
+        app.open_project_at(tmp_project_dir("cli-open-missing"));
+        assert!(app.last_error.is_some());
+        assert!(app.sessions.is_empty());
+        assert!(app.project.is_none());
     }
 }

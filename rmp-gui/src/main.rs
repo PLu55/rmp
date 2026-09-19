@@ -56,7 +56,57 @@ fn install_fallback_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// `rmp-gui`'s one flag and one positional argument.
+///
+/// No clap here: the CLI surface is one optional path, and `rmp-cli` is where this workspace's
+/// argument parsing lives — see `CLAUDE.md`'s crate layout. Scanned for `-h`/`--help` wherever it
+/// appears, the usual convention, rather than only in the first position.
+fn print_help() {
+    println!(
+        "rmp-gui — graphical front end for rmp: analyse, inspect and resynthesise\n\
+         \n\
+         Usage:\n\
+         \x20 rmp-gui [PROJECT]\n\
+         \n\
+         Arguments:\n\
+         \x20 PROJECT   a project directory to open at startup (one `File > Save Project`\n\
+         \x20           already wrote). If given, it is opened the same way `File > Open\n\
+         \x20           Project` does; a directory that does not exist, or one with no\n\
+         \x20           readable `project.toml`, is reported in the window rather than\n\
+         \x20           refused here.\n\
+         \n\
+         Options:\n\
+         \x20 -h, --help   print this message and exit"
+    );
+}
+
+/// The startup project path, or a usage error for anything this cannot make sense of.
+///
+/// A second positional argument is refused rather than silently ignored — a typo'd flag landing
+/// here as a second path is a mistake worth saying something about, not a project to open.
+fn parse_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String> {
+    match args {
+        [] => Ok(None),
+        [path] => Ok(Some(std::path::PathBuf::from(path))),
+        _ => Err(format!("too many arguments (expected at most one: a project directory), got {args:?}")),
+    }
+}
+
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print_help();
+        return Ok(());
+    }
+    let project = match parse_args(&args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("rmp-gui: {e}\n");
+            print_help();
+            std::process::exit(2);
+        }
+    };
+
     rmp_core::threads::configure_pool();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -68,9 +118,36 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "rmp",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             install_fallback_font(&cc.egui_ctx);
-            Ok(Box::<app::RmpApp>::default())
+            let mut rmp_app = app::RmpApp::default();
+            if let Some(dir) = project {
+                rmp_app.open_project_at(dir);
+            }
+            Ok(Box::new(rmp_app))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_arguments_is_no_project() {
+        assert_eq!(parse_args(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn one_argument_is_the_project_path() {
+        let args = ["a-project".to_string()];
+        assert_eq!(parse_args(&args).unwrap(), Some(std::path::PathBuf::from("a-project")));
+    }
+
+    #[test]
+    fn a_second_argument_is_refused_rather_than_ignored() {
+        let args = ["a".to_string(), "b".to_string()];
+        let err = parse_args(&args).expect_err("two positional arguments must not be accepted");
+        assert!(!err.is_empty());
+    }
 }

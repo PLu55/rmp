@@ -58,6 +58,8 @@ RMP_RESIDUAL_DETAIL=1 ./target/release/rmp in.wav --residual-book bank.json.gz
 
 # the graphical front end (a scaffold)
 cargo run --release -p rmp-gui
+cargo run --release -p rmp-gui -- a-project-dir   # opens that project at startup
+cargo run --release -p rmp-gui -- --help
 
 # end-to-end measurement against synthetic ground truth
 cargo run --release -p rmp-cli --example analyze [seconds] [max_atoms] [grains_per_sec] [candidates]
@@ -593,6 +595,18 @@ project active, since there is nowhere to copy into. A name collision is resolve
 `-2`, `-3`, … rather than overwriting whatever is already there; re-importing a file already inside
 the project (`same_file`, by canonicalised path) is a no-op instead of a self-copy, which
 `std::fs::copy` makes no promises about.
+
+**`rmp-gui` takes one optional argument: a project directory.** `rmp-gui PROJECT` opens it the
+moment the window has something to draw into, through `RmpApp::open_project_at` — a thin wrapper
+over `do_open_project`, skipping the dialog and the dirty check a menu-driven Open Project needs
+(there is nothing open yet to lose). A directory that does not exist, or one whose `project.toml`
+does not read back, is reported through `last_error` in the running window exactly as a menu-driven
+open would report it — not refused before the window appears, since a GUI program failing silently
+to a terminal that may not be visible is a worse failure mode than an empty window with a message in
+it. `-h`/`--help` is the one exception: recognised wherever it appears among the arguments, ahead of
+being treated as a path, and prints to stdout and exits before `eframe::run_native` is ever called.
+No `clap` here — `rmp-cli` is the only crate that owns argument parsing (see *Crate layout* above);
+one optional path and one flag is hand-rolled in `main.rs` instead.
 
 **A synthesised book is longer than the excerpt it came from.**
 `rmp_synthesis::atoms::natural_len` sizes the output by rendering each atom's envelope and taking
