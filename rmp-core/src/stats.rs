@@ -766,6 +766,7 @@ mod tests {
 
     fn sel(alpha: f32, beta: f32, f: f32, amp: f32, energy: f64) -> Selection {
         Selection {
+            id: 0,
             atom: AtomParams {
                 t0: 0,
                 f,

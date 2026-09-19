@@ -266,6 +266,7 @@ pub(crate) mod tests {
     /// A book atom with enough filled in for the observation to be about it.
     pub(crate) fn sel(t0: i64, f: f32, env: Shape, energy: f64) -> Selection {
         Selection {
+            id: 0,
             atom: AtomParams { t0, f, env, phi: 0.25, amp: energy.sqrt() as f32 },
             block: 0,
             onset: t0.max(0) as usize,

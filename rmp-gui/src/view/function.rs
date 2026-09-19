@@ -100,8 +100,8 @@ impl Curve {
     fn points(self, book: &Book) -> Vec<[f64; 2]> {
         let initial = book.initial_energy;
         let mut running = 0.0f64;
-        book.selections
-            .iter()
+        book.in_order()
+            .into_iter()
             .enumerate()
             .map(|(i, s)| {
                 running += s.energy_removed;

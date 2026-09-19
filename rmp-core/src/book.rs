@@ -19,6 +19,14 @@ use std::path::Path;
 /// One selected atom, with where it came from and what it actually removed.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Selection {
+    /// Counter-based, assigned in the order the pursuit selected the atom — 0 for the first,
+    /// counting up across the whole run, windows included. `selections` itself is not trusted to
+    /// carry that order: a caller is free to filter or re-sort it, and `id` is what
+    /// [`Book::in_order`] recovers the original sequence from. `#[serde(default)]` reads a book
+    /// written before this field existed as every atom sharing id 0, which a stable sort leaves in
+    /// its original, on-disk order — the same order `in_order` gave before the field existed.
+    #[serde(default)]
+    pub id: u64,
     pub atom: AtomParams,
     /// Index into the dictionary's block list.
     pub block: usize,
@@ -88,9 +96,20 @@ impl Book {
         self.selections.is_empty()
     }
 
+    /// `selections` in pursuit order, recovered from `id` rather than trusted from the vector's own
+    /// order. Each entry's `residual_energy` is only meaningful as the running total *after* the
+    /// ones before it, so anything that reads the book as a sequence — the convergence curve, the
+    /// final residual energy — has to see this order even when `selections` has been filtered or
+    /// re-sorted for some other purpose.
+    pub fn in_order(&self) -> Vec<&Selection> {
+        let mut v: Vec<&Selection> = self.selections.iter().collect();
+        v.sort_by_key(|s| s.id);
+        v
+    }
+
     /// Residual energy after the last atom, or the initial energy if none were selected.
     pub fn residual_energy(&self) -> f64 {
-        self.selections
+        self.in_order()
             .last()
             .map_or(self.initial_energy, |s| s.residual_energy)
     }
@@ -101,7 +120,7 @@ impl Book {
 
     /// SNR in dB after each atom — the convergence curve.
     pub fn snr_trace(&self) -> Vec<f32> {
-        self.selections
+        self.in_order()
             .iter()
             .map(|s| snr_db(self.initial_energy, s.residual_energy))
             .collect()
@@ -280,6 +299,7 @@ mod tests {
 
     fn sel(block: usize, residual: f64) -> Selection {
         Selection {
+            id: 0,
             atom: AtomParams {
                 t0: 0,
                 f: 1000.0,
@@ -312,6 +332,29 @@ mod tests {
 
         assert_eq!(b.atoms_to_reach(20.0), Some(2));
         assert_eq!(b.atoms_to_reach(99.0), None);
+    }
+
+    /// `snr_trace` and `residual_energy` read pursuit order off `id`, not off `selections`' own
+    /// order — so shuffling the vector, as a caller filtering or re-sorting atoms for some other
+    /// purpose would, does not change the convergence curve.
+    #[test]
+    fn the_convergence_curve_survives_a_reordering() {
+        let atom = |id: u64, block: usize, residual: f64| Selection { id, ..sel(block, residual) };
+
+        let mut ordered = Book::new(100.0, 48_000.0);
+        ordered.selections.push(atom(0, 0, 10.0)); // 10 dB
+        ordered.selections.push(atom(1, 1, 1.0)); // 20 dB
+        ordered.selections.push(atom(2, 0, 0.1)); // 30 dB
+
+        let mut shuffled = Book::new(100.0, 48_000.0);
+        shuffled.selections.push(atom(2, 0, 0.1));
+        shuffled.selections.push(atom(0, 0, 10.0));
+        shuffled.selections.push(atom(1, 1, 1.0));
+
+        assert_eq!(shuffled.snr_trace(), ordered.snr_trace());
+        assert_eq!(shuffled.residual_energy(), ordered.residual_energy());
+        assert_eq!(shuffled.snr_db(), ordered.snr_db());
+        assert_eq!(shuffled.atoms_to_reach(20.0), ordered.atoms_to_reach(20.0));
     }
 
     #[test]
@@ -411,6 +454,7 @@ mod tests {
             "projected_energy":1.0,"energy_removed":1.0,"residual_energy":0.5}],
             "initial_energy":1.0,"sample_rate":48000.0}"#;
         let b: Book = serde_json::from_str(json).unwrap();
+        assert_eq!(b.selections[0].id, 0);
         assert_eq!(b.selections[0].hr_score, None);
         assert!(!b.selections[0].refined);
         assert_eq!(b.residual, None);

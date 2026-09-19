@@ -91,7 +91,9 @@ pub(crate) mod testing {
         let mut book = rmp_core::book::Book::new(1.0, sample_rate);
         book.selections = atoms
             .iter()
-            .map(|&atom| rmp_core::book::Selection {
+            .enumerate()
+            .map(|(id, &atom)| rmp_core::book::Selection {
+                id: id as u64,
                 atom,
                 block: 0,
                 onset: 0,

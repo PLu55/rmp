@@ -73,6 +73,7 @@ mod tests {
 
     fn sel(atom: AtomParams) -> Selection {
         Selection {
+            id: 0,
             atom,
             block: 0,
             onset: 0,

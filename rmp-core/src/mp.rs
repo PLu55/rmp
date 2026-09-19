@@ -428,6 +428,7 @@ impl<'a> Mp<'a> {
                 dec.update(&self.residual, low, lo, hi);
             }
             book.selections.push(Selection {
+                id: book.selections.len() as u64,
                 atom: best.atom,
                 block: best.seed.block,
                 onset: best.seed.onset,
@@ -1089,6 +1090,9 @@ pub fn run_windowed(
             // is the atom's true removal and accumulates into a global residual energy directly.
             running = (running - s.energy_removed).max(0.0);
             s.residual_energy = running;
+            // `wbook`'s ids restart at 0 per window; renumbered here so `id` stays a single
+            // increasing counter across the whole run, in the order windows are actually processed.
+            s.id = book.selections.len() as u64;
             book.selections.push(s);
         }
 

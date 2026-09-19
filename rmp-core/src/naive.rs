@@ -153,6 +153,7 @@ impl NaiveMp {
             let before = energy;
             energy = subtract_at(&mut residual.samples, &rendered, atom.t0, before);
             book.selections.push(Selection {
+                id: book.selections.len() as u64,
                 atom,
                 block: best.block,
                 onset: best.onset,

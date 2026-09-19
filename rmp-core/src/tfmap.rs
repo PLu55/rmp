@@ -754,6 +754,7 @@ mod tests {
         };
         let energy = Envelope::render(atom.env, SR).unwrap().energy() * (amp as f64).powi(2);
         Selection {
+            id: 0,
             atom,
             block: 0,
             onset: t0.max(0) as usize,
