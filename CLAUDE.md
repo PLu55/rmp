@@ -584,6 +584,16 @@ A tab whose book or input can no longer be found still opens — settings and sw
 results, the reason logged — the same "Press Analyse." state as before this existed, not a reason to
 refuse the whole project.
 
+**Import, beside Open in the tab strip, is how a project's audio stops depending on wherever the
+original file happens to live.** It copies the chosen soundfile into the project directory
+(`copy_into_project`) and only then calls the same `open` Open does, so the tab it produces is a
+tab like any other — `input` still never changes after construction, and Import is not a third way
+a tab comes into being, only a second way of arriving at the file `open` is handed. Disabled with no
+project active, since there is nowhere to copy into. A name collision is resolved by appending
+`-2`, `-3`, … rather than overwriting whatever is already there; re-importing a file already inside
+the project (`same_file`, by canonicalised path) is a no-op instead of a self-copy, which
+`std::fs::copy` makes no promises about.
+
 **A synthesised book is longer than the excerpt it came from.**
 `rmp_synthesis::atoms::natural_len` sizes the output by rendering each atom's envelope and taking
 the furthest death, where analysis sized the residual by the input. The atom tails the analysis

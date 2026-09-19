@@ -752,6 +752,8 @@ enum Action {
     Close(usize),
     Duplicate,
     Open(PathBuf),
+    /// A soundfile chosen for Import — copied into the project directory before it becomes a tab.
+    Import(PathBuf),
 }
 
 /// The window.
@@ -949,6 +951,15 @@ impl RmpApp {
                     action = Some(Action::Open(p));
                 }
                 if ui
+                    .add_enabled(self.project.is_some(), egui::Button::new("Import…"))
+                    .on_disabled_hover_text("no project open — File > New or Open first")
+                    .on_hover_text("a soundfile, copied into the project directory and opened in a tab of its own")
+                    .clicked()
+                    && let Some(p) = pick_file()
+                {
+                    action = Some(Action::Import(p));
+                }
+                if ui
                     .add_enabled(!self.sessions.is_empty(), egui::Button::new("Duplicate"))
                     .on_hover_text("this tab's file and settings, without its results")
                     .clicked()
@@ -965,11 +976,14 @@ impl RmpApp {
                 self.push(self.sessions[self.active].duplicate(self.free_number()))
             }
             Some(Action::Open(p)) => self.open(p),
+            Some(Action::Import(p)) => self.import_audio(p),
             None => {}
         }
     }
 
-    /// Open a file, in a tab of its own. The only way a tab comes into existence.
+    /// Open a file, in a tab of its own. Together with `Session::restore` (used when a project is
+    /// opened), the only way a tab comes into existence — Import funnels through this too, once its
+    /// copy into the project directory has finished.
     ///
     /// A tab is never empty and its file never changes, and both of those are facts about
     /// `Session` rather than rules the UI has to keep remembering: `input` is a `PathBuf` set at
@@ -980,6 +994,18 @@ impl RmpApp {
     /// `Duplicate`'s job, and one button cannot be both without becoming unpredictable.
     fn open(&mut self, path: PathBuf) {
         self.push(Session::new(self.free_number(), path));
+    }
+
+    /// Import a soundfile: copy it into the open project's directory, then open it exactly as
+    /// `open` would. Disabled with no project active — there is nowhere to copy into — so this is
+    /// never reached without one; `import_audio` still checks, since a click and the panel that
+    /// gated it are two different frames apart.
+    fn import_audio(&mut self, src: PathBuf) {
+        let Some(dir) = self.project.as_ref().map(|p| p.dir.clone()) else { return };
+        match copy_into_project(&src, &dir) {
+            Ok(dest) => self.open(dest),
+            Err(e) => self.last_error = Some(e),
+        }
     }
 
     /// The lowest number no open tab is using.
@@ -1247,6 +1273,42 @@ fn pick_file() -> Option<PathBuf> {
 /// something. `do_new_project` still refuses if the name collides with an existing project.
 fn pick_new_project_dir() -> Option<PathBuf> {
     rfd::FileDialog::new().set_file_name("project").save_file()
+}
+
+/// Copy `src` into `dir`, keeping its file name unless that collides with something already there
+/// — appending `-2`, `-3`, … until it does not, the same idea `free_number` uses for tab numbers.
+///
+/// Re-importing a file already inside the project (its name already resolves to itself) is not a
+/// collision to rename around: that path is returned as-is, both because there is nothing to copy
+/// and because copying a file onto itself is not something `std::fs::copy` promises to do safely.
+fn copy_into_project(src: &Path, dir: &Path) -> Result<PathBuf, String> {
+    let name = src.file_name().ok_or_else(|| format!("{} has no file name", src.display()))?;
+    let stem = src.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let ext = src.extension().map(|e| e.to_string_lossy().into_owned());
+
+    let mut dest = dir.join(name);
+    let mut n = 2;
+    while dest.exists() {
+        if same_file(src, &dest) {
+            return Ok(dest);
+        }
+        dest = dir.join(match &ext {
+            Some(e) => format!("{stem}-{n}.{e}"),
+            None => format!("{stem}-{n}"),
+        });
+        n += 1;
+    }
+
+    std::fs::copy(src, &dest)
+        .map_err(|e| format!("copying {} to {}: {e}", src.display(), dest.display()))?;
+    Ok(dest)
+}
+
+/// Whether two paths name the same file on disk, resolving symlinks and relative components —
+/// what `copy_into_project` needs to tell "already imported" apart from "a different file that
+/// happens to share a name."
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 /// Where to write a render. Unlike a settings document, which belongs beside the others, a render
@@ -1976,5 +2038,91 @@ mod tests {
         assert_eq!(doc.tabs.len(), 1, "the first project's tab must survive the refused New");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copy_into_project_places_the_file_under_its_own_name() {
+        let dir = tmp_project_dir("import-basic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_dir = tmp_project_dir("import-basic-src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("piano.wav");
+        std::fs::write(&src, b"not really audio").unwrap();
+
+        let dest = copy_into_project(&src, &dir).expect("copying must succeed");
+        assert_eq!(dest, dir.join("piano.wav"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"not really audio");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&src_dir).ok();
+    }
+
+    /// Two different files that happen to share a name must not collide: the second import gets a
+    /// new name rather than overwriting the first.
+    #[test]
+    fn copy_into_project_renames_around_a_different_files_name() {
+        let dir = tmp_project_dir("import-collision");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("piano.wav"), b"already here").unwrap();
+
+        let src_dir = tmp_project_dir("import-collision-src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("piano.wav");
+        std::fs::write(&src, b"a different file").unwrap();
+
+        let dest = copy_into_project(&src, &dir).expect("copying must succeed");
+        assert_eq!(dest, dir.join("piano-2.wav"), "must not overwrite the unrelated file already there");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a different file");
+        assert_eq!(std::fs::read(dir.join("piano.wav")).unwrap(), b"already here", "untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&src_dir).ok();
+    }
+
+    /// Re-importing a file already inside the project is a no-op, not a self-copy — `std::fs::copy`
+    /// makes no promises about a source and destination that are the same file.
+    #[test]
+    fn copy_into_project_is_a_no_op_when_the_file_is_already_there() {
+        let dir = tmp_project_dir("import-reimport");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("piano.wav");
+        std::fs::write(&src, b"already inside the project").unwrap();
+
+        let dest = copy_into_project(&src, &dir).expect("must not error on a self-copy");
+        assert_eq!(dest, src);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"already inside the project", "left untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Import does nothing with no project active — there is nowhere to copy into — rather than
+    /// silently falling back to a plain Open.
+    #[test]
+    fn import_does_nothing_without_an_open_project() {
+        let mut app = RmpApp::default();
+        app.import_audio(PathBuf::from("/a/piano.wav"));
+        assert!(app.sessions.is_empty());
+    }
+
+    /// The point of the feature: an imported file ends up inside the project, and the tab it opens
+    /// points at the copy, not at the original.
+    #[test]
+    fn importing_a_file_opens_a_tab_pointing_at_the_copy_inside_the_project() {
+        let dir = tmp_project_dir("import-e2e");
+        let src_dir = tmp_project_dir("import-e2e-src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("piano.wav");
+        std::fs::write(&src, b"not really audio").unwrap();
+
+        let mut app = RmpApp::default();
+        app.do_new_project(dir.clone());
+        app.import_audio(src.clone());
+
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].input, dir.join("piano.wav"));
+        assert_ne!(app.sessions[0].input, src, "the tab must point at the copy, not the original");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&src_dir).ok();
     }
 }
