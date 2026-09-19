@@ -13,21 +13,23 @@
 use crate::audio::Audio;
 use crate::help::Help;
 use crate::playback::{self, Available, Sources, Which};
+use crate::project::{self, ProjectDoc, TabDoc};
+use crate::results::Results;
 use crate::view::distribution::DistributionView;
 use crate::view::function::FunctionView;
 use crate::view::summary::SummaryView;
 use crate::view::structure::StructureView;
 use crate::view::timefreq::TimeFreqView;
 use crate::settings::SettingsDoc;
-use crate::task::{self, Outcome, Progress, Running, Update};
-use std::path::PathBuf;
+use crate::task::{self, Progress, Running, Update};
+use std::path::{Path, PathBuf};
 
 /// What a tab's results area is showing.
 ///
 /// Not called `Tab`: a tab is a document now, and two things by that name in one file is how the
 /// results strip and the document strip get confused for each other.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum View {
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum View {
     /// `rmp_core::stats::BookSummary` — the same figures `rmpstat summary` prints.
     Summary,
     /// `rmp_core::stats::Histogram` over a `Quantity`, as `rmpstat hist`.
@@ -95,8 +97,8 @@ struct Session {
     /// What the *finished* run kept, as against what is ticked now. A switch changed after a run
     /// must not make a source look available that the run did not produce.
     available: Available,
-    /// The last finished run, if any.
-    outcome: Option<Box<Outcome>>,
+    /// The last finished run, or a book read back from disk after a project restored this tab.
+    results: Option<Results>,
     log: Vec<String>,
     view: View,
     /// The result tabs' own state: what each has computed, and under which options. Invalidated
@@ -125,7 +127,7 @@ impl Session {
             sources: Sources::default(),
             book_path: None,
             available: Available::default(),
-            outcome: None,
+            results: None,
             log: Vec::new(),
             view: View::Summary,
             summary_view: SummaryView::default(),
@@ -159,7 +161,7 @@ impl Session {
             // exists to prevent, and `default_book_name` already numbers them apart.
             book_path: None,
             available: Available::default(),
-            outcome: None,
+            results: None,
             log: Vec::new(),
             view: self.view,
             summary_view: SummaryView::default(),
@@ -233,7 +235,7 @@ impl Session {
                         a.book.snr_db(),
                         if a.cancelled { " (interrupted)" } else { "" }
                     ));
-                    self.outcome = Some(outcome);
+                    self.results = Some(Results::Run(outcome));
                 }
                 Update::Failed(e) => self.log.push(format!("failed: {e}")),
             }
@@ -248,18 +250,18 @@ impl Session {
     /// Grouped rather than laid out as one row of buttons because the switches only make sense
     /// beside their verb: "residual" means a different thing to each of the three, and a flat row
     /// of six checkboxes would leave that ambiguous.
-    fn controls(&mut self, ui: &mut egui::Ui, out: &mut SettingsOut, playing: bool) {
+    fn controls(&mut self, ui: &mut egui::Ui, out: &mut SettingsOut, playing: bool, project_dir: Option<&Path>) {
         ui.label(self.input.display().to_string())
             .on_hover_text("a tab's file cannot be changed; Open… puts another file in its own tab");
 
         ui.horizontal_top(|ui| {
-            self.analyse_panel(ui);
-            self.synthesise_panel(ui);
+            self.analyse_panel(ui, project_dir);
+            self.synthesise_panel(ui, project_dir);
             self.play_panel(ui, out, playing);
         });
     }
 
-    fn analyse_panel(&mut self, ui: &mut egui::Ui) {
+    fn analyse_panel(&mut self, ui: &mut egui::Ui, project_dir: Option<&Path>) {
         ui.group(|ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
@@ -285,7 +287,7 @@ impl Session {
                                 .on_disabled_hover_text("the settings document does not parse")
                                 .clicked()
                             {
-                                self.start_run();
+                                self.start_run(project_dir);
                             }
                         }
                     }
@@ -306,7 +308,7 @@ impl Session {
         });
     }
 
-    fn synthesise_panel(&mut self, ui: &mut egui::Ui) {
+    fn synthesise_panel(&mut self, ui: &mut egui::Ui, project_dir: Option<&Path>) {
         ui.group(|ui| {
             ui.vertical(|ui| {
                 match &self.synthesising {
@@ -319,7 +321,7 @@ impl Session {
                     None => {
                         // Checked against what is actually ticked, not merely "is there a book":
                         // finding out after the save dialog would be worse than a disabled button.
-                        let can = if self.outcome.is_some() {
+                        let can = if self.results.is_some() {
                             self.parts.available(self.available)
                         } else {
                             Err("analyse something first")
@@ -330,7 +332,7 @@ impl Session {
                             .on_hover_text("write this book back out as a soundfile")
                             .clicked()
                         {
-                            self.start_synthesis();
+                            self.start_synthesis(project_dir);
                         }
                     }
                 }
@@ -349,10 +351,10 @@ impl Session {
                         out.stop = true;
                     }
                 } else {
-                    let ready = self.outcome.is_some() && self.sources.any();
+                    let ready = self.results.is_some() && self.sources.any();
                     if ui
                         .add_enabled(ready, egui::Button::new("Play"))
-                        .on_disabled_hover_text(if self.outcome.is_none() {
+                        .on_disabled_hover_text(if self.results.is_none() {
                             "analyse something first"
                         } else {
                             "nothing selected to play"
@@ -366,7 +368,7 @@ impl Session {
                 // Ticked against what the *finished run* produced, not what is ticked in Analyse
                 // now: changing a switch after a run must not offer a source that run never made.
                 for w in Which::ALL {
-                    let has = self.outcome.is_some() && self.available.has(w);
+                    let has = self.results.is_some() && self.available.has(w);
                     let mut on = w.get(&self.sources) && has;
                     ui.add_enabled_ui(has, |ui| {
                         if ui.checkbox(&mut on, w.label()).on_disabled_hover_text(w.why_not()).changed() {
@@ -378,13 +380,13 @@ impl Session {
         });
     }
 
-    fn start_run(&mut self) {
+    fn start_run(&mut self, project_dir: Option<&Path>) {
         let Ok(config) = self.settings.status() else { return };
         let config = config.clone();
         // Asked before the run, as `rmp -b` requires it: a decomposition that took minutes and then
         // had nowhere to go would be the worst outcome here. Cancelling the dialog cancels the run.
         let Some(book_output) =
-            pick_book_save(self.book_path.as_deref(), &self.default_book_name())
+            pick_book_save(self.book_path.as_deref(), project_dir, &self.default_book_name())
         else {
             return;
         };
@@ -393,7 +395,7 @@ impl Session {
         // settings it ran under.
         self.ran_with = self.settings.effective().map(str::to_owned);
         self.log.clear();
-        self.outcome = None;
+        self.results = None;
         self.running = Some(task::spawn(task::Job {
             input: self.input.clone(),
             config,
@@ -415,14 +417,16 @@ impl Session {
     ///
     /// The directory still comes from wherever the document was last saved — see
     /// `pick_settings_save` — so this changes what is proposed, not where.
-    fn start_synthesis(&mut self) {
-        let Some(outcome) = &self.outcome else { return };
-        let Some(output) = pick_audio_save(&self.default_render_name()) else { return };
+    fn start_synthesis(&mut self, project_dir: Option<&Path>) {
+        let Some(results) = &self.results else { return };
+        let Some(output) = pick_audio_save(&self.default_render_name(), project_dir) else {
+            return;
+        };
         // Cloned rather than borrowed: the render outlives this frame on a thread of its own, and
         // the tab stays live meanwhile — you can edit its settings, or start the next analysis.
         self.synthesising = Some(task::spawn_synthesis(task::SynthJob {
-            book: outcome.analysis.book.clone(),
-            residual_book: playback::residual_book(&outcome.analysis).cloned(),
+            book: results.book().clone(),
+            residual_book: results.residual_book().cloned(),
             parts: self.parts,
             output,
         }));
@@ -487,7 +491,7 @@ impl Session {
     /// The residue's ERB analysis is `[residual] enabled` in the document like everything else.
     /// It used to have a checkbox of its own here, ANDed with the setting — two controls for one
     /// thing, and no way to tell from the panel which of them was the one saying no.
-    fn settings(&mut self, ui: &mut egui::Ui, out: &mut SettingsOut) {
+    fn settings(&mut self, ui: &mut egui::Ui, out: &mut SettingsOut, project_dir: Option<&Path>) {
         let err = &mut out.error;
         ui.horizontal(|ui| {
             ui.heading("Settings");
@@ -523,8 +527,11 @@ impl Session {
                 *err = Some(e);
             }
             if ui.button("Save as…").clicked()
-                && let Some(p) =
-                    pick_settings_save(self.settings.path(), &self.default_settings_name())
+                && let Some(p) = pick_settings_save(
+                    self.settings.path(),
+                    project_dir,
+                    &self.default_settings_name(),
+                )
                 && let Err(e) = self.settings.save_as(&p)
             {
                 *err = Some(e);
@@ -582,7 +589,7 @@ impl Session {
     }
 
     fn results(&mut self, ui: &mut egui::Ui) {
-        let Some(outcome) = &self.outcome else {
+        let Some(results) = &self.results else {
             ui.centered_and_justified(|ui| ui.label("Press Analyse."));
             return;
         };
@@ -607,13 +614,119 @@ impl Session {
         // Each tab is a view of a call in `rmp-core`; none of them recomputes anything, which is
         // what keeps the window and `rmpstat` reporting one set of numbers.
         match self.view {
-            View::Summary => self.summary_view.ui(ui, outcome),
-            View::Distribution => self.distribution_view.ui(ui, &outcome.analysis.book),
-            View::Function => self.function_view.ui(ui, &outcome.analysis.book),
-            View::TimeFrequency => self.timefreq_view.ui(ui, &outcome.analysis.book),
-            View::Structure => self.structure_view.ui(ui, &outcome.analysis.book),
+            View::Summary => self.summary_view.ui(ui, results),
+            View::Distribution => self.distribution_view.ui(ui, results.book()),
+            View::Function => self.function_view.ui(ui, results.book()),
+            View::TimeFrequency => self.timefreq_view.ui(ui, results.book()),
+            View::Structure => self.structure_view.ui(ui, results.book()),
         }
     }
+
+    /// This tab, as a project document remembers it.
+    fn to_tab_doc(&self, project_dir: &Path) -> TabDoc {
+        TabDoc {
+            number: self.number,
+            input: project::store_path(project_dir, &self.input),
+            start: self.start.clone(),
+            duration: self.duration.clone(),
+            settings: self.settings.path().map(|p| project::store_path(project_dir, p)),
+            keep_residual: self.keep_residual,
+            run_residual_analysis: self.run_residual_analysis,
+            parts: self.parts,
+            sources: self.sources,
+            book: self.book_path.as_deref().map(|p| project::store_path(project_dir, p)),
+            view: self.view,
+        }
+    }
+
+    /// Rebuild a tab from a project document: its settings and, when a book is on record and reads
+    /// back, its results — without re-running the pursuit. See [`load_results`].
+    ///
+    /// A tab whose book or input can no longer be read still opens, with the failure logged rather
+    /// than refusing the whole project: settings and switches are still worth having back, and a
+    /// tab is never empty regardless — there is always an `input`, even one that can no longer be
+    /// found, which is exactly today's "Press Analyse." state.
+    fn restore(project_dir: &Path, doc: &TabDoc) -> Self {
+        let mut s = Self::new(doc.number, project::resolve_path(project_dir, &doc.input));
+        s.start = doc.start.clone();
+        s.duration = doc.duration.clone();
+        s.keep_residual = doc.keep_residual;
+        s.run_residual_analysis = doc.run_residual_analysis;
+        s.parts = doc.parts;
+        s.sources = doc.sources;
+        s.view = doc.view;
+
+        if let Some(p) = &doc.settings {
+            let p = project::resolve_path(project_dir, p);
+            match SettingsDoc::load(&p) {
+                Ok(d) => s.settings = d,
+                Err(e) => s.log.push(format!("settings: {e}")),
+            }
+        }
+
+        if let Some(p) = &doc.book {
+            let book_path = project::resolve_path(project_dir, p);
+            s.book_path = Some(book_path.clone());
+            match load_results(&s.input, &s.start, &s.duration, &book_path) {
+                Ok(results) => {
+                    s.available = Available::of_loaded(results.book());
+                    // The settings on disk are what the loaded book is presumed to agree with;
+                    // editing them from here starts `results_are_stale` reporting against a
+                    // document the loaded book has moved on from, same as any other tab.
+                    s.ran_with = s.settings.effective().map(str::to_owned);
+                    s.results = Some(results);
+                }
+                Err(e) => s.log.push(format!("could not reload results: {e}")),
+            }
+        }
+        s
+    }
+
+    /// Give this tab's settings a file, as part of Save Project: one that has never been saved gets
+    /// the project's own default name, one that already has a path and unsaved edits is written
+    /// back to it. A restored project can only read a settings document that actually exists.
+    fn ensure_settings_saved(&mut self, project_dir: &Path) {
+        if self.settings.path().is_none() {
+            let name = self.default_settings_name();
+            if let Err(e) = self.settings.save_as(&project_dir.join(name)) {
+                self.log.push(format!("settings: {e}"));
+            }
+        } else if self.settings.modified()
+            && let Err(e) = self.settings.save()
+        {
+            self.log.push(format!("settings: {e}"));
+        }
+    }
+
+    /// Move this tab's settings file into `new_dir`, for Save Project As — but only when it is
+    /// either unsaved or was living inside `old_dir`, the common case once a project defaults saves
+    /// into its own directory. A settings document saved somewhere else on purpose is left alone:
+    /// this re-homes what the project owns, not every file a tab happens to reference.
+    fn rehome_settings(&mut self, old_dir: Option<&Path>, new_dir: &Path) {
+        let inside_old =
+            self.settings.path().is_some_and(|p| old_dir.is_some_and(|d| p.starts_with(d)));
+        if self.settings.path().is_none() || inside_old {
+            let name = self.default_settings_name();
+            if let Err(e) = self.settings.save_as(&new_dir.join(name)) {
+                self.log.push(format!("settings: {e}"));
+            }
+        }
+    }
+}
+
+/// Re-read the excerpt a book was analysed from, and the book itself — the same two reads
+/// `task::work` does before a run, minus the pursuit. Blocking, on the caller's thread: comparable
+/// cost to `SettingsDoc::load`, which already blocks the same way, and there is no pursuit here to
+/// make worth a worker thread.
+fn load_results(input: &Path, start: &str, duration: &str, book_path: &Path) -> Result<Results, String> {
+    let book = rmp_core::book::read(book_path)?;
+    let read = rmp_core::audio::read(input).map_err(|e| e.to_string())?;
+    let (offset, signal) = rmp_core::pipeline::excerpt(
+        read.signal,
+        start.trim().parse().ok(),
+        duration.trim().parse().ok(),
+    )?;
+    Ok(Results::Loaded(Box::new(crate::results::Loaded { book, signal, offset })))
 }
 
 /// What the settings panel asks of the window.
@@ -661,6 +774,29 @@ pub struct RmpApp {
     /// Index into `sessions`. Meaningless while that is empty, which is the one time nothing
     /// indexes it.
     active: usize,
+    /// The open project, if any. `None` is free-standing mode, unchanged from before this existed:
+    /// every tab behaves exactly as it always did, and nothing here is required to use the window.
+    project: Option<Project>,
+    /// New/Open Project asked for while the current tabs (or project) held unsaved changes; the
+    /// confirm dialog is drawn from this rather than acting immediately.
+    pending_replace: Option<PendingReplace>,
+    /// A project-level error — creating a directory, reading `project.toml` — from before any tab
+    /// exists to log it into.
+    last_error: Option<String>,
+}
+
+/// The project a window has open: where it lives, and the document as it was last written, so a
+/// freshly built one can be compared against it — the same trick `SettingsDoc` plays with
+/// `text`/`saved`, one level up.
+struct Project {
+    dir: PathBuf,
+    saved_doc: ProjectDoc,
+}
+
+#[derive(Clone)]
+enum PendingReplace {
+    New(PathBuf),
+    Open(PathBuf),
 }
 
 impl eframe::App for RmpApp {
@@ -681,6 +817,7 @@ impl eframe::App for RmpApp {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
 
+        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
 
         // No tabs: the window a fresh start looks like, and the one it returns to when the last
@@ -711,13 +848,14 @@ impl eframe::App for RmpApp {
         if !sounding {
             self.playing_tab = None;
         }
+        let project_dir = self.project.as_ref().map(|p| p.dir.as_path());
         let session = &mut self.sessions[self.active];
         let playing = sounding && self.playing_tab == Some(session.number);
         egui::Panel::top("input").show(ui, |ui| {
-            ui.push_id(salt, |ui| session.controls(ui, &mut out, playing));
+            ui.push_id(salt, |ui| session.controls(ui, &mut out, playing, project_dir));
         });
         egui::Panel::left("settings").default_size(440.0).show(ui, |ui| {
-            ui.push_id(salt, |ui| session.settings(ui, &mut out));
+            ui.push_id(salt, |ui| session.settings(ui, &mut out, project_dir));
         });
         egui::Panel::bottom("log").resizable(true).default_size(140.0).show(ui, |ui| {
             ui.push_id(salt, |ui| session.log_panel(ui));
@@ -744,12 +882,12 @@ impl eframe::App for RmpApp {
                 }
             }
             if let Some(a) = &mut self.audio
-                && let Some(o) = &session.outcome
+                && let Some(r) = &session.results
             {
                 // Mixed here rather than on a thread: rendering the atoms of a large book is the
                 // one slow part, and it is the same render the pursuit already did per atom. If it
                 // ever bites, this is the call to move, not the playback.
-                match playback::mix(&o.analysis, &o.signal, session.sources) {
+                match playback::mix(r.book(), r.residual(), r.residual_book(), r.signal(), session.sources) {
                     Ok(mix) => {
                         session.log.push(format!(
                             "playing {} — {:.2} s, peak {:.1} dBFS",
@@ -876,6 +1014,227 @@ impl RmpApp {
         // `saturating_sub` for the empty case, where `active` is not an index into anything.
         self.active = self.active.min(self.sessions.len().saturating_sub(1));
     }
+
+    /// What a project document would look like right now, if it were saved to `dir`. The single
+    /// definition both `project_modified` and `save_project` use, so "what counts as the project"
+    /// cannot drift between deciding there is something to save and actually saving it.
+    fn build_project_doc(&self, dir: &Path) -> ProjectDoc {
+        ProjectDoc::new(self.sessions.iter().map(|s| s.to_tab_doc(dir)).collect(), self.active)
+    }
+
+    /// Whether the open project has anything Save Project would change on disk — the same
+    /// `text != saved` trick `SettingsDoc` plays, one level up: a freshly built document compared
+    /// against the one last written.
+    fn project_modified(&self) -> bool {
+        self.project.as_ref().is_some_and(|p| p.saved_doc != self.build_project_doc(&p.dir))
+    }
+
+    /// Whether starting or opening a different project would discard something: any tab's unsaved
+    /// settings, or the open project itself having moved on since it was last saved.
+    fn is_dirty(&self) -> bool {
+        self.sessions.iter().any(|s| s.settings.modified()) || self.project_modified()
+    }
+
+    fn new_project(&mut self) {
+        let Some(dir) = pick_new_project_dir() else { return };
+        if self.is_dirty() {
+            self.pending_replace = Some(PendingReplace::New(dir));
+        } else {
+            self.do_new_project(dir);
+        }
+    }
+
+    /// Creates the directory (a save-style dialog is what named it — see `pick_new_project_dir` —
+    /// so it does not exist yet in the ordinary case) and writes an empty `project.toml`
+    /// immediately, so "New" concretely leaves a project on disk rather than just an empty window
+    /// waiting for a first Save.
+    ///
+    /// Refuses a directory that already holds a `project.toml` rather than overwriting it: "New" is
+    /// for a project that does not exist yet, and a name that collides with one that does is a
+    /// mistake to report, not silently fold into.
+    fn do_new_project(&mut self, dir: PathBuf) {
+        if dir.join(project::PROJECT_FILE).is_file() {
+            self.last_error = Some(format!(
+                "{} already has a project — Open it instead, or choose a different name",
+                dir.display()
+            ));
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.last_error = Some(format!("creating {}: {e}", dir.display()));
+            return;
+        }
+        self.sessions.clear();
+        self.active = 0;
+        let doc = self.build_project_doc(&dir);
+        match rmp_core::book::write_doc(&dir.join(project::PROJECT_FILE), &doc) {
+            Ok(()) => self.last_error = None,
+            Err(e) => self.last_error = Some(e),
+        }
+        self.project = Some(Project { dir, saved_doc: doc });
+    }
+
+    fn open_project(&mut self) {
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
+        if self.is_dirty() {
+            self.pending_replace = Some(PendingReplace::Open(dir));
+        } else {
+            self.do_open_project(dir);
+        }
+    }
+
+    fn do_open_project(&mut self, dir: PathBuf) {
+        match rmp_core::book::read_doc::<ProjectDoc>(&dir.join(project::PROJECT_FILE)) {
+            Ok(doc) => {
+                self.sessions = doc.tabs.iter().map(|t| Session::restore(&dir, t)).collect();
+                self.active = doc.active.min(self.sessions.len().saturating_sub(1));
+                self.project = Some(Project { dir, saved_doc: doc });
+                self.last_error = None;
+            }
+            Err(e) => self.last_error = Some(format!("opening project: {e}")),
+        }
+    }
+
+    /// Gives every tab's settings a file first (a restored project can only read a settings
+    /// document that actually exists), then writes `project.toml` capturing the tabs as they are
+    /// now.
+    fn save_project(&mut self) {
+        let Some(dir) = self.project.as_ref().map(|p| p.dir.clone()) else { return };
+        for s in &mut self.sessions {
+            s.ensure_settings_saved(&dir);
+        }
+        let doc = self.build_project_doc(&dir);
+        match rmp_core::book::write_doc(&dir.join(project::PROJECT_FILE), &doc) {
+            Ok(()) => {
+                if let Some(p) = &mut self.project {
+                    p.saved_doc = doc;
+                }
+                self.last_error = None;
+            }
+            Err(e) => self.last_error = Some(e),
+        }
+    }
+
+    /// Re-homes each tab's *settings* document into the new directory and saves there — but does
+    /// not move or copy any book or rendered soundfile already written to disk. Remembering what a
+    /// tab produced is this feature's job; moving the files it produced is a distinct one, and
+    /// building it silently into Save As would risk quietly duplicating or losing large books.
+    fn save_project_as(&mut self) {
+        let Some(new_dir) = rfd::FileDialog::new().pick_folder() else { return };
+        if let Err(e) = std::fs::create_dir_all(&new_dir) {
+            self.last_error = Some(format!("creating {}: {e}", new_dir.display()));
+            return;
+        }
+        let old_dir = self.project.as_ref().map(|p| p.dir.clone());
+        for s in &mut self.sessions {
+            s.rehome_settings(old_dir.as_deref(), &new_dir);
+        }
+        self.project = Some(Project { dir: new_dir, saved_doc: ProjectDoc::default() });
+        self.save_project();
+    }
+
+    fn apply_pending(&mut self, action: PendingReplace) {
+        match action {
+            PendingReplace::New(dir) => self.do_new_project(dir),
+            PendingReplace::Open(dir) => self.do_open_project(dir),
+        }
+    }
+
+    /// `File`, and a label for whichever project is open.
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("New Project…").clicked() {
+                    self.new_project();
+                    ui.close();
+                }
+                if ui.button("Open Project…").clicked() {
+                    self.open_project();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.project.is_some() && self.project_modified(),
+                        egui::Button::new("Save Project"),
+                    )
+                    .clicked()
+                {
+                    self.save_project();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(self.project.is_some(), egui::Button::new("Save Project As…"))
+                    .clicked()
+                {
+                    self.save_project_as();
+                    ui.close();
+                }
+            });
+            match &self.project {
+                Some(p) => {
+                    ui.separator();
+                    ui.label(p.dir.display().to_string());
+                    if self.project_modified() {
+                        ui.strong("*");
+                    }
+                }
+                None => {
+                    ui.weak("no project — files open free-standing");
+                }
+            }
+            if let Some(e) = &self.last_error {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+        });
+        self.replace_confirm_modal(ui);
+    }
+
+    /// New/Open Project asked for while something was unsaved; drawn as its own small window rather
+    /// than acting immediately.
+    fn replace_confirm_modal(&mut self, ui: &mut egui::Ui) {
+        let Some(action) = self.pending_replace.clone() else { return };
+        enum Choice {
+            SaveThenContinue,
+            Discard,
+            Cancel,
+        }
+        let mut choice = None;
+        egui::Window::new("Unsaved changes").collapsible(false).resizable(false).show(
+            ui.ctx(),
+            |ui| {
+                ui.label(
+                    "The current project has unsaved changes — settings edited but not saved, \
+                     or the project document itself has moved on.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Save then continue").clicked() {
+                        choice = Some(Choice::SaveThenContinue);
+                    }
+                    if ui.button("Discard").clicked() {
+                        choice = Some(Choice::Discard);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(Choice::Cancel);
+                    }
+                });
+            },
+        );
+        match choice {
+            Some(Choice::SaveThenContinue) => {
+                if self.project.is_some() {
+                    self.save_project();
+                }
+                self.pending_replace = None;
+                self.apply_pending(action);
+            }
+            Some(Choice::Discard) => {
+                self.pending_replace = None;
+                self.apply_pending(action);
+            }
+            Some(Choice::Cancel) => self.pending_replace = None,
+            None => {}
+        }
+    }
 }
 
 /// The one audio file dialog, shared by the tab strip and the empty window.
@@ -883,22 +1242,31 @@ fn pick_file() -> Option<PathBuf> {
     rfd::FileDialog::new().add_filter("audio", &["wav", "aiff", "aif", "flac"]).pick_file()
 }
 
-/// Where to write a render. No directory is suggested: unlike a settings document, which belongs
-/// beside the others, a render is an output and the file dialog's own last-used place is as good a
-/// guess as any.
-fn pick_audio_save(name: &str) -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("soundfile", &["wav", "aiff", "flac"])
-        .set_file_name(name)
-        .save_file()
+/// Where to create a new project: a save-style dialog rather than a folder picker, so New Project
+/// names a folder that does not exist yet instead of pointing at one that might already hold
+/// something. `do_new_project` still refuses if the name collides with an existing project.
+fn pick_new_project_dir() -> Option<PathBuf> {
+    rfd::FileDialog::new().set_file_name("project").save_file()
 }
 
-/// Where to write a book, starting wherever the last one went.
-fn pick_book_save(current: Option<&std::path::Path>, name: &str) -> Option<PathBuf> {
+/// Where to write a render. Unlike a settings document, which belongs beside the others, a render
+/// is an output with no file of its own to start from — so once a project is active, its directory
+/// is the starting guess; otherwise the file dialog's own last-used place is as good a one.
+fn pick_audio_save(name: &str, project_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut d = rfd::FileDialog::new().add_filter("soundfile", &["wav", "aiff", "flac"]).set_file_name(name);
+    if let Some(dir) = project_dir {
+        d = d.set_directory(dir);
+    }
+    d.save_file()
+}
+
+/// Where to write a book: wherever the last one went, or the project directory on a tab's first
+/// save, or the dialog's own last-used place with no project active.
+fn pick_book_save(current: Option<&Path>, project_dir: Option<&Path>, name: &str) -> Option<PathBuf> {
     let mut d = rfd::FileDialog::new()
         .add_filter("book", &["gz", "json", "toml"])
         .set_file_name(name);
-    if let Some(dir) = current.and_then(|p| p.parent()) {
+    if let Some(dir) = current.and_then(Path::parent).or(project_dir) {
         d = d.set_directory(dir);
     }
     d.save_file()
@@ -908,14 +1276,15 @@ fn pick_settings() -> Option<PathBuf> {
     rfd::FileDialog::new().add_filter("settings", &["toml"]).pick_file()
 }
 
-/// Save-as, proposing `name` in whatever directory the document was last saved to.
+/// Save-as, proposing `name` in whatever directory the document was last saved to, the project
+/// directory on a first save, or the dialog's own last-used place with no project active.
 ///
-/// The two halves come from different places on purpose: the name identifies the *tab* (see
-/// `Session::default_settings_name`), while the directory is wherever this person keeps their
-/// settings, which only the previous save knows.
-fn pick_settings_save(current: Option<&std::path::Path>, name: &str) -> Option<PathBuf> {
+/// The name and the directory come from different places on purpose: the name identifies the *tab*
+/// (see `Session::default_settings_name`), while the directory is wherever this person — or this
+/// project — keeps its settings.
+fn pick_settings_save(current: Option<&Path>, project_dir: Option<&Path>, name: &str) -> Option<PathBuf> {
     let mut d = rfd::FileDialog::new().add_filter("settings", &["toml"]).set_file_name(name);
-    if let Some(dir) = current.and_then(|p| p.parent()) {
+    if let Some(dir) = current.and_then(Path::parent).or(project_dir) {
         d = d.set_directory(dir);
     }
     d.save_file()
@@ -1266,7 +1635,7 @@ mod tests {
         assert_eq!(copy.sources, Sources { atoms: true, ..Sources::default() });
         assert!(!copy.keep_residual);
         assert_eq!(copy.available, Available::default(), "a copy has run nothing");
-        assert!(copy.outcome.is_none());
+        assert!(copy.results.is_none());
     }
 
     /// The combinations of atoms and residual must not overwrite each other's files: hearing them
@@ -1406,9 +1775,206 @@ mod tests {
         assert_eq!(copy.start, "2.5");
         assert_eq!(copy.settings.status().unwrap().pursuit.max_atoms, 4321);
         assert!(copy.log.is_empty());
-        assert!(copy.outcome.is_none());
+        assert!(copy.results.is_none());
         assert!(copy.running.is_none());
         assert!(copy.ran_with.is_none(), "a copy has not run, so nothing of its own is stale");
         assert!(!copy.results_are_stale());
+    }
+
+    fn tmp_project_dir(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("rmp-gui-project-test-{}-{name}", std::process::id()));
+        p
+    }
+
+    /// A round trip through `to_tab_doc`/`Session::restore`: settings, switches and the view
+    /// selection all have to come back, with no results — a book was never on record for this tab.
+    #[test]
+    fn restoring_a_tab_brings_back_its_settings_and_switches() {
+        let dir = tmp_project_dir("restore-basic");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = with(&["/a/piano.wav"]);
+        let s = &mut app.sessions[0];
+        s.start = "2.5".into();
+        s.duration = "0.5".into();
+        set(s, "max_atoms", "4321");
+        s.keep_residual = false;
+        s.run_residual_analysis = true;
+        s.parts = task::RenderParts { atoms: false, residual: true };
+        s.sources = Sources { atoms: true, ..Sources::default() };
+        s.view = View::Distribution;
+        // `Save Project` would give the settings a file via `ensure_settings_saved`; done directly
+        // here, since a document with no file has nothing for `to_tab_doc` to point a restore at.
+        s.settings.save_as(&dir.join("piano-01.toml")).unwrap();
+
+        let doc = s.to_tab_doc(&dir);
+        let restored = Session::restore(&dir, &doc);
+
+        assert_eq!(restored.number, s.number);
+        assert_eq!(restored.input, s.input);
+        assert_eq!(restored.start, "2.5");
+        assert_eq!(restored.duration, "0.5");
+        assert_eq!(restored.settings.status().unwrap().pursuit.max_atoms, 4321);
+        assert!(!restored.keep_residual);
+        assert!(restored.run_residual_analysis);
+        assert_eq!(restored.parts, task::RenderParts { atoms: false, residual: true });
+        assert_eq!(restored.sources, Sources { atoms: true, ..Sources::default() });
+        assert_eq!(restored.view, View::Distribution);
+        assert!(restored.results.is_none(), "no book was ever on record for this tab");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tab still opens when its book can no longer be read — a moved or deleted file — with the
+    /// failure logged rather than the whole project refusing to restore.
+    #[test]
+    fn a_tab_whose_book_cannot_be_read_still_opens_with_the_failure_logged() {
+        let dir = tmp_project_dir("restore-missing-book");
+        let doc = TabDoc {
+            number: 3,
+            input: PathBuf::from("/a/piano.wav"),
+            start: String::new(),
+            duration: String::new(),
+            settings: None,
+            keep_residual: true,
+            run_residual_analysis: false,
+            parts: task::RenderParts::default(),
+            sources: Sources::default(),
+            book: Some(PathBuf::from("missing-book.json.gz")),
+            view: View::Summary,
+        };
+
+        let restored = Session::restore(&dir, &doc);
+        assert_eq!(restored.number, 3);
+        assert!(restored.results.is_none());
+        assert!(
+            restored.log.iter().any(|l| l.contains("could not reload results")),
+            "no explanation logged: {:?}",
+            restored.log
+        );
+    }
+
+    /// The point of the whole feature: a tab whose book is on record reloads its results from disk
+    /// on restore, with no pursuit re-run — `Available` and the mixable sources have to agree with
+    /// what a live run of the same book would report, minus the measured residual a file never
+    /// carries.
+    ///
+    /// Against a real soundfile, since the excerpt has to actually re-read the same samples the
+    /// book was analysed from; skipped where `data/` is not checked out, as `task`'s own fixture
+    /// test is.
+    #[test]
+    fn a_restored_tab_reloads_its_results_from_the_book_without_rerunning() {
+        let input = std::path::Path::new("../data/audio/chopin-nocturne-2.wav");
+        if !input.is_file() {
+            eprintln!("no {} here; skipping", input.display());
+            return;
+        }
+        // Absolute, like every real tab's `input` is — a relative path here would resolve against
+        // the *project* directory, same as a stored settings or book path would.
+        let input = input.canonicalize().expect("resolving the fixture path");
+        let input = input.as_path();
+        let dir = tmp_project_dir("restore-results");
+        std::fs::create_dir_all(&dir).unwrap();
+        let book_path = dir.join("piano-01-book.json.gz");
+
+        let mut cfg = rmp_core::config::Config::default();
+        cfg.dictionary.fof.alphas = vec![256.0];
+        cfg.dictionary.fof.betas_ms = vec![1.0];
+        cfg.blocks.f_min = 200.0;
+        cfg.blocks.f_max = 2000.0;
+        cfg.pursuit.max_atoms = 20;
+        cfg.refine.enabled = false;
+
+        let read = rmp_core::audio::read(input).expect("reading the fixture");
+        let (offset, signal) = rmp_core::pipeline::excerpt(read.signal, Some(2.0), Some(0.3))
+            .expect("cutting the excerpt");
+        let mut planner = rmp_core::fft::Planner::new();
+        let analysis = rmp_core::pipeline::analyse(
+            rmp_core::pipeline::AnalysisRequest {
+                signal: &signal,
+                offset,
+                config: &cfg,
+                residual: None,
+            },
+            &mut planner,
+            &mut (),
+        )
+        .expect("the fixture decomposes");
+        rmp_core::book::write(&book_path, &analysis.book).expect("writing the book");
+
+        let doc = TabDoc {
+            number: 1,
+            input: input.to_path_buf(),
+            start: "2.0".into(),
+            duration: "0.3".into(),
+            settings: None,
+            keep_residual: true,
+            run_residual_analysis: false,
+            parts: task::RenderParts::default(),
+            sources: Sources::default(),
+            book: Some(project::store_path(&dir, &book_path)),
+            view: View::Summary,
+        };
+
+        let restored = Session::restore(&dir, &doc);
+        assert!(restored.log.is_empty(), "nothing should have failed: {:?}", restored.log);
+        let results = restored.results.as_ref().expect("the book reads back");
+        assert_eq!(results.book().len(), analysis.book.len());
+        assert!(!results.book().is_empty());
+        assert_eq!(results.residual(), &[] as &[f32], "no measured residual in a loaded book");
+        assert!(restored.available.atoms);
+        assert!(!restored.available.residual_measured);
+        assert!(!restored.results_are_stale(), "ran_with was set from the settings on restore");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `Save Project` is what clears the project-modified flag, and it gives every tab's settings a
+    /// file along the way — a restored project can only read a settings document that exists.
+    #[test]
+    fn saving_a_project_clears_its_modified_flag_and_saves_unsaved_settings() {
+        let dir = tmp_project_dir("dirty-flag");
+        let mut app = RmpApp::default();
+
+        app.do_new_project(dir.clone());
+        assert!(app.project.is_some());
+        assert!(!app.project_modified(), "freshly created, nothing to save yet");
+
+        app.open(PathBuf::from("/a/piano.wav"));
+        assert!(app.project_modified(), "a tab was added since the last save");
+
+        app.save_project();
+        assert!(!app.project_modified(), "save_project caught up");
+        assert!(
+            app.sessions[0].settings.path().is_some(),
+            "save_project must give an unsaved tab's settings a file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// "New" is for a project that does not exist yet — a name that collides with one that does
+    /// must be reported, not silently overwritten, or picking a name close to an existing project
+    /// could quietly discard it.
+    #[test]
+    fn new_project_refuses_a_directory_that_already_holds_one() {
+        let dir = tmp_project_dir("new-refuses-existing");
+        let mut first = RmpApp::default();
+        first.do_new_project(dir.clone());
+        first.open(PathBuf::from("/a/piano.wav"));
+        first.save_project();
+        assert!(dir.join(project::PROJECT_FILE).is_file());
+
+        let mut second = RmpApp::default();
+        second.do_new_project(dir.clone());
+        assert!(second.project.is_none(), "must not adopt the existing directory as a fresh project");
+        assert!(second.last_error.is_some(), "and must say why");
+
+        // The original project is untouched.
+        let doc: ProjectDoc = rmp_core::book::read_doc(&dir.join(project::PROJECT_FILE)).unwrap();
+        assert_eq!(doc.tabs.len(), 1, "the first project's tab must survive the refused New");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

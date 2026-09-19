@@ -168,18 +168,21 @@ parts that need reading together, all in `rmp-core` unless said otherwise:
   shell, so everything worth an oracle lives in `stats`/`tfmap` where `cargo test` reaches it.
 - **`rmp-gui`** — the eframe front end. The window is a strip of tabs, each an independent
   analysis: its own input file, settings, run, log and results, titled `NN filename.wav` with `NN`
-  the lowest two-digit number no open tab is using. **A tab is one file, and opening a file is the
-  only way a tab comes into being** — so there is no empty tab, not at startup and not after the
-  last one closes, and no way to point a tab at a second file. Both are facts about `Session`
-  rather than rules the UI has to keep remembering: `input` is a `PathBuf` set at construction, so
-  there is no state for an empty tab to be in and nothing to write a second file into. The reason
-  is that a tab's results, log and title all describe one file, and swapping it underneath would
-  leave a book describing a file the tab no longer names. With no tabs the window shows only a
-  hint, the `Open…` in the strip being the one way in. A tab's settings are a **document**, loaded,
-  edited and saved as a TOML file — `settings::SettingsDoc` — with a `?` beside them opening
-  `MANUAL.md` itself in a window of its own (`help`). `task` runs a decomposition off the UI thread;
-  `view/` holds the result tabs, each a view of a call in `rmp-core` or `rmp-structure` and never
-  its own arithmetic.
+  the lowest two-digit number no open tab is using. **A tab is one file, and opening a file — or
+  restoring a project — is the only way a tab comes into being** — so there is no empty tab, not
+  at startup and not after the last one closes, and no way to point a tab at a second file. Both
+  are facts about `Session` rather than rules the UI has to keep remembering: `input` is a
+  `PathBuf` set at construction, so there is no state for an empty tab to be in and nothing to
+  write a second file into. The reason is that a tab's results, log and title all describe one
+  file, and swapping it underneath would leave a book describing a file the tab no longer names.
+  With no tabs the window shows only a hint, the `Open…` in the strip being the one way in beside
+  the `File` menu's `Open Project…`. A tab's settings are a **document**, loaded, edited and saved
+  as a TOML file — `settings::SettingsDoc` — with a `?` beside them opening `MANUAL.md` itself in a
+  window of its own (`help`). `task` runs a decomposition off the UI thread; `view/` holds the
+  result tabs, each a view of a call in `rmp-core` or `rmp-structure` and never its own arithmetic;
+  `results::Results` is what feeds them — a live run or a book reloaded by `project`, see below.
+  `project` is the persistent-project document, and the `File` menu (New/Open/Save/Save as) built
+  on it — see *A project remembers a tab's files* further down.
 
 ### Invariants that are not locally obvious
 
@@ -553,6 +556,33 @@ is not enough on its own: the worker only discovers that on its next send, and a
 sends nothing between starting and finishing, so it would hold a core to the end of a decomposition
 nobody is going to look at. `a_cancelled_run_selects_nothing_and_reports_that_it_was_cancelled` is
 the gate, paired with an uncancelled run over the same fixture so it cannot pass for being barren.
+
+**A project remembers a tab's files, and restoring one reloads results rather than re-running.**
+`project::ProjectDoc` is a TOML document (`project.toml`, one per project directory) written and
+read through `rmp_core::book::write_doc`/`read_doc` — the same extension-driven serialisation a book
+already uses, so the format needed no I/O code of its own, just a `#[derive(Serialize,
+Deserialize)]` struct. A path inside it (input, settings, book) is relative to the project directory
+when it lives there, absolute otherwise (`project::store_path`/`resolve_path`), so a project stays
+portable as long as everything but the original audio lives beside `project.toml`, which is where
+Analyse/Synthesize/settings Save-as now default once a project is active.
+
+`Session::restore` is the second, deliberate way a tab comes into existence — Open a file is still
+the first and the only one that starts from nothing. When a project tab has a book on record,
+restoring it calls `load_results`: the same two reads `task::work` does before a run (the excerpt,
+`rmp_core::book::read`), minus the pursuit. What that *can't* recover — the dictionary, the timings,
+the pursuit's own leftover buffer, none of them ever written to a book — is simply absent rather
+than faked, which is what `results::Results` exists to make explicit: `Results::Run(Outcome)` from a
+live decomposition and `Results::Loaded(Loaded { book, signal, offset })` from a restored one are two
+sources for the same views, and `SummaryView` prints "not available" for whichever fields a loaded
+book cannot supply instead of inventing a run that did not happen. `playback::{mix, Available::of}`
+were narrowed from taking a whole `Analysis` to the three fields they actually read (`book`,
+`residual`, `residual_book`), so a live run and a loaded book drive the identical mix and the
+identical "what can Play offer" logic; `Available::of_loaded` is the loaded-book equivalent of
+`Available::of`, correctly reporting the measured residual unavailable since a file never carries it.
+
+A tab whose book or input can no longer be found still opens — settings and switches restored, no
+results, the reason logged — the same "Press Analyse." state as before this existed, not a reason to
+refuse the whole project.
 
 **A synthesised book is longer than the excerpt it came from.**
 `rmp_synthesis::atoms::natural_len` sizes the output by rendering each atom's envelope and taking

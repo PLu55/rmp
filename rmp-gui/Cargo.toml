@@ -10,6 +10,7 @@ egui = "0.36.2"
 egui_commonmark = { version = "0.25.0", default-features = false, features = ["pulldown_cmark"] }
 egui_plot = "0.37.0"
 rfd = "0.17.2"
+serde.workspace = true
 rmp-core.workspace = true
 rmp-synthesis.workspace = true
 rmp-structure.workspace = true

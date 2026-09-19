@@ -3586,6 +3586,7 @@ dependencies = [
  "rmp-structure",
  "rmp-synthesis",
  "rodio",
+ "serde",
 ]
 
 [[package]]

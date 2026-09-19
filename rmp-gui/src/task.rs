@@ -275,7 +275,7 @@ impl Reporter for Forward<'_> {
 /// stochastic reconstruction of the residue from its ERB band powers. "Residual" here is always
 /// the *synthesised* one; the measured residue is a buffer the analysis already holds and is a
 /// thing to listen to rather than to synthesise (see [`crate::playback`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RenderParts {
     pub atoms: bool,
     pub residual: bool,

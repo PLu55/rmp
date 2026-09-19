@@ -21,11 +21,13 @@
 //! Summed at unit gain and not normalised: the levels *are* the result. Scaling the mix to fit
 //! would hide exactly the thing being judged — how much energy the atoms took and what is left.
 
+use rmp_core::book::Book;
 use rmp_core::pipeline::Analysis;
+use rmp_core::residual::ResidualBook;
 use rmp_core::signal::Signal;
 
 /// Which sources to hear together.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Sources {
     pub origin: bool,
     pub atoms: bool,
@@ -79,6 +81,19 @@ impl Available {
             Which::Atoms => self.atoms,
             Which::ResidualMeasured => self.residual_measured,
             Which::ResidualSynthesised => self.residual_synthesised,
+        }
+    }
+
+    /// What a book read back from disk can offer, when a project restored a tab without re-running
+    /// the pursuit. The pursuit's own leftover buffer is never written to a book, so the measured
+    /// residual is correctly unavailable here — not faked, just absent, same as any other run that
+    /// did not keep it.
+    pub fn of_loaded(book: &Book) -> Self {
+        Self {
+            origin: true,
+            atoms: !book.is_empty(),
+            residual_measured: false,
+            residual_synthesised: book.residual.is_some(),
         }
     }
 }
@@ -135,27 +150,45 @@ impl Which {
     }
 }
 
-/// Where an analysis keeps its stochastic model, whichever of the two places that is.
+/// Where a source keeps its stochastic model, whichever of the two places that is.
 ///
 /// `pipeline::analyse` returns the residual book *beside* the atom book rather than inside it —
 /// whether the two share a file is the caller's decision, not the pipeline's — but a book read back
-/// from disk carries its own in `Book::residual`. Anything asking "is there a residual to work
-/// with" has to look in both, and this is the single place that does.
+/// from disk, or restored from a project, carries its own in `Book::residual`. Anything asking "is
+/// there a residual to work with" has to look in both, and this is the single place that does, for
+/// a live run and a restored one alike: a restored tab has no `run_residual_book` of its own, so it
+/// simply falls straight through to `book.residual`.
 ///
 /// Getting this wrong is not hypothetical: Synthesize checked only `book.residual` and so refused
 /// every residual render, including the mixed one, however the analysis had been run.
-pub fn residual_book(analysis: &Analysis) -> Option<&rmp_core::residual::ResidualBook> {
-    analysis.residual_book.as_ref().or(analysis.book.residual.as_ref())
+pub fn residual_book_of<'a>(
+    run_residual_book: Option<&'a ResidualBook>,
+    book: &'a Book,
+) -> Option<&'a ResidualBook> {
+    run_residual_book.or(book.residual.as_ref())
+}
+
+/// The mirror for a live [`Analysis`], which still has its own `residual_book` field to check
+/// first — see [`residual_book_of`].
+pub fn residual_book(analysis: &Analysis) -> Option<&ResidualBook> {
+    residual_book_of(analysis.residual_book.as_ref(), &analysis.book)
 }
 
 /// Build the mix.
+///
+/// Takes the three pieces a source can offer — the book, its measured residual (empty when none
+/// was kept, or none exists to keep, as for a book restored from a project), and its residual book
+/// — rather than a live [`Analysis`], so a book read back from disk drives exactly the same mix a
+/// fresh run would, with no `Analysis` fabricated to stand in for one.
 ///
 /// Everything is aligned to the *excerpt*, sample 0 being the excerpt's first sample, so the four
 /// sources line up without consulting `start_sample`. The atom render can run past the excerpt's
 /// end — an atom truncated by the analysis is audible again here, about 3% of the energy on a short
 /// piano fixture — so the mix is as long as the longest source rather than as long as the origin.
 pub fn mix(
-    analysis: &Analysis,
+    book: &Book,
+    residual: &[f32],
+    residual_book: Option<&ResidualBook>,
     origin: &Signal,
     want: Sources,
 ) -> Result<Signal, String> {
@@ -166,15 +199,15 @@ pub fn mix(
         parts.push(origin.samples.clone());
     }
     if want.atoms {
-        let rendered = rmp_synthesis::atoms::render_atoms(&analysis.book, origin.len())
+        let rendered = rmp_synthesis::atoms::render_atoms(book, origin.len())
             .map_err(|e| format!("rendering the atoms: {e}"))?;
         parts.push(rendered.samples);
     }
     if want.residual_measured {
-        parts.push(analysis.residual.clone());
+        parts.push(residual.to_vec());
     }
     if want.residual_synthesised {
-        let book = residual_book(analysis).ok_or("this analysis has no residual book")?;
+        let book = residual_book.ok_or("this analysis has no residual book")?;
         let rendered =
             rmp_synthesis::render_residual_book(book, &rmp_synthesis::RenderConfig::default())
                 .map_err(|e| format!("rendering the residual: {e}"))?;
@@ -282,6 +315,63 @@ mod tests {
         );
         assert!(residual_book(&analysis).is_some(), "so only looking in both finds it");
         assert!(Available::of(&analysis, true).residual_synthesised);
+    }
+
+    /// A book restored from a project — no live `Analysis`, just what `task::work` would have
+    /// written to disk — has to offer the same atoms and synthesised residual a live run did, with
+    /// only the measured residual correctly missing (it is never written to a book at all).
+    #[test]
+    fn a_loaded_books_availability_and_mix_agree_with_what_a_run_produced() {
+        use rmp_core::config::Config;
+        use rmp_core::fft::Planner;
+        use rmp_core::pipeline::{self, AnalysisRequest};
+
+        let mut cfg = Config::default();
+        cfg.dictionary.fof.alphas = vec![256.0];
+        cfg.dictionary.fof.betas_ms = vec![1.0];
+        cfg.blocks.f_min = 200.0;
+        cfg.blocks.f_max = 2000.0;
+        cfg.pursuit.max_atoms = 8;
+        cfg.refine.enabled = false;
+        cfg.residual.enabled = true;
+
+        let samples: Vec<f32> = rmp_core::residual::pseudo_noise(8_000);
+        let sig = Signal::new(samples, 48_000.0);
+        let residual_cfg = cfg.residual_config(48_000.0).expect("a usable ERB range");
+        let mut planner = Planner::new();
+
+        let mut analysis = pipeline::analyse(
+            AnalysisRequest {
+                signal: &sig,
+                offset: 0,
+                config: &cfg,
+                residual: Some(&residual_cfg),
+            },
+            &mut planner,
+            &mut (),
+        )
+        .expect("the fixture decomposes");
+
+        // What `task::work` does before a book reaches disk: the residual book moves into
+        // `Book::residual`, which is the only place a book read back from disk carries it.
+        analysis.book.residual = analysis.residual_book.take();
+
+        let from_run = Available::of(&analysis, true);
+        let from_loaded = Available::of_loaded(&analysis.book);
+        assert_eq!(from_loaded.origin, from_run.origin);
+        assert_eq!(from_loaded.atoms, from_run.atoms);
+        assert!(!from_loaded.residual_measured, "a loaded book never carries the measured residual");
+        assert_eq!(from_loaded.residual_synthesised, from_run.residual_synthesised);
+
+        let want =
+            Sources { origin: true, atoms: true, residual_measured: false, residual_synthesised: true };
+        let run_mix = mix(&analysis.book, &analysis.residual, residual_book(&analysis), &sig, want)
+            .expect("mixing from a live run");
+        let loaded_mix = mix(&analysis.book, &[], analysis.book.residual.as_ref(), &sig, want)
+            .expect("mixing from a loaded book, with no measured residual to hand it");
+        // Neither mix asked for the measured residual, so the two must agree exactly even though
+        // only one of them had it to give.
+        assert_eq!(run_mix.samples, loaded_mix.samples);
     }
 
     /// The mix is the sum at unit gain, and as long as its longest part. Checked with plain

@@ -8,7 +8,8 @@
 //! the part a low-alpha config blows up — CLAUDE.md measures 64 ms against 2.4 ms across two
 //! configs of the same material — and folding it into the analysis time is exactly what hid that.
 
-use crate::task::Outcome;
+use crate::results::Results;
+use rmp_core::pipeline::Timing;
 use rmp_core::signal::{Signal, db_fs, peak_of, rms_of};
 use rmp_core::stats::{self, BookSummary, Evaluator};
 use std::time::Duration;
@@ -25,9 +26,8 @@ impl SummaryView {
         self.cached = None;
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, outcome: &Outcome) {
-        let (analysis, origin) = (&outcome.analysis, &outcome.signal);
-        let book = &analysis.book;
+    pub fn ui(&mut self, ui: &mut egui::Ui, results: &Results) {
+        let (book, origin) = (results.book(), results.signal());
         if self.cached.is_none() {
             let mut ev = Evaluator::new(book);
             self.cached = Some(stats::summarize(book, &mut ev).map_err(|e| e.to_string()));
@@ -49,17 +49,17 @@ impl SummaryView {
                 &format!(
                     "{} samples from {}  ({:.3} s at {:.3} s)",
                     origin.len(),
-                    outcome.offset,
+                    results.offset(),
                     origin.len() as f32 / origin.sample_rate.max(1.0),
-                    outcome.offset as f32 / origin.sample_rate.max(1.0),
+                    results.offset() as f32 / origin.sample_rate.max(1.0),
                 ),
             );
 
             ui.add_space(8.0);
             ui.heading("Residual");
-            let residual = &analysis.residual;
+            let residual = results.residual();
             if residual.is_empty() {
-                ui.weak("not kept — tick `residual` in Analyse before running");
+                ui.weak("not kept — tick `residual` in Analyse before running (or analyse again: a loaded book never carries one)");
             } else {
                 // Relative first, because that is the figure you act on: an absolute dBFS residual
                 // means nothing without knowing how loud the input was.
@@ -76,7 +76,15 @@ impl SummaryView {
 
             ui.add_space(8.0);
             ui.heading("Time");
-            timings(ui, analysis, origin);
+            match results.timing() {
+                Some(t) => timings(ui, t, results.cancelled(), origin),
+                None => {
+                    ui.weak(
+                        "not available — this book was loaded from a saved project; analyse \
+                         again to see timings",
+                    );
+                }
+            }
         });
     }
 }
@@ -132,8 +140,7 @@ fn rows(ui: &mut egui::Ui, s: &BookSummary, sr: f32) {
     }
 }
 
-fn timings(ui: &mut egui::Ui, analysis: &rmp_core::pipeline::Analysis, origin: &Signal) {
-    let t = &analysis.timing;
+fn timings(ui: &mut egui::Ui, t: &Timing, cancelled: bool, origin: &Signal) {
     let duration = origin.len() as f32 / origin.sample_rate.max(1.0);
 
     row(ui, "dictionary", &dur(t.dictionary));
@@ -146,7 +153,7 @@ fn timings(ui: &mut egui::Ui, analysis: &rmp_core::pipeline::Analysis, origin: &
     // The same figure `rmp` prints, through the same definition — see `Timing::realtime_factor`.
     let realtime = t.realtime_factor(duration);
     row(ui, "analysis", &format!("{} for {duration:.2} s — {realtime:.1}x realtime", dur(t.init + t.pursuit)));
-    if analysis.cancelled {
+    if cancelled {
         ui.colored_label(
             ui.visuals().warn_fg_color,
             "interrupted — the book holds only what had been selected by then",
