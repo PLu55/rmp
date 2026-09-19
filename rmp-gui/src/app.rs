@@ -512,6 +512,17 @@ impl Session {
                     Err(e) => *err = Some(e),
                 }
             }
+            if ui
+                .add_enabled(project_dir.is_some(), egui::Button::new("Import…"))
+                .on_disabled_hover_text("no project open — File > New or Open first")
+                .on_hover_text("a settings file, copied into the project directory and loaded here")
+                .clicked()
+                && let Some(dir) = project_dir
+                && let Some(p) = pick_settings()
+                && let Err(e) = self.import_settings(&p, dir)
+            {
+                *err = Some(e);
+            }
             // Nothing to write, or nowhere to write it.
             let can_save = self.settings.path().is_some() && self.settings.modified();
             if ui
@@ -711,6 +722,18 @@ impl Session {
                 self.log.push(format!("settings: {e}"));
             }
         }
+    }
+
+    /// The settings panel's Import: copy a settings document into the project directory, then load
+    /// the copy — the same `copy_into_project` the tab strip's `import_audio` uses, so a project's
+    /// settings, like its audio, need not depend on wherever the original file lives.
+    ///
+    /// Deliberately not reset otherwise: the results stay, and `results_are_stale` starts reporting
+    /// them against the document that is now on screen, same as Load.
+    fn import_settings(&mut self, src: &Path, project_dir: &Path) -> Result<(), String> {
+        let dest = copy_into_project(src, project_dir)?;
+        self.settings = SettingsDoc::load(&dest)?;
+        Ok(())
     }
 }
 
@@ -1285,6 +1308,8 @@ fn pick_new_project_dir() -> Option<PathBuf> {
 
 /// Copy `src` into `dir`, keeping its file name unless that collides with something already there
 /// — appending `-2`, `-3`, … until it does not, the same idea `free_number` uses for tab numbers.
+/// What Import copies in, for a soundfile (the tab strip's `import_audio`) and a settings document
+/// (`Session::settings`'s own `Import…`) alike — one definition of "bring a file into the project."
 ///
 /// Re-importing a file already inside the project (its name already resolves to itself) is not a
 /// collision to rename around: that path is returned as-is, both because there is nothing to copy
@@ -2161,5 +2186,54 @@ mod tests {
         assert!(app.last_error.is_some());
         assert!(app.sessions.is_empty());
         assert!(app.project.is_none());
+    }
+
+    /// The settings panel's Import: the document ends up inside the project and loaded, not merely
+    /// pointed at wherever it started.
+    #[test]
+    fn importing_a_settings_document_copies_it_into_the_project_and_loads_it() {
+        let dir = tmp_project_dir("import-settings");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_dir = tmp_project_dir("import-settings-src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("piano.toml");
+        let mut text = rmp_core::config::Config::default().to_toml();
+        text = text.replace("max_atoms = 1000", "max_atoms = 4321");
+        std::fs::write(&src, &text).unwrap();
+
+        let mut app = with(&["/a/piano.wav"]);
+        let s = &mut app.sessions[0];
+        s.import_settings(&src, &dir).expect("importing must succeed");
+
+        assert_eq!(s.settings.path(), Some(dir.join("piano.toml")).as_deref());
+        assert_eq!(s.settings.status().unwrap().pursuit.max_atoms, 4321);
+        assert!(!s.settings.modified(), "a freshly loaded document is unmodified");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&src_dir).ok();
+    }
+
+    /// A collision with a different, unrelated settings file already in the project must not
+    /// silently overwrite it — the same rule `copy_into_project` already enforces for audio.
+    #[test]
+    fn importing_a_settings_document_renames_around_a_collision() {
+        let dir = tmp_project_dir("import-settings-collision");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("piano.toml"), "already here").unwrap();
+
+        let src_dir = tmp_project_dir("import-settings-collision-src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("piano.toml");
+        std::fs::write(&src, rmp_core::config::Config::default().to_toml()).unwrap();
+
+        let mut app = with(&["/a/piano.wav"]);
+        let s = &mut app.sessions[0];
+        s.import_settings(&src, &dir).expect("importing must succeed");
+
+        assert_eq!(s.settings.path(), Some(dir.join("piano-2.toml")).as_deref());
+        assert_eq!(std::fs::read_to_string(dir.join("piano.toml")).unwrap(), "already here");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&src_dir).ok();
     }
 }

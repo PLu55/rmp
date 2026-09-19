@@ -381,6 +381,12 @@ having nowhere else to put one, and the GUI's is `MANUAL.md` in a window. It liv
 `rmp_core::config` all the same, because what it documents is `Config`'s TOML form and adding a
 setting should be an edit to the same file as describing it.
 
+**Import, beside Load in the settings panel, is the settings-document counterpart to the tab
+strip's Import.** `Session::import_settings` calls the same `copy_into_project` — copy the chosen
+document into the project directory, then load the copy — so a project's settings need not depend
+on wherever the original file lives either, and a name collision is resolved the same way: renamed
+around, never overwritten. Disabled with no project active, for the same reason Import is there.
+
 **The help window is `MANUAL.md`, embedded and split, not a summary of it.** `help::parse` cuts the
 file at its `##` and `###` headings, and because the manual titles its subsections with the setting
 they document — "`### capture_tolerance` — default `0.95`" — the table of contents *is* the list of
